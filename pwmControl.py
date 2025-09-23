@@ -1,3 +1,5 @@
+# This script creates a 50hz output with a 50% duty cycle
+
 import os, time
 
 PWMCHIP="/sys/class/pwm/pwmchip3"  # set to the one that shows on your pin
