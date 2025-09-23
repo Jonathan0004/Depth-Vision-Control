@@ -1,4 +1,5 @@
 # This script creates a 50hz output with a 50% duty cycle
+# Outputs PWM on pin 32
 
 import os, time
 
