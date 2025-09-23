@@ -1,1 +1,4 @@
 For PWM use pin 32
+
+
+For motor encoding use: AS5048A 14-bit magnetic position encoder
