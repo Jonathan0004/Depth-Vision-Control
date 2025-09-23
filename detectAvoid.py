@@ -25,7 +25,7 @@ import queue
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# 🔧 Tunable Parameters (grouped for quick tweaking)
+# Tunable Parameters (grouped for quick tweaking)
 # ---------------------------------------------------------------------------
 
 # Grid sampling density for obstacle detection. Higher values sample more
@@ -48,7 +48,7 @@ BOTTOM_CUTOFF_PIXELS = 54
 
 # Horizontal route-planner smoothing. Values near 0 snap instantly to a new
 # target gap; values near 1 move very slowly for a damped response.
-BLUE_X_SMOOTHNESS = 0.7
+BLUE_X_SMOOTHNESS = 0.5
 
 # Width of the "pull" zone around the combined-image center. Obstacles inside
 # this area directly influence the route planner. Obstacles outside only count
@@ -56,7 +56,7 @@ BLUE_X_SMOOTHNESS = 0.7
 PULL_INFLUENCE_RADIUS_PX = 120
 
 # ---------------------------------------------------------------------------
-# 📦 Runtime State (initialized here for clarity)
+# Runtime State (initialized here for clarity)
 # ---------------------------------------------------------------------------
 
 # Persistent estimate of the blue guidance circle's X-position (float for
@@ -73,7 +73,7 @@ def clamp(val, minn, maxn):
 
 
 # ---------------------------------------------------------------------------
-# 🚀 Initialize the Depth-Estimation Pipeline
+# Initialize the Depth-Estimation Pipeline
 # ---------------------------------------------------------------------------
 depth_pipe = pipeline(
     task="depth-estimation",
@@ -83,7 +83,7 @@ depth_pipe = pipeline(
 
 
 # ---------------------------------------------------------------------------
-# 🎥 Camera Capture Setup (Jetson CSI via GStreamer)
+# Camera Capture Setup (Jetson CSI via GStreamer)
 # ---------------------------------------------------------------------------
 def make_gst(sensor_id):
     """Return a GStreamer pipeline string for the given CSI camera."""
@@ -108,7 +108,7 @@ cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
 # ---------------------------------------------------------------------------
-# 🧵 Threaded Queues for Camera Frames and Depth Inference
+# Threaded Queues for Camera Frames and Depth Inference
 # ---------------------------------------------------------------------------
 frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
 running = True
@@ -155,7 +155,7 @@ Thread(target=infer, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
-# 🔁 Main Visualization & Planning Loop
+# Main Visualization & Planning Loop
 # ---------------------------------------------------------------------------
 while True:
     try:
@@ -209,14 +209,14 @@ while True:
             continue
         # draw red dot
         target = cmap0 if cam == 0 else cmap1
-        cv2.circle(target, (px - (0 if cam==0 else w0), py), 5, (0, 0, 255), -1)
+        #cv2.circle(target, (px - (0 if cam==0 else w0), py), 5, (0, 0, 255), -1)
 
     # Show combined view
     combined = np.hstack((cmap0, cmap1))
     
     
     
-    # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
+    # === HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
     h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
 
     # vertical midpoint between the two green cutoff lines
@@ -266,7 +266,7 @@ while True:
             cx = (left + right) // 2
             dist = abs(cx - preferred_x)
             if (width > best_width) or (width == best_width and dist < best_dist):
-                best_width = width
+            	best_width = width
                 best_dist = dist
                 best_cx = cx
         return int(best_cx)
