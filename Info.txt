@@ -1,0 +1,1 @@
+For PWM use pin 32
