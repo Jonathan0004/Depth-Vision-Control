@@ -70,7 +70,7 @@ hud_text_thickness = 1
 PWMCHIP = "/sys/class/pwm/pwmchip3"  # adjust to your board
 PWM_CHANNEL_INDEX = 0                # "pwm0"
 PWM_PERIOD_NS = 20_000_000           # 50 Hz
-PWM_DUTY_NS   = 10_000_000           # 50% duty (neutral/default)
+PWM_DUTY_NS   = 1_500_000           # 1.5 ms neutral  ✅
 
 
 # ---------------------------------------------------------------------------
@@ -311,16 +311,15 @@ while True:
     if not pwm_initialized and not pwm_error_reported:
         try:
             pwm_driver = PWMDriver(PWMCHIP, PWM_CHANNEL_INDEX)
-            pwm_driver.init(PWM_PERIOD_NS, PWM_DUTY_NS)  # 50 Hz @ 50% (neutral)
+            pwm_driver.init(PWM_PERIOD_NS, PWM_DUTY_NS)  # 50 Hz @ 1.5 ms neutral  ✅
             pwm_initialized = True
             print("PWM initialized: 50 Hz @ 50% duty on pwmchip3/pwm0.")
         except Exception as e:
             pwm_error_reported = True
             print(f"[PWM] Initialization error: {e}")
 
-    # Live mapping: steer_control_x (pixels) -> PWM duty (nanoseconds)
-    #  - 1–2 ms pulse range typical for servo/ESC at 50 Hz.
-    #  - center_x maps to 1.5 ms; +/- span_px maps to 1.0–2.0 ms.
+
+    
     if pwm_initialized:
         min_ns, center_ns, max_ns = 1_000_000, 1_500_000, 2_000_000  # 1–2 ms
         span_px = 300  # pixels from center to reach min/max (tune for your geometry)
