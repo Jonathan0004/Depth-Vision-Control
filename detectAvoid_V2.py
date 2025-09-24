@@ -276,6 +276,10 @@ while True:
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
 
+
+
+
+    
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
     cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
