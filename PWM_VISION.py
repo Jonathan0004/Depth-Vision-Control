@@ -58,7 +58,7 @@ pull_influence_radius_px = 120   # half-width of the pull zone around centre
 pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left)
 
 # Smoothing factor for the steering cue (1 → frozen, 0 → instant response)
-blue_x_smoothness = 0.7
+blue_x_smoothness = 0.5
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
