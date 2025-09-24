@@ -4,6 +4,9 @@ The script streams from two cameras, infers depth using the
 ``depth-anything`` model, highlights obstacles inside configurable cutoff
 bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
+
+NOW WITH:
+- SHOW_GUI toggle: turn visualization on/off without affecting detection or PWM.
 """
 
 import os
@@ -22,6 +25,9 @@ from transformers import pipeline
 # the rest of the code. Where possible, related values are grouped together and
 # documented so their impact is clear.
 # ---------------------------------------------------------------------------
+
+# Toggle visualization (heatmaps, overlays, window). False = headless speed run.
+SHOW_GUI = True
 
 # Grid resolution for sampling depth points across each frame (higher = denser)
 rows, cols = 25, 50
@@ -60,8 +66,8 @@ hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
 
-# --- PWM configuration (added; does not alter existing behaviour) ---
-PWMCHIP = "/sys/class/pwm/pwmchip3"  # set to the one that shows on your pin
+# --- PWM configuration ---
+PWMCHIP = "/sys/class/pwm/pwmchip3"  # adjust to your board
 PWM_CHANNEL_INDEX = 0                # "pwm0"
 PWM_PERIOD_NS = 20_000_000           # 50 Hz
 PWM_DUTY_NS   = 10_000_000           # 50% duty (neutral/default)
@@ -73,7 +79,7 @@ PWM_DUTY_NS   = 10_000_000           # 50% duty (neutral/default)
 blue_x = None              # persistent, smoothed x-position of the blue circle
 steer_control_x = None     # integer pixel location displayed as HUD text
 
-# PWM state (added)
+# PWM state
 pwm_initialized = False
 pwm_error_reported = False
 pwm_driver = None
@@ -84,12 +90,11 @@ last_duty_ns = None  # for optional deadband
 # Helper utilities and pipeline initialisation
 # ---------------------------------------------------------------------------
 
-# Utility: clamp values between two bounds (used to keep overlays on-screen)
 def clamp(val, minn, maxn):
+    """Clamp values between two bounds (used to keep overlays on-screen)."""
     return max(min(val, maxn), minn)
 
-
-# --- PWM helper (added; efficient for future fast updates) ---------------
+# --- PWM helper (efficient for fast updates) ------------------------------
 def _pwm_wr(path, value):
     with open(path, "w") as f:
         f.write(str(value))
@@ -110,32 +115,20 @@ class PWMDriver:
         self.period_path = f"{self.pwm_dir}/period"
         self.duty_path = f"{self.pwm_dir}/duty_cycle"
         self._duty_fd = None
-        self._enabled = False
 
     def init(self, period_ns: int, duty_ns: int):
-        # export if needed
         if not os.path.isdir(self.pwm_dir):
             _pwm_wr(f"{self.chip}/export", str(self.idx))
+        try: _pwm_wr(self.enable_path, "0")
+        except FileNotFoundError: pass
 
-        # disable if currently enabled
-        try:
-            _pwm_wr(self.enable_path, "0")
-        except FileNotFoundError:
-            pass
-
-        # program period and duty
         _pwm_wr(self.period_path, period_ns)
         _pwm_wr(self.duty_path, duty_ns)
 
-        # enable
         _pwm_wr(self.enable_path, "1")
-        self._enabled = True
-
-        # keep duty fd open for low-latency updates later
         self._duty_fd = open(self.duty_path, "w", buffering=1)
 
     def set_duty(self, duty_ns: int):
-        # fast path write (no reopen)
         if self._duty_fd is not None:
             self._duty_fd.seek(0)
             self._duty_fd.write(str(duty_ns))
@@ -151,8 +144,7 @@ class PWMDriver:
             _pwm_wr(self.enable_path, "0")
         except Exception:
             pass
-        self._enabled = False
-# -------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
@@ -218,7 +210,7 @@ def infer():
 Thread(target=infer, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# Main processing loop — consume depth results, annotate, and display
+# Main processing loop — consume depth results, plan, PWM, and (optional) GUI
 # ---------------------------------------------------------------------------
 while True:
     try:
@@ -226,7 +218,7 @@ while True:
     except queue.Empty:
         continue
 
-    # Build a sparse point cloud by sampling each depth map on a coarse grid
+    # === Build a sparse point cloud by sampling each depth map on a coarse grid
     h0, w0 = depth0.shape
     h1, w1 = depth1.shape
     points = []
@@ -241,62 +233,23 @@ while True:
                 points.append((px, py, z, cam_idx))
     cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
 
-    # Determine obstacle candidates by comparing each sample to the scene average
+    # === Determine obstacle candidates by comparing each sample to the scene average
     zs = cloud['z']
     mean_z, std_z = zs.mean(), zs.std()
     thresh = max(depth_diff_threshold, std_multiplier * std_z)
     mask = (mean_z - zs) > thresh
 
-    # Convert depth arrays into coloured heatmaps for easier interpretation
-    norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
-    norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
-
-    # Draw cutoff lines on each camera to mark the active sensing band
-    for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
-        top_y = top_cutoff_pixels
-        bottom_y = h - bottom_cutoff_pixels
-        cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
-        cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
-
-    # Draw obstacle points only within cutoffs
-    for is_obst, pt in zip(mask, cloud):
-        if not is_obst:
-            continue
-        px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
-        # check cutoffs
-        if py < top_cutoff_pixels or py > ( (frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels ):
-            continue
-        # draw red dot
-        target = cmap0 if cam == 0 else cmap1
-        offset_x = 0 if cam == 0 else w0
-
-        #Red Dots:
-        # cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
-
-    # Show combined view
-    combined = np.hstack((cmap0, cmap1))
-
-    
-    
-    # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
-    h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
-
-    # vertical midpoint between the two green cutoff lines (for blue circle)
-    line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
-
+    # === GAP ROUTE PLANNER (works regardless of GUI)
+    w_combined = w0 + w1
     # combined-frame center X, optionally offset for asymmetric steering bias
     center_x = (w_combined // 2) + pull_zone_center_offset_px
-
-    # pull zone boundaries (clamped to image)
+    # pull zone boundaries (used by gating logic)
     zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
     zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
 
     # Collect red-dot X positions that fall between the cutoff green lines (both cams)
     red_xs_all = []
     red_xs_in_zone = []
-
     for is_obst, pt in zip(mask, cloud):
         if not is_obst:
             continue
@@ -316,10 +269,7 @@ while True:
     blockers_all = [0] + red_xs_all + [w_combined]
 
     def widest_gap_center(blockers, preferred_x):
-        """
-        Choose the center of the widest gap considering ALL blockers.
-        Tie-breaker: pick the gap whose center is closest to preferred_x.
-        """
+        """Choose the center of the widest gap. Tie-break: closest to preferred_x."""
         if len(blockers) < 2:
             return preferred_x
         best_width = -1
@@ -336,7 +286,7 @@ while True:
         return int(best_cx)
 
     # Gating:
-    # - No in-zone obstacles -> ignore outside, keep center
+    # - No in-zone obstacles -> keep center
     # - Any in-zone obstacles -> plan using ALL obstacles
     if len(red_xs_in_zone) == 0:
         gap_cx = center_x
@@ -385,57 +335,74 @@ while True:
             last_duty_ns = duty
     # =========================== PWM SECTION: END ===========================
 
+    # --------------------------- GUI (optional) -----------------------------
+    if SHOW_GUI:
+        # Convert depth arrays into coloured heatmaps for easier interpretation
+        norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
+        norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
 
+        # Draw cutoff lines on each camera to mark the active sensing band
+        for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
+            top_y = top_cutoff_pixels
+            bottom_y = h - bottom_cutoff_pixels
+            cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
+            cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
 
-    
-    # Draw the guidance circle
-    blue_pos = (draw_x, line_y)
-    cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
+        # (Optional) draw obstacle points (kept off by default)
+        # for is_obst, pt in zip(mask, cloud):
+        #     if not is_obst: continue
+        #     px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
+        #     frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
+        #     if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels):
+        #         continue
+        #     target = cmap0 if cam == 0 else cmap1
+        #     offset_x = 0 if cam == 0 else w0
+        #     cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
 
-    # Display "Steer Control" on the left frame
-    cv2.putText(
-        combined,
-        f"Steer Control: {steer_control_x}",
-        hud_text_position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        cv2.LINE_AA
-    )
+        # Build combined view and overlay guidance
+        combined = np.hstack((cmap0, cmap1))
+        h_combined = frame0.shape[0]
+        line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
 
-    # Visualize the pull zone boundaries (blue vertical lines)
-    cv2.line(
-        combined,
-        (int(zone_left), 0),
-        (int(zone_left), h_combined),
-        pull_zone_line_color,
-        pull_zone_line_thickness,
-    )
-    cv2.line(
-        combined,
-        (int(zone_right), 0),
-        (int(zone_right), h_combined),
-        pull_zone_line_color,
-        pull_zone_line_thickness,
-    )
-    # ────────────────────────────────────────────────────────────────────
+        # Draw the guidance circle
+        blue_pos = (draw_x, line_y)
+        cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
 
-    # Present the final annotated view
-    cv2.imshow("Depth: Camera 0 | Camera 1", combined)
-    key = cv2.waitKey(1) & 0xFF
+        # Display "Steer Control"
+        cv2.putText(
+            combined,
+            f"Steer Control: {steer_control_x}",
+            hud_text_position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_color,
+            hud_text_thickness,
+            cv2.LINE_AA
+        )
 
-    # Handle keys — currently only ESC to exit
-    if key == 27:
-        break
+        # Visualize the pull zone boundaries (blue vertical lines)
+        cv2.line(combined, (int(zone_left), 0), (int(zone_left), combined.shape[0]),
+                 pull_zone_line_color, pull_zone_line_thickness)
+        cv2.line(combined, (int(zone_right), 0), (int(zone_right), combined.shape[0]),
+                 pull_zone_line_color, pull_zone_line_thickness)
+
+        # Present the final annotated view
+        cv2.imshow("Depth: Camera 0 | Camera 1", combined)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
+            break
+    # -----------------------------------------------------------------------
 
 # === Cleanup ===
 running = False
 cap0.release()
 cap1.release()
-cv2.destroyAllWindows()
+if SHOW_GUI:
+    cv2.destroyAllWindows()
 
-# PWM cleanup (added; non-intrusive)
+# PWM cleanup
 try:
     if pwm_driver is not None:
         pwm_driver.disable()
