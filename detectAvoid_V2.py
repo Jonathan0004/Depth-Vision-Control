@@ -192,7 +192,9 @@ while True:
         # draw red dot
         target = cmap0 if cam == 0 else cmap1
         offset_x = 0 if cam == 0 else w0
-        cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
+
+        #Red Dots:
+        # cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
 
     # Show combined view
     combined = np.hstack((cmap0, cmap1))
