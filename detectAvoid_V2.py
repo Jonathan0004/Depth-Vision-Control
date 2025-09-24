@@ -5,88 +5,64 @@ from PIL import Image
 from transformers import pipeline
 from threading import Thread
 import queue
+import json
+import os
+import time
 
-# ============================================================================
-# Depth Dual-Camera Viewer with Obstacle Detection & Steering Guidance
-# ----------------------------------------------------------------------------
-# This script fuses two camera feeds, estimates depth, highlights detected
-# obstacles, and overlays guidance for steering around them.
-#
-# The overall program flow is:
-#   1. Configure tunable parameters (grid density, detection thresholds, etc.).
-#   2. Start the depth-estimation model and camera capture pipelines.
-#   3. Spawn background threads to keep frames and inference results flowing.
-#   4. Within the main loop:
-#        * Build a sparse depth cloud on a configurable grid.
-#        * Detect obstacles by comparing depth values to global statistics.
-#        * Render visualizations (depth colormap, cutoffs, detected points).
-#        * Plan a clear horizontal route and draw steering guidance.
-#   5. Press ESC to exit cleanly.
-# ============================================================================
+# ============================
+#  Depth Dual-Camera with Obstacle Detection & Cutoff Zones
+#  - Press 'c' to toggle distance-measurement / calibration mode
+#  - Obstacles are detected by comparing depth at grid points against a combined-frame average and threshold
+#  - Red dots mark detected obstacles—but ONLY between top & bottom cutoffs
+#  - Thin green lines show the top/bottom cutoff boundaries
+#  - Press 'Esc' to exit
+# ============================
 
-# ---------------------------------------------------------------------------
-# Tunable Parameters (grouped for quick tweaking)
-# ---------------------------------------------------------------------------
+# === Grid & Calibration ===
+rows, cols = 25, 50  # grid resolution
+calib_file = 'calibration.json'
 
-# Grid sampling density for obstacle detection. Higher values sample more
-# points but increase computation time. These values directly control the size
-# of the sparse point cloud used for analysis.
-GRID_ROWS = 25
-GRID_COLS = 50
+# === Obstacle Detection Tunables ===
+depth_diff_threshold = 8      # minimum absolute depth difference (relative units)
+std_multiplier = 0.3         # multiplier for standard deviation threshold
 
-# Obstacle detection sensitivity. The model compares each sampled depth value
-# against the global statistics of the entire sparse cloud. Tune these to make
-# detection more or less aggressive.
-DEPTH_DIFF_THRESHOLD = 5    # Minimum absolute difference from the mean depth.
-STD_MULTIPLIER = 0.23       # Multiplier for the standard-deviation-based gate.
+#std_multiplier = 0.23 (Outdoor)
 
-# Vertical cutoff boundaries (in pixels from the respective frame edges). Red
-# obstacle markers will only appear between these lines. Adjust to ignore sky
-# or the vehicle body. The same values are used for both cameras.
-TOP_CUTOFF_PIXELS = 10
-BOTTOM_CUTOFF_PIXELS = 54
 
-# Horizontal route-planner smoothing. Values near 0 snap instantly to a new
-# target gap; values near 1 move very slowly for a damped response.
-BLUE_X_SMOOTHNESS = 0.5
 
-# Width of the "pull" zone around the combined-image center. Obstacles inside
-# this area directly influence the route planner. Obstacles outside only count
-# if the pull zone already contains something.
-PULL_INFLUENCE_RADIUS_PX = 120
+# === New Cutoff Settings (pixels) ===
+top_cutoff_pixels = 10        # no red-dots above this many pixels from the top
+bottom_cutoff_pixels = 54     # no red-dots below this many pixels from the bottom
 
-# ---------------------------------------------------------------------------
-# Runtime State (initialized here for clarity)
-# ---------------------------------------------------------------------------
 
-# Persistent estimate of the blue guidance circle's X-position (float for
-# smooth interpolation).
-blue_x = None
 
-# Current steering command that gets printed on-screen each frame.
+# === Blue-Route Planner Tunables (HORIZONTAL-GAP) ===
+blue_x_smoothness = 0.7    # 0 → instant jumps, 1 → almost no motion
+
+blue_x = None              # persistent horizontal position of the blue circle
+
+# === Blue-Route Planner (Pull Zone) ===
+pull_influence_radius_px = 120   # <-- tune this: pixels from center that can 'pull' the blue circle
+
+
+# Current steering position (blue circle x in the combined image)
 steer_control_x = None
 
 
-def clamp(val, minn, maxn):
-    """Clamp *val* to the inclusive range [minn, maxn]."""
-    return max(min(val, maxn), minn)
 
 
-# ---------------------------------------------------------------------------
-# Initialize the Depth-Estimation Pipeline
-# ---------------------------------------------------------------------------
+
+def clamp(val, minn, maxn): return max(min(val, maxn), minn)
+
+# === Initialize Depth-Estimation Pipeline ===
 depth_pipe = pipeline(
     task="depth-estimation",
     model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
     device=0
 )
 
-
-# ---------------------------------------------------------------------------
-# Camera Capture Setup (Jetson CSI via GStreamer)
-# ---------------------------------------------------------------------------
+# === GStreamer Pipeline Helper ===
 def make_gst(sensor_id):
-    """Return a GStreamer pipeline string for the given CSI camera."""
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
         "video/x-raw(memory:NVMM),width=300,height=150,framerate=60/1 ! "
@@ -95,68 +71,67 @@ def make_gst(sensor_id):
         "appsink sync=false max-buffers=1 drop=true"
     )
 
-
-# Open both camera feeds using the helper above.
+# === Open Cameras ===
 cap0 = cv2.VideoCapture(make_gst(0), cv2.CAP_GSTREAMER)
 cap1 = cv2.VideoCapture(make_gst(1), cv2.CAP_GSTREAMER)
 if not cap0.isOpened() or not cap1.isOpened():
     raise RuntimeError("Failed to open one or both cameras.")
-
-# Keep the buffer shallow so we always process the freshest frame.
 cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+# === Load Calibration Data ===
+measured_avg = None
+actual = None
+distance_scale = 1.0
+if os.path.exists(calib_file):
+    with open(calib_file, 'r') as f:
+        data = json.load(f)
+    dc = data.get('distance_calibration', {})
+    meas = dc.get('measured', 0)
+    act = dc.get('actual', 0)
+    if meas > 0:
+        measured_avg = meas
+        actual = act
+        distance_scale = act / meas
+    print("✅ Loaded distance calibration.")
+else:
+    print("⚠️ calibration.json not found.")
 
-# ---------------------------------------------------------------------------
-# Threaded Queues for Camera Frames and Depth Inference
-# ---------------------------------------------------------------------------
+# === Threaded Frame and Inference Queues ===
 frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
 running = True
 
-
 def grab(cam, q):
-    """Continuously grab frames from *cam* and push the latest into *q*."""
     while running:
         ret, frame = cam.read()
         if ret:
-            if q.full():
-                q.get_nowait()  # discard stale frame to avoid blocking
+            if q.full(): q.get_nowait()
             q.put(frame)
 
-
-# Launch frame grabbers for both cameras.
 Thread(target=grab, args=(cap0, frame_q0), daemon=True).start()
 Thread(target=grab, args=(cap1, frame_q1), daemon=True).start()
 
-
 def infer():
-    """Fetch paired frames, run depth estimation, and queue the results."""
     while running:
         try:
             f0 = frame_q0.get(timeout=0.01)
             f1 = frame_q1.get(timeout=0.01)
         except queue.Empty:
             continue
-
         imgs = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in (f0, f1)]
-
         with torch.amp.autocast(device_type='cuda'), torch.no_grad():
             outs = depth_pipe(imgs)
-
         d0, d1 = [np.array(o['depth']) for o in outs]
-
-        if result_q.full():
-            result_q.get_nowait()
+        if result_q.full(): result_q.get_nowait()
         result_q.put((f0, d0, f1, d1))
 
-
-# Depth inference runs on its own background thread.
 Thread(target=infer, daemon=True).start()
 
+# === Viewer Modes ===
+measurement_mode = False
+point_calib_mode = False
 
-# ---------------------------------------------------------------------------
-# Main Visualization & Planning Loop
-# ---------------------------------------------------------------------------
+# === Main Loop ===
 while True:
     try:
         frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
@@ -170,10 +145,10 @@ while True:
     for cam_idx, (depth, x_offset, w, h) in enumerate([
         (depth0, 0, w0, h0), (depth1, w0, w1, h1)
     ]):
-        for c in range(GRID_COLS):
-            for r in range(GRID_ROWS):
-                px = int((c + 0.5) * w / GRID_COLS) + x_offset
-                py = int((r + 0.5) * h / GRID_ROWS)
+        for c in range(cols):
+            for r in range(rows):
+                px = int((c + 0.5) * w / cols) + x_offset
+                py = int((r + 0.5) * h / rows)
                 z  = float(depth[int(py), int(px - x_offset)])
                 points.append((px, py, z, cam_idx))
     cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
@@ -181,7 +156,7 @@ while True:
     # Obstacle detection thresholds
     zs = cloud['z']
     mean_z, std_z = zs.mean(), zs.std()
-    thresh = max(DEPTH_DIFF_THRESHOLD, STD_MULTIPLIER * std_z)
+    thresh = max(depth_diff_threshold, std_multiplier * std_z)
     mask = (mean_z - zs) > thresh
 
     # Prepare visualizations
@@ -192,12 +167,17 @@ while True:
 
     # Draw cutoff lines on each camera
     for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
-        # Top cutoff line (ignore everything above)
-        cv2.line(cmap, (0, TOP_CUTOFF_PIXELS), (w, TOP_CUTOFF_PIXELS), (0, 255, 0), 1)
-
-        # Bottom cutoff line (ignore everything below)
-        bottom_y = h - BOTTOM_CUTOFF_PIXELS
-        cv2.line(cmap, (0, bottom_y), (w, bottom_y), (0, 255, 0), 1)
+        # top cutoff line
+        cv2.line(cmap,
+                 (0, top_cutoff_pixels),
+                 (w, top_cutoff_pixels),
+                 (0, 255, 0), 1)
+        # bottom cutoff line
+        bottom_y = h - bottom_cutoff_pixels
+        cv2.line(cmap,
+                 (0, bottom_y),
+                 (w, bottom_y),
+                 (0, 255, 0), 1)
 
     # Draw obstacle points only within cutoffs
     for is_obst, pt in zip(mask, cloud):
@@ -205,29 +185,41 @@ while True:
             continue
         px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
         # check cutoffs
-        if py < TOP_CUTOFF_PIXELS or py > ((frame0.shape[0] if cam == 0 else frame1.shape[0]) - BOTTOM_CUTOFF_PIXELS):
+        if py < top_cutoff_pixels or py > ( (frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels ):
             continue
         # draw red dot
         target = cmap0 if cam == 0 else cmap1
-        #cv2.circle(target, (px - (0 if cam==0 else w0), py), 5, (0, 0, 255), -1)
+        cv2.circle(target, (px - (0 if cam==0 else w0), py), 5, (0, 0, 255), -1)
+
+    # Measurement / calibration overlays
+    if measurement_mode or point_calib_mode:
+        cy, cx = h0 // 2, w0 // 2
+        px = cx * frame0.shape[1] // w0
+        py = cy * frame0.shape[0] // h0
+        cv2.drawMarker(cmap0, (px, py), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+        if measurement_mode:
+            dist = depth0[cy, cx] * distance_scale
+            cv2.putText(cmap0, f"{dist:.2f} m", (10, frame0.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
 
     # Show combined view
     combined = np.hstack((cmap0, cmap1))
     
     
     
-    # === HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
+    # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
     h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
 
     # vertical midpoint between the two green cutoff lines
-    line_y = (TOP_CUTOFF_PIXELS + (h_combined - BOTTOM_CUTOFF_PIXELS)) // 2
+    line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
 
     # combined-frame center X
     center_x = w_combined // 2
 
     # pull zone boundaries (clamped to image)
-    zone_left = clamp(center_x - PULL_INFLUENCE_RADIUS_PX, 0, w_combined)
-    zone_right = clamp(center_x + PULL_INFLUENCE_RADIUS_PX, 0, w_combined)
+    zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
+    zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
 
     # Collect red-dot X positions that fall between the cutoff green lines (both cams)
     red_xs_all = []
@@ -238,7 +230,7 @@ while True:
             continue
         px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
         frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
-        if py < TOP_CUTOFF_PIXELS or py > (frame_h - BOTTOM_CUTOFF_PIXELS):
+        if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels):
             continue
         red_xs_all.append(px)
         if zone_left <= px <= zone_right:
@@ -266,7 +258,7 @@ while True:
             cx = (left + right) // 2
             dist = abs(cx - preferred_x)
             if (width > best_width) or (width == best_width and dist < best_dist):
-            	best_width = width
+                best_width = width
                 best_dist = dist
                 best_cx = cx
         return int(best_cx)
@@ -283,7 +275,7 @@ while True:
     if blue_x is None:
         blue_x = float(gap_cx)
     else:
-        blue_x = blue_x * BLUE_X_SMOOTHNESS + gap_cx * (1 - BLUE_X_SMOOTHNESS)
+        blue_x = blue_x * blue_x_smoothness + gap_cx * (1 - blue_x_smoothness)
 
     # Round ONLY for rendering / display to avoid bias
     draw_x = int(round(blue_x))
@@ -320,9 +312,41 @@ while True:
     cv2.imshow("Depth: Camera 0 | Camera 1", combined)
     key = cv2.waitKey(1) & 0xFF
 
-    # Only ESC (27) exits; other hotkeys have been intentionally removed to
-    # simplify the interface now that calibration mode is no longer needed.
-    if key == 27:
+    # Handle keys
+    if key == ord('c'):
+        if not measurement_mode and not point_calib_mode:
+            measurement_mode = True
+            print("🎯 Measurement mode ON.")
+        elif measurement_mode:
+            measurement_mode = False
+            point_calib_mode = True
+            print("🛠️ Calibration mode ON. Press SPACE to capture.")
+        else:
+            point_calib_mode = False
+            print("🔄 Exited calibration mode.")
+    elif point_calib_mode and key == ord(' '):
+        samples = []
+        print("📐 Capturing 4 samples...")
+        for i in range(4):
+            try:
+                _, d0, _, _ = result_q.get(timeout=1)
+            except queue.Empty:
+                print(f" ✗ Sample {i+1} timeout")
+                continue
+            samples.append(d0[h0//2, w0//2])
+            print(f" ✓ Sample {i+1}: {samples[-1]:.3f} m")
+            time.sleep(0.5)
+        if len(samples) == 4:
+            measured_avg = float(np.mean(samples))
+            actual = float(input(f"Enter actual distance in meters (measured {measured_avg:.3f}): "))
+            distance_scale = actual / measured_avg if measured_avg else 1.0
+            with open(calib_file, 'w') as f:
+                json.dump({"distance_calibration": {"measured": measured_avg, "actual": actual}}, f)
+            print("💾 Calibration saved.")
+        else:
+            print("⚠️ Insufficient samples.")
+        point_calib_mode = False
+    elif key == 27:
         break
 
 # === Cleanup ===
