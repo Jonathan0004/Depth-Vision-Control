@@ -23,9 +23,10 @@ from transformers import pipeline
 try:
     import Jetson.GPIO as GPIO
     GPIO_AVAILABLE = True
-except ImportError:  # pragma: no cover - Jetson specific hardware dependency
+except Exception as exc:  # pragma: no cover - Jetson specific hardware dependency
     GPIO = None
     GPIO_AVAILABLE = False
+    print(f"Jetson GPIO unavailable ({exc}). Running in no-GPIO mode.")
 
 
 # ---------------------------------------------------------------------------
