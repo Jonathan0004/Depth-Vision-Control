@@ -69,16 +69,7 @@ hud_text_thickness = 1
 PWMCHIP = "/sys/class/pwm/pwmchip3"
 PWM_CHANNEL_INDEX = 0           # -> pwm0
 PWM_PERIOD_NS = 20_000_000      # 50 Hz period (20 ms)
-PWM_NEUTRAL_DUTY_NS = 1_500_000  # 1.5 ms (neutral for most hobby servos / ESCs)
-
-# Steering PWM tuning — tweak to match the usable travel of your motor/ESC.
-# If the motor fails to reverse, try reducing LEFT_LIMIT (less reverse travel),
-# shrinking STEER_SPAN_PX, or toggling INVERT_OUTPUT.
-PWM_LEFT_LIMIT_NS = 1_000_000    # duty when the cue is fully left
-PWM_RIGHT_LIMIT_NS = 2_000_000   # duty when the cue is fully right
-PWM_STEER_SPAN_PX = 220          # pixels from centre to reach a limit duty
-PWM_MIN_WRITE_DELTA_NS = 500     # skip tiny updates below this change (noise filter)
-PWM_INVERT_OUTPUT = False        # flip the steering direction if hardware reversed
+PWM_DUTY_NS = 1_500_000         # 1.5 ms (neutral for most hobby servos)
 # ---------------------------------------------------------------------------
 
 
@@ -102,26 +93,6 @@ pwm_driver = None
 # Utility: clamp values between two bounds (used to keep overlays on-screen)
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
-
-
-# Convert the steering cue position into a PWM duty cycle.
-def steer_to_pwm_duty(steer_x: int, center_x: float) -> int:
-    if PWM_STEER_SPAN_PX <= 0:
-        raise ValueError("PWM_STEER_SPAN_PX must be > 0 to map steering to PWM")
-
-    delta_px = steer_x - center_x
-    norm = float(np.clip(delta_px / float(PWM_STEER_SPAN_PX), -1.0, 1.0))
-
-    if PWM_INVERT_OUTPUT:
-        norm *= -1.0
-
-    if norm >= 0:
-        duty = PWM_NEUTRAL_DUTY_NS + norm * (PWM_RIGHT_LIMIT_NS - PWM_NEUTRAL_DUTY_NS)
-    else:
-        duty = PWM_NEUTRAL_DUTY_NS + norm * (PWM_NEUTRAL_DUTY_NS - PWM_LEFT_LIMIT_NS)
-
-    return int(round(np.clip(duty, min(PWM_LEFT_LIMIT_NS, PWM_RIGHT_LIMIT_NS),
-                              max(PWM_LEFT_LIMIT_NS, PWM_RIGHT_LIMIT_NS))))
 
 
 # Minimal sysfs PWM driver keeping the duty file handle open for fast updates
@@ -389,19 +360,23 @@ try:
         if not pwm_initialized and not pwm_error_reported:
             try:
                 pwm_driver = PWMDriver(PWMCHIP, PWM_CHANNEL_INDEX)
-                pwm_driver.init(PWM_PERIOD_NS, PWM_NEUTRAL_DUTY_NS)  # 50 Hz @ neutral
+                pwm_driver.init(PWM_PERIOD_NS, PWM_DUTY_NS)  # 50 Hz @ 1.5 ms neutral  ✅
                 pwm_initialized = True
-                neutral_ms = PWM_NEUTRAL_DUTY_NS / 1_000_000
-                print(f"PWM initialized: 50 Hz @ {neutral_ms:.2f} ms (neutral) on pwmchip3/pwm{PWM_CHANNEL_INDEX}.")
+                print("PWM initialized: 50 Hz @ 1.5 ms (neutral) on pwmchip3/pwm0.")
             except Exception as e:
                 pwm_error_reported = True
                 print(f"[PWM] Initialization error: {e}")
 
         if pwm_initialized:
-            duty = steer_to_pwm_duty(steer_control_x, center_x)
+            min_ns, center_ns, max_ns = 1_000_000, 1_500_000, 2_000_000  # 1–2 ms
+            span_px = 300  # pixels from center to reach min/max (tune for your geometry)
+
+            delta_px = steer_control_x - center_x
+            duty = int(np.clip(center_ns + (delta_px / span_px) * (max_ns - center_ns),
+                               min_ns, max_ns))
 
             # Optional tiny deadband to reduce redundant writes (~0.5 µs):
-            if (last_duty_ns is None) or (abs(duty - last_duty_ns) >= PWM_MIN_WRITE_DELTA_NS):
+            if (last_duty_ns is None) or (abs(duty - last_duty_ns) >= 500):
                 pwm_driver.set_duty(duty)
                 last_duty_ns = duty
         # =========================== PWM SECTION: END ===========================
