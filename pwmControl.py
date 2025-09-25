@@ -1,4 +1,3 @@
-# This script creates a 50hz output with a 50% duty cycle
 # Outputs PWM on Pin 32
 # Ground is Pin 30
 
@@ -7,7 +6,7 @@ import os, time
 PWMCHIP="/sys/class/pwm/pwmchip3"  # set to the one that shows on your pin
 CH="pwm0"
 PERIOD=20_000_000   # 50 Hz (nanoseconds)
-DUTY=10_000_000     # 50% (nanoseconds)
+DUTY=1_590_000     
 PWM=f"{PWMCHIP}/{CH}"
 
 def wr(p, v):
