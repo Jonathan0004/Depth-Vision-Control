@@ -1,16 +1,12 @@
-"""
-Stereo depth estimation with obstacle detection and steering guidance.
+"""Stereo depth estimation with obstacle detection and steering guidance.
 
-UPDATED FOR TB6612FNG:
-- One DC motor on channel A (A01/A02)
-- 5 kHz PWM on PWMA (Jetson sysfs: pwmchip3/pwm0), duty-cycle only for speed
-- Direction via AIN1/AIN2; STBY held HIGH
-- Center steering => 0% duty (stop). Farther left/right => higher duty.
-- Right/Left chooses direction (configurable with RIGHT_IS_FORWARD).
+The script streams from two cameras, infers depth using the
+``depth-anything`` model, highlights obstacles inside configurable cutoff
+bands, and visualises a blue steering cue that points toward the widest gap.
+All tunable parameters live together for quick iteration.
 
-Notes:
-- We DO NOT explicitly use "coast" or "brake" states—just duty = 0 to stop.
-- When direction changes, we drop duty to 0 first, then flip IN1/IN2.
+Now includes PWM steering output (Jetson sysfs pwmchip3/pwm0) updated from the
+computed steering x-position.
 """
 
 import os
@@ -24,142 +20,83 @@ import torch
 from PIL import Image
 from transformers import pipeline
 
-try:
-    import Jetson.GPIO as GPIO  # <-- for AIN1/AIN2/STBY control
-    _GPIO_AVAILABLE = True
-except Exception as exc:  # pragma: no cover - fallback path on non-Jetson systems
-    _GPIO_AVAILABLE = False
-
-    class _DummyGPIO:
-        """Minimal stub matching the Jetson.GPIO API used in this script."""
-
-        BOARD = "BOARD"
-        HIGH = 1
-        LOW = 0
-
-        def __init__(self):
-            self._warned = False
-
-        def _warn(self):
-            if not self._warned:
-                print(
-                    f"[GPIO] Jetson.GPIO unavailable ({exc}). Using no-op GPIO stub. "
-                    "Motor control disabled."
-                )
-                self._warned = True
-
-        def setmode(self, *_args, **_kwargs):
-            self._warn()
-
-        def setup(self, *_args, **_kwargs):
-            self._warn()
-
-        def output(self, *_args, **_kwargs):
-            self._warn()
-
-        def cleanup(self, *_args, **_kwargs):
-            self._warn()
-
-    GPIO = _DummyGPIO()
-
 
 # ---------------------------------------------------------------------------
-# Configuration — visual processing (unchanged)
+# Configuration — tweak these values to adjust behaviour without diving into
+# the rest of the code. Where possible, related values are grouped together and
+# documented so their impact is clear.
 # ---------------------------------------------------------------------------
 
+# Grid resolution for sampling depth points across each frame (higher = denser)
 rows, cols = 25, 50
-depth_diff_threshold = 8
-std_multiplier = 0.3
 
-top_cutoff_pixels = 10
-bottom_cutoff_pixels = 54
+# Obstacle detection thresholds
+depth_diff_threshold = 8      # minimum mean-depth difference to flag a point
+std_multiplier = 0.3          # scales standard deviation term for adaptive thresholding
+
+# Cutoff bands (green) — obstacles outside these vertical limits are ignored
+top_cutoff_pixels = 10        # pixels from the top edge of each camera frame
+bottom_cutoff_pixels = 54     # pixels from the bottom edge of each camera frame
 cutoff_line_color = (0, 255, 0)
 cutoff_line_thickness = 1
 
+# Obstacle marker (red dots)
 obstacle_dot_radius_px = 5
 obstacle_dot_color = (0, 0, 255)
 
+# Blue steering cue (circle) rendered on the combined frame
 blue_circle_radius_px = 12
 blue_circle_color = (255, 0, 0)
 blue_circle_thickness = 3
 
+# Blue vertical cutoff lines indicate the "pull zone" used for gating logic
 pull_zone_line_color = (255, 0, 0)
 pull_zone_line_thickness = 1
-pull_influence_radius_px = 120
-pull_zone_center_offset_px = 0
+pull_influence_radius_px = 120   # half-width of the pull zone around centre
+pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left)
 
+# Smoothing factor for the steering cue (1 → frozen, 0 → instant response)
 blue_x_smoothness = 0.7
+
+# HUD text overlays on the combined frame
 hud_text_position = (10, 30)
 hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
 
-
+# ------------------------ PWM Output Configuration --------------------------
+# Jetson sysfs PWM path & parameters (adjust PWMCHIP/pwm index for your board)
+PWMCHIP = "/sys/class/pwm/pwmchip3"
+PWM_CHANNEL_INDEX = 0           # -> pwm0
+PWM_PERIOD_NS = 20_000_000      # 50 Hz period (20 ms)
+PWM_DUTY_NS = 1_500_000         # 1.5 ms (neutral for most hobby servos)
 # ---------------------------------------------------------------------------
-# TB6612FNG + Jetson PWM/GPIO configuration
-# ---------------------------------------------------------------------------
-
-# --- PWM (PWMA) on Jetson sysfs ---
-PWMCHIP = "/sys/class/pwm/pwmchip3"  # same path you were using
-PWM_CHANNEL_INDEX = 0                # -> pwm0
-PWM_FREQ_HZ = 5_000                  # 5 kHz fixed
-PWM_PERIOD_NS = int(1e9 // PWM_FREQ_HZ)  # 200_000 ns at 5 kHz
-
-# Start at 0% duty so the motor is stopped until steering tells it to move
-PWM_START_DUTY_NS = 0
-
-# --- Direction pins (edit these to match your wiring) ---
-# Using BOARD numbering (physical header pins):
-GPIO.setmode(GPIO.BOARD)
-STBY_PIN = 29   # STBY  -> HIGH = enabled
-AIN1_PIN = 33   # AIN1  -> HIGH (with AIN2 LOW) = FORWARD
-AIN2_PIN = 31   # AIN2  -> HIGH (with AIN1 LOW) = REVERSE
-
-# Print friendly mapping at startup
-PIN_LABELS = (
-    f"PIN MAP (BOARD numbering): STBY={STBY_PIN}, AIN1={AIN1_PIN}, AIN2={AIN2_PIN}, "
-    f"PWMA=pwmchip3/pwm{PWM_CHANNEL_INDEX} (5 kHz)"
-)
-
-# Which steering side means "forward"?
-# True: Right of center => FORWARD, Left => REVERSE
-# False: Right => REVERSE, Left => FORWARD
-RIGHT_IS_FORWARD = True
-
-# How close to center counts as "stop" (to avoid jitter)
-CENTER_DEADBAND_PX = 5
-
-# Pixel distance from center that maps to 100% duty (tune as you like)
-SPAN_PX = pull_influence_radius_px  # use your pull zone half-width
 
 
 # ---------------------------------------------------------------------------
-# Runtime state
+# Runtime state (initialised once, then updated as frames stream in)
 # ---------------------------------------------------------------------------
-blue_x = None
-steer_control_x = None
+blue_x = None              # persistent, smoothed x-position of the blue circle
+steer_control_x = None     # integer pixel location displayed as HUD text
 
+# PWM runtime flags/state
 pwm_initialized = False
 pwm_error_reported = False
-last_duty_ns = 0
+last_duty_ns = None
 pwm_driver = None
 
-current_dir = None  # "FORWARD" / "REVERSE" / None
-last_sign = 0       # -1, 0, +1
-
 
 # ---------------------------------------------------------------------------
-# Utilities
+# Helper utilities and pipeline initialisation
 # ---------------------------------------------------------------------------
 
+# Utility: clamp values between two bounds (used to keep overlays on-screen)
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
 
 
+# Minimal sysfs PWM driver keeping the duty file handle open for fast updates
 class PWMDriver:
-    """
-    Minimal sysfs PWM driver for speed. Keeps duty file open for low-latency updates.
-    """
     def __init__(self, chip_path: str, channel_index: int):
         self.chip_path = chip_path
         self.channel_index = int(channel_index)
@@ -172,11 +109,14 @@ class PWMDriver:
             f.write(str(value))
 
     def init(self, period_ns: int, duty_ns: int):
+        # Sanity check chip exists
         if not os.path.isdir(self.chip_path):
             raise FileNotFoundError(f"{self.chip_path} does not exist. Check which pwmchipN is present.")
 
+        # Export channel if needed
         if not os.path.isdir(self.pwm_path):
             PWMDriver._wr(os.path.join(self.chip_path, "export"), str(self.channel_index))
+            # Wait for sysfs to create pwmN directory
             for _ in range(200):
                 if os.path.isdir(self.pwm_path):
                     break
@@ -184,24 +124,26 @@ class PWMDriver:
             else:
                 raise TimeoutError(f"pwm{self.channel_index} did not appear after export")
 
+        # Disable before configuration (some drivers require this)
         try:
             PWMDriver._wr(os.path.join(self.pwm_path, "enable"), "0")
         except OSError:
-            pass
+            pass  # okay during initialisation races
 
+        # Configure while disabled: period -> duty -> enable
         PWMDriver._wr(os.path.join(self.pwm_path, "period"), period_ns)
-        # Clamp initial duty to [0, period]
-        duty_ns = max(0, min(int(duty_ns), int(period_ns)))
         PWMDriver._wr(os.path.join(self.pwm_path, "duty_cycle"), duty_ns)
         PWMDriver._wr(os.path.join(self.pwm_path, "enable"), "1")
+
+        # Keep the duty file open for low-latency updates
         self._duty_file = open(os.path.join(self.pwm_path, "duty_cycle"), "w")
 
     def set_duty(self, duty_ns: int):
         if self._duty_file is None:
             raise RuntimeError("PWM not initialised. Call init() first.")
-        duty_ns = max(0, min(int(duty_ns), int(PWM_PERIOD_NS)))
+        # Write with rewind to avoid leftover digits when writing fewer chars
         self._duty_file.seek(0)
-        self._duty_file.write(str(duty_ns))
+        self._duty_file.write(str(int(duty_ns)))
         self._duty_file.flush()
 
     def close(self):
@@ -215,43 +157,14 @@ class PWMDriver:
                 pass
 
 
-def set_direction(new_dir: str):
-    """
-    Set AIN1/AIN2 for desired direction.
-    FORWARD  -> STBY=HIGH, AIN1=HIGH, AIN2=LOW
-    REVERSE  -> STBY=HIGH, AIN1=LOW,  AIN2=HIGH
-    """
-    global current_dir
-    if new_dir == current_dir:
-        return
-    if new_dir not in ("FORWARD", "REVERSE"):
-        return
-
-    # STBY must be HIGH to operate
-    GPIO.output(STBY_PIN, GPIO.HIGH)
-
-    if new_dir == "FORWARD":
-        GPIO.output(AIN1_PIN, GPIO.HIGH)
-        GPIO.output(AIN2_PIN, GPIO.LOW)
-        print("[DIR] FORWARD  — STBY=HIGH, AIN1=HIGH, AIN2=LOW")
-    else:
-        GPIO.output(AIN1_PIN, GPIO.LOW)
-        GPIO.output(AIN2_PIN, GPIO.HIGH)
-        print("[DIR] REVERSE  — STBY=HIGH, AIN1=LOW,  AIN2=HIGH")
-
-    current_dir = new_dir
-
-
-# ---------------------------------------------------------------------------
-# Depth model + cameras (unchanged)
-# ---------------------------------------------------------------------------
-
+# Initialise the depth estimation model once (heavy call, so keep global)
 depth_pipe = pipeline(
     task="depth-estimation",
     model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
     device=0
 )
 
+# Build the camera-specific GStreamer pipeline string for a Jetson device
 def make_gst(sensor_id):
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
@@ -261,6 +174,7 @@ def make_gst(sensor_id):
         "appsink sync=false max-buffers=1 drop=true"
     )
 
+# Open both cameras and trim their internal buffers for minimal latency
 cap0 = cv2.VideoCapture(make_gst(0), cv2.CAP_GSTREAMER)
 cap1 = cv2.VideoCapture(make_gst(1), cv2.CAP_GSTREAMER)
 if not cap0.isOpened() or not cap1.isOpened():
@@ -268,10 +182,17 @@ if not cap0.isOpened() or not cap1.isOpened():
 cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+# Thread-safe queues for streaming frames and depth inference results
 frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
 running = True
 
+
+# ---------------------------------------------------------------------------
+# Background threads: one per camera for capture, one shared for inference
+# ---------------------------------------------------------------------------
+
 def grab(cam, q):
+    """Continuously read frames from `cam` and keep the freshest one in `q`."""
     while running:
         ret, frame = cam.read()
         if ret:
@@ -282,6 +203,7 @@ Thread(target=grab, args=(cap0, frame_q0), daemon=True).start()
 Thread(target=grab, args=(cap1, frame_q1), daemon=True).start()
 
 def infer():
+    """Fetch paired frames, run depth inference, and push the results downstream."""
     while running:
         try:
             f0 = frame_q0.get(timeout=0.01)
@@ -297,17 +219,8 @@ def infer():
 
 Thread(target=infer, daemon=True).start()
 
-
 # ---------------------------------------------------------------------------
-# GPIO init (direction + STBY)
-# ---------------------------------------------------------------------------
-GPIO.setup([STBY_PIN, AIN1_PIN, AIN2_PIN], GPIO.OUT, initial=GPIO.LOW)
-GPIO.output(STBY_PIN, GPIO.HIGH)  # enable TB6612FNG
-print(PIN_LABELS)
-
-
-# ---------------------------------------------------------------------------
-# Main loop
+# Main processing loop — consume depth results, annotate, and display
 # ---------------------------------------------------------------------------
 try:
     while True:
@@ -316,7 +229,7 @@ try:
         except queue.Empty:
             continue
 
-        # Build sparse point cloud
+        # Build a sparse point cloud by sampling each depth map on a coarse grid
         h0, w0 = depth0.shape
         h1, w1 = depth1.shape
         points = []
@@ -331,42 +244,58 @@ try:
                     points.append((px, py, z, cam_idx))
         cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
 
-        # Obstacle candidates
+        # Determine obstacle candidates by comparing each sample to the scene average
         zs = cloud['z']
         mean_z, std_z = zs.mean(), zs.std()
         thresh = max(depth_diff_threshold, std_multiplier * std_z)
         mask = (mean_z - zs) > thresh
 
-        # Visualisation
+        # Convert depth arrays into coloured heatmaps for easier interpretation
         norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
         norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
 
+        # Draw cutoff lines on each camera to mark the active sensing band
         for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
             top_y = top_cutoff_pixels
             bottom_y = h - bottom_cutoff_pixels
             cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
             cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
 
+        # Draw obstacle points only within cutoffs
         for is_obst, pt in zip(mask, cloud):
             if not is_obst:
                 continue
             px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
-            if py < top_cutoff_pixels or py > ((frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels):
+            # check cutoffs
+            if py < top_cutoff_pixels or py > ( (frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels ):
                 continue
-            # optional obstacle dots omitted for clarity
+            # target = cmap0 if cam == 0 else cmap1
+            # offset_x = 0 if cam == 0 else w0
+            # Optional: draw red dots
+            # cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
 
+        # Show combined view
         combined = np.hstack((cmap0, cmap1))
 
-        # Route planner
+        # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
         h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
+
+        # vertical midpoint between the two green cutoff lines (for blue circle)
         line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
+
+        # combined-frame center X, optionally offset for asymmetric steering bias
         center_x = (w_combined // 2) + pull_zone_center_offset_px
+
+        # pull zone boundaries (clamped to image)
         zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
         zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
 
-        red_xs_all, red_xs_in_zone = [], []
+        # Collect red-dot X positions that fall between the cutoff green lines (both cams)
+        red_xs_all = []
+        red_xs_in_zone = []
+
         for is_obst, pt in zip(mask, cloud):
             if not is_obst:
                 continue
@@ -377,12 +306,19 @@ try:
             red_xs_all.append(px)
             if zone_left <= px <= zone_right:
                 red_xs_in_zone.append(px)
+
+        # Deduplicate & sort to simplify gap computation
         red_xs_all = sorted(set(red_xs_all))
         red_xs_in_zone = sorted(set(red_xs_in_zone))
 
+        # Global blockers across the full width
         blockers_all = [0] + red_xs_all + [w_combined]
 
         def widest_gap_center(blockers, preferred_x):
+            """
+            Choose the center of the widest gap considering ALL blockers.
+            Tie-breaker: pick the gap whose center is closest to preferred_x.
+            """
             if len(blockers) < 2:
                 return preferred_x
             best_width = -1
@@ -398,77 +334,61 @@ try:
                     best_cx = cx
             return int(best_cx)
 
-        gap_cx = center_x if len(red_xs_in_zone) == 0 else widest_gap_center(blockers_all, preferred_x=center_x)
+        # Gating:
+        # - No in-zone obstacles -> ignore outside, keep center
+        # - Any in-zone obstacles -> plan using ALL obstacles
+        if len(red_xs_in_zone) == 0:
+            gap_cx = center_x
+        else:
+            gap_cx = widest_gap_center(blockers_all, preferred_x=center_x)
 
-        # Smooth & draw
+        # Smooth horizontal motion (keep as FLOAT; don't floor!)
         if blue_x is None:
             blue_x = float(gap_cx)
         else:
             blue_x = blue_x * blue_x_smoothness + gap_cx * (1 - blue_x_smoothness)
+
+        # Round ONLY for rendering / display to avoid bias
         draw_x = int(round(blue_x))
+
+        # Update "Steer Control" variable every loop
         steer_control_x = draw_x
 
-        # ===================== TB6612FNG MOTOR CONTROL (5 kHz) =====================
-        # Initialize PWM at 5 kHz, 0% duty once
+        # ========================== PWM SECTION: START ==========================
+        # Initialize PWM ONCE, immediately after 'steer_control_x = draw_x'.
+        # Keeps duty file handle open for FAST future updates tied to 'steer_control_x'.
         if not pwm_initialized and not pwm_error_reported:
             try:
                 pwm_driver = PWMDriver(PWMCHIP, PWM_CHANNEL_INDEX)
-                pwm_driver.init(PWM_PERIOD_NS, PWM_START_DUTY_NS)  # 5 kHz @ 0% duty
+                pwm_driver.init(PWM_PERIOD_NS, PWM_DUTY_NS)  # 50 Hz @ 1.5 ms neutral  ✅
                 pwm_initialized = True
-                print(f"[PWM] Initialized at {PWM_FREQ_HZ} Hz on pwmchip3/pwm{PWM_CHANNEL_INDEX} (duty=0)")
+                print("PWM initialized: 50 Hz @ 1.5 ms (neutral) on pwmchip3/pwm0.")
             except Exception as e:
                 pwm_error_reported = True
                 print(f"[PWM] Initialization error: {e}")
 
         if pwm_initialized:
-            # Steering offset from center
+            min_ns, center_ns, max_ns = 1_000_000, 1_500_000, 2_000_000  # 1–2 ms
+            span_px = 300  # pixels from center to reach min/max (tune for your geometry)
+
             delta_px = steer_control_x - center_x
+            duty = int(np.clip(center_ns + (delta_px / span_px) * (max_ns - center_ns),
+                               min_ns, max_ns))
 
-            # Decide sign: -1 left, +1 right, 0 near center
-            if abs(delta_px) <= CENTER_DEADBAND_PX:
-                sign = 0
-            else:
-                sign = 1 if delta_px > 0 else -1
+            # Optional tiny deadband to reduce redundant writes (~0.5 µs):
+            if (last_duty_ns is None) or (abs(duty - last_duty_ns) >= 500):
+                pwm_driver.set_duty(duty)
+                last_duty_ns = duty
+        # =========================== PWM SECTION: END ===========================
 
-            # Map distance to duty fraction [0,1]
-            mag = min(abs(delta_px) / float(max(1, SPAN_PX)), 1.0)
-            duty_ns = int(mag * PWM_PERIOD_NS) if sign != 0 else 0
-
-            # Pick direction based on side (RIGHT_IS_FORWARD controls mapping)
-            if sign == 0:
-                # Stop: duty = 0, keep current IN pins as-is
-                if last_duty_ns != 0:
-                    pwm_driver.set_duty(0)
-                    last_duty_ns = 0
-            else:
-                desired_dir = None
-                if (sign > 0 and RIGHT_IS_FORWARD) or (sign < 0 and not RIGHT_IS_FORWARD):
-                    desired_dir = "FORWARD"
-                else:
-                    desired_dir = "REVERSE"
-
-                # If direction changed, first drop duty to 0, then flip pins
-                if current_dir != desired_dir:
-                    if last_duty_ns != 0:
-                        pwm_driver.set_duty(0)
-                        last_duty_ns = 0
-                        # next loop we'll actually switch pins
-                    else:
-                        set_direction(desired_dir)
-
-                # After pins are correct, apply duty
-                if current_dir == desired_dir:
-                    if duty_ns != last_duty_ns:
-                        pwm_driver.set_duty(duty_ns)
-                        last_duty_ns = duty_ns
-        # ==========================================================================
-
-        # Draw blue cue & HUD
+        # Draw the guidance circle
         blue_pos = (draw_x, line_y)
         cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
+
+        # Display "Steer Control" on the left frame
         cv2.putText(
             combined,
-            f"Steer Control X: {steer_control_x}  | Duty: {last_duty_ns}/{PWM_PERIOD_NS}  | Dir: {current_dir}",
+            f"Steer Control: {steer_control_x}",
             hud_text_position,
             cv2.FONT_HERSHEY_SIMPLEX,
             hud_text_scale,
@@ -476,15 +396,34 @@ try:
             hud_text_thickness,
             cv2.LINE_AA
         )
-        cv2.line(combined, (int(zone_left), 0), (int(zone_left), frame0.shape[0]), pull_zone_line_color, pull_zone_line_thickness)
-        cv2.line(combined, (int(zone_right), 0), (int(zone_right), frame0.shape[0]), pull_zone_line_color, pull_zone_line_thickness)
 
+        # Visualize the pull zone boundaries (blue vertical lines)
+        cv2.line(
+            combined,
+            (int(zone_left), 0),
+            (int(zone_left), h_combined),
+            pull_zone_line_color,
+            pull_zone_line_thickness,
+        )
+        cv2.line(
+            combined,
+            (int(zone_right), 0),
+            (int(zone_right), h_combined),
+            pull_zone_line_color,
+            pull_zone_line_thickness,
+        )
+        # ────────────────────────────────────────────────────────────────────
+
+        # Present the final annotated view
         cv2.imshow("Depth: Camera 0 | Camera 1", combined)
         key = cv2.waitKey(1) & 0xFF
+
+        # Handle keys — currently only ESC to exit
         if key == 27:
             break
 
 finally:
+    # === Cleanup ===
     running = False
     try:
         cap0.release()
@@ -498,19 +437,9 @@ finally:
         cv2.destroyAllWindows()
     except Exception:
         pass
-
-    # Motor off, standby low
+    # Turn off PWM if it was enabled
     try:
         if pwm_driver is not None:
-            pwm_driver.set_duty(0)
             pwm_driver.close()
     except Exception as e:
         print(f"[PWM] Cleanup error: {e}")
-
-    try:
-        GPIO.output(AIN1_PIN, GPIO.LOW)
-        GPIO.output(AIN2_PIN, GPIO.LOW)
-        GPIO.output(STBY_PIN, GPIO.LOW)  # standby
-        GPIO.cleanup()
-    except Exception:
-        pass
