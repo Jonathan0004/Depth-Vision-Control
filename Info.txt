@@ -1,3 +1,5 @@
 For PWM use pin 32
 
 For motor encoding use: AS5048A 14-bit magnetic position encoder
+
+Disable PWM: echo 0 | sudo tee /sys/class/pwm/pwmchip3/pwm0/enable
