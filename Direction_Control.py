@@ -365,7 +365,6 @@ try:
         gap_cx = center_x if len(red_xs_in_zone) == 0 else widest_gap_center(blockers_all, preferred_x=center_x)
 
         # Smooth & draw
-        global blue_x
         if blue_x is None:
             blue_x = float(gap_cx)
         else:
