@@ -24,7 +24,43 @@ import torch
 from PIL import Image
 from transformers import pipeline
 
-import Jetson.GPIO as GPIO  # <-- for AIN1/AIN2/STBY control
+try:
+    import Jetson.GPIO as GPIO  # <-- for AIN1/AIN2/STBY control
+    _GPIO_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - fallback path on non-Jetson systems
+    _GPIO_AVAILABLE = False
+
+    class _DummyGPIO:
+        """Minimal stub matching the Jetson.GPIO API used in this script."""
+
+        BOARD = "BOARD"
+        HIGH = 1
+        LOW = 0
+
+        def __init__(self):
+            self._warned = False
+
+        def _warn(self):
+            if not self._warned:
+                print(
+                    f"[GPIO] Jetson.GPIO unavailable ({exc}). Using no-op GPIO stub. "
+                    "Motor control disabled."
+                )
+                self._warned = True
+
+        def setmode(self, *_args, **_kwargs):
+            self._warn()
+
+        def setup(self, *_args, **_kwargs):
+            self._warn()
+
+        def output(self, *_args, **_kwargs):
+            self._warn()
+
+        def cleanup(self, *_args, **_kwargs):
+            self._warn()
+
+    GPIO = _DummyGPIO()
 
 
 # ---------------------------------------------------------------------------
