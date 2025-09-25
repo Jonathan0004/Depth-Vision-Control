@@ -79,8 +79,6 @@ PWM_RIGHT_LIMIT_NS = 2_000_000   # duty when the cue is fully right
 PWM_STEER_SPAN_PX = 220          # pixels from centre to reach a limit duty
 PWM_MIN_WRITE_DELTA_NS = 500     # skip tiny updates below this change (noise filter)
 PWM_INVERT_OUTPUT = False        # flip the steering direction if hardware reversed
-# PWM smoothing (1 → frozen PWM, 0 → instant updates; works like a low-pass filter)
-PWM_DUTY_SMOOTHNESS = 0.6
 # ---------------------------------------------------------------------------
 
 
@@ -95,7 +93,6 @@ pwm_initialized = False
 pwm_error_reported = False
 last_duty_ns = None
 pwm_driver = None
-pwm_smoothed_duty_ns = None
 
 
 # ---------------------------------------------------------------------------
@@ -401,23 +398,12 @@ try:
                 print(f"[PWM] Initialization error: {e}")
 
         if pwm_initialized:
-            target_duty = steer_to_pwm_duty(steer_control_x, center_x)
-
-            # Exponential smoothing on PWM duty to soften rapid steer changes
-            smooth = float(np.clip(PWM_DUTY_SMOOTHNESS, 0.0, 1.0))
-            if pwm_smoothed_duty_ns is None:
-                pwm_smoothed_duty_ns = float(target_duty)
-            elif smooth < 1.0:
-                pwm_smoothed_duty_ns = (
-                    pwm_smoothed_duty_ns * smooth + target_duty * (1.0 - smooth)
-                )
-
-            duty_to_write = int(round(pwm_smoothed_duty_ns))
+            duty = steer_to_pwm_duty(steer_control_x, center_x)
 
             # Optional tiny deadband to reduce redundant writes (~0.5 µs):
-            if (last_duty_ns is None) or (abs(duty_to_write - last_duty_ns) >= PWM_MIN_WRITE_DELTA_NS):
-                pwm_driver.set_duty(duty_to_write)
-                last_duty_ns = duty_to_write
+            if (last_duty_ns is None) or (abs(duty - last_duty_ns) >= PWM_MIN_WRITE_DELTA_NS):
+                pwm_driver.set_duty(duty)
+                last_duty_ns = duty
         # =========================== PWM SECTION: END ===========================
 
         # Draw the guidance circle
