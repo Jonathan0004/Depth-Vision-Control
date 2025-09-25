@@ -20,13 +20,140 @@ import torch
 from PIL import Image
 from transformers import pipeline
 
+class SysfsGPIO:
+    """Minimal BOARD-mode GPIO controller using the Jetson sysfs interface."""
+
+    BOARD = "BOARD"
+    OUT = "out"
+    HIGH = 1
+    LOW = 0
+
+    GPIO_BASE_PATH = "/sys/class/gpio"
+    EXPORT_PATH = os.path.join(GPIO_BASE_PATH, "export")
+    UNEXPORT_PATH = os.path.join(GPIO_BASE_PATH, "unexport")
+
+    # Header pin → SoC line → global gpio number mappings sourced from NVIDIA.
+    BOARD_TO_GLOBAL = {
+        7: 492,   # GPIO09  → PAC.06 → gpio-492
+        31: 454,  # GPIO11  → PQ.06  → gpio-454
+        32: 389,  # GPIO07  → PG.06  → gpio-389
+        33: 391,  # GPIO13  → PH.00  → gpio-391
+        35: 398,  # GPIO19  → PH.07  → gpio-398
+        40: 399,  # I2S0_DOUT (GPIO) → PI.00 → gpio-399
+    }
+
+    def __init__(self):
+        self._mode = None
+        self._active_pins = set()
+
+    def _require_board_mode(self):
+        if self._mode != self.BOARD:
+            raise RuntimeError("BOARD mode required. Call setmode(GPIO.BOARD) first.")
+
+    @staticmethod
+    def _write(path, value):
+        with open(path, "w") as f:
+            f.write(str(value))
+
+    def _gpio_path(self, global_num: int) -> str:
+        return os.path.join(self.GPIO_BASE_PATH, f"gpio{global_num}")
+
+    def setmode(self, mode):
+        if mode != self.BOARD:
+            raise ValueError("SysfsGPIO only supports BOARD numbering mode.")
+        self._mode = mode
+
+    def setup(self, board_pin: int, direction, initial=None):
+        self._require_board_mode()
+        if direction != self.OUT:
+            raise ValueError("SysfsGPIO currently supports only output pins.")
+
+        try:
+            global_num = self.BOARD_TO_GLOBAL[board_pin]
+        except KeyError as exc:
+            raise ValueError(f"Pin {board_pin} is not mapped for sysfs control.") from exc
+
+        gpio_path = self._gpio_path(global_num)
+        if not os.path.isdir(gpio_path):
+            self._write(self.EXPORT_PATH, global_num)
+            for _ in range(200):
+                if os.path.isdir(gpio_path):
+                    break
+                time.sleep(0.01)
+            else:
+                raise TimeoutError(f"gpio{global_num} did not appear after export")
+
+        self._write(os.path.join(gpio_path, "direction"), "out")
+        self._active_pins.add(board_pin)
+
+        if initial is not None:
+            self.output(board_pin, initial)
+
+    def output(self, board_pin: int, value):
+        self._require_board_mode()
+
+        try:
+            global_num = self.BOARD_TO_GLOBAL[board_pin]
+        except KeyError as exc:
+            raise ValueError(f"Pin {board_pin} is not mapped for sysfs control.") from exc
+
+        gpio_path = self._gpio_path(global_num)
+        val = "1" if int(value) else "0"
+        self._write(os.path.join(gpio_path, "value"), val)
+
+    def cleanup(self, pins=None):
+        if pins is None:
+            pins_iter = list(self._active_pins)
+        elif isinstance(pins, int):
+            pins_iter = [pins]
+        else:
+            pins_iter = list(pins)
+
+        for board_pin in pins_iter:
+            global_num = self.BOARD_TO_GLOBAL.get(board_pin)
+            if global_num is None:
+                continue
+
+            gpio_path = self._gpio_path(global_num)
+            try:
+                self._write(os.path.join(gpio_path, "value"), "0")
+            except OSError:
+                pass
+
+            try:
+                self._write(self.UNEXPORT_PATH, global_num)
+            except OSError:
+                pass
+
+            self._active_pins.discard(board_pin)
+
+
+GPIO_BACKEND = ""
+
 try:
-    import Jetson.GPIO as GPIO
+    import Jetson.GPIO as GPIO  # type: ignore[attr-defined]
+
     GPIO_AVAILABLE = True
+    GPIO_BACKEND = "Jetson.GPIO"
 except Exception as exc:  # pragma: no cover - Jetson specific hardware dependency
-    GPIO = None
-    GPIO_AVAILABLE = False
-    print(f"Jetson GPIO unavailable ({exc}). Running in no-GPIO mode.")
+    try:
+        GPIO = SysfsGPIO()
+        if not os.path.isdir(SysfsGPIO.GPIO_BASE_PATH):
+            raise FileNotFoundError(SysfsGPIO.GPIO_BASE_PATH)
+        GPIO_AVAILABLE = True
+        GPIO_BACKEND = "sysfs"
+        print(
+            "Jetson.GPIO unavailable ({}). Falling back to sysfs GPIO control using"
+            " BOARD pin mappings.".format(exc)
+        )
+    except Exception as fallback_exc:
+        GPIO = None
+        GPIO_AVAILABLE = False
+        GPIO_BACKEND = ""
+        print(
+            "GPIO control disabled — Jetson.GPIO failed ({}) and sysfs fallback"
+            " could not be initialised ({}).".format(exc, fallback_exc)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +208,8 @@ PWM_PERIOD_NS = 200_000         # 5 kHz period (200 µs)
 # TB6612FNG direction control pins (Jetson Nano BOARD numbering):
 #  - MOTOR_IN1_PIN goes HIGH for forward rotation (connect to TB6612 AIN1)
 #  - MOTOR_IN2_PIN goes HIGH for reverse rotation (connect to TB6612 AIN2)
+# When Jetson.GPIO cannot determine the board, the script falls back to the
+# sysfs interface using NVIDIA's published pin→SoC→gpio mappings.
 MOTOR_IN1_PIN = 33
 MOTOR_IN2_PIN = 35
 # ---------------------------------------------------------------------------
@@ -387,8 +516,10 @@ try:
                     gpio_initialized = True
                     last_direction_state = "stop"
                     print(
-                        "GPIO direction pins ready: pin 33 -> AIN1 (forward HIGH), "
-                        "pin 35 -> AIN2 (reverse HIGH)."
+                        "GPIO direction pins ready via {} backend: pin {} -> AIN1"
+                        " (forward HIGH), pin {} -> AIN2 (reverse HIGH).".format(
+                            GPIO_BACKEND or "unknown", MOTOR_IN1_PIN, MOTOR_IN2_PIN
+                        )
                     )
             except Exception as e:
                 pwm_error_reported = True
