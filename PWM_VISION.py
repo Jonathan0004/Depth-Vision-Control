@@ -17,7 +17,15 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from transformers import pipeline
+
+try:
+    from transformers import pipeline
+except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
+    missing_pkg = exc.name or "transformers"
+    raise SystemExit(
+        "Required dependency missing: '{pkg}'. Install it with "
+        "`pip install {pkg}` before running PWM_VISION.py".format(pkg=missing_pkg)
+    ) from exc
 
 
 # ---------------------------------------------------------------------------
