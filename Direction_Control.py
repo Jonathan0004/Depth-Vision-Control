@@ -20,6 +20,13 @@ import torch
 from PIL import Image
 from transformers import pipeline
 
+try:
+    import Jetson.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:  # pragma: no cover - Jetson specific hardware dependency
+    GPIO = None
+    GPIO_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration — tweak these values to adjust behaviour without diving into
@@ -68,8 +75,13 @@ hud_text_thickness = 1
 # Jetson sysfs PWM path & parameters (adjust PWMCHIP/pwm index for your board)
 PWMCHIP = "/sys/class/pwm/pwmchip3"
 PWM_CHANNEL_INDEX = 0           # -> pwm0
-PWM_PERIOD_NS = 20_000_000      # 50 Hz period (20 ms)
-PWM_DUTY_NS = 1_500_000         # 1.5 ms (neutral for most hobby servos)
+PWM_PERIOD_NS = 200_000         # 5 kHz period (200 µs)
+
+# TB6612FNG direction control pins (Jetson Nano BOARD numbering):
+#  - MOTOR_IN1_PIN goes HIGH for forward rotation (connect to TB6612 AIN1)
+#  - MOTOR_IN2_PIN goes HIGH for reverse rotation (connect to TB6612 AIN2)
+MOTOR_IN1_PIN = 33
+MOTOR_IN2_PIN = 35
 # ---------------------------------------------------------------------------
 
 
@@ -82,7 +94,10 @@ steer_control_x = None     # integer pixel location displayed as HUD text
 # PWM runtime flags/state
 pwm_initialized = False
 pwm_error_reported = False
+gpio_initialized = False
+gpio_error_reported = False
 last_duty_ns = None
+last_direction_state = None
 pwm_driver = None
 
 
@@ -360,22 +375,60 @@ try:
         if not pwm_initialized and not pwm_error_reported:
             try:
                 pwm_driver = PWMDriver(PWMCHIP, PWM_CHANNEL_INDEX)
-                pwm_driver.init(PWM_PERIOD_NS, PWM_DUTY_NS)  # 50 Hz @ 1.5 ms neutral  ✅
+                pwm_driver.init(PWM_PERIOD_NS, 0)
                 pwm_initialized = True
-                print("PWM initialized: 50 Hz @ 1.5 ms (neutral) on pwmchip3/pwm0.")
+                print("PWM initialized: 5 kHz speed control on pwmchip3/pwm0.")
+
+                if GPIO_AVAILABLE and not gpio_initialized:
+                    GPIO.setmode(GPIO.BOARD)
+                    GPIO.setup(MOTOR_IN1_PIN, GPIO.OUT, initial=GPIO.LOW)
+                    GPIO.setup(MOTOR_IN2_PIN, GPIO.OUT, initial=GPIO.LOW)
+                    gpio_initialized = True
+                    last_direction_state = "stop"
+                    print(
+                        "GPIO direction pins ready: pin 33 -> AIN1 (forward HIGH), "
+                        "pin 35 -> AIN2 (reverse HIGH)."
+                    )
             except Exception as e:
                 pwm_error_reported = True
                 print(f"[PWM] Initialization error: {e}")
 
         if pwm_initialized:
-            min_ns, center_ns, max_ns = 1_000_000, 1_500_000, 2_000_000  # 1–2 ms
-            span_px = 300  # pixels from center to reach min/max (tune for your geometry)
+            span_px = 300  # pixels from center to reach full speed (tune for your geometry)
 
             delta_px = steer_control_x - center_x
-            duty = int(np.clip(center_ns + (delta_px / span_px) * (max_ns - center_ns),
-                               min_ns, max_ns))
+            normalized = float(np.clip(delta_px / span_px, -1.0, 1.0))
 
-            # Optional tiny deadband to reduce redundant writes (~0.5 µs):
+            max_duty = PWM_PERIOD_NS - 1
+
+            if abs(normalized) < 0.02:
+                duty = 0
+                desired_direction = "stop"
+            elif normalized > 0:
+                duty = int(min(abs(normalized), 0.999) * max_duty)
+                desired_direction = "forward"
+            else:
+                duty = int(min(abs(normalized), 0.999) * max_duty)
+                desired_direction = "reverse"
+
+            if gpio_initialized and not gpio_error_reported:
+                try:
+                    if desired_direction == "forward" and last_direction_state != "forward":
+                        GPIO.output(MOTOR_IN1_PIN, GPIO.HIGH)
+                        GPIO.output(MOTOR_IN2_PIN, GPIO.LOW)
+                        last_direction_state = "forward"
+                    elif desired_direction == "reverse" and last_direction_state != "reverse":
+                        GPIO.output(MOTOR_IN1_PIN, GPIO.LOW)
+                        GPIO.output(MOTOR_IN2_PIN, GPIO.HIGH)
+                        last_direction_state = "reverse"
+                    elif desired_direction == "stop" and last_direction_state != "stop":
+                        GPIO.output(MOTOR_IN1_PIN, GPIO.LOW)
+                        GPIO.output(MOTOR_IN2_PIN, GPIO.LOW)
+                        last_direction_state = "stop"
+                except Exception as e:
+                    gpio_error_reported = True
+                    print(f"[GPIO] Direction control error: {e}")
+
             if (last_duty_ns is None) or (abs(duty - last_duty_ns) >= 500):
                 pwm_driver.set_duty(duty)
                 last_duty_ns = duty
@@ -443,3 +496,14 @@ finally:
             pwm_driver.close()
     except Exception as e:
         print(f"[PWM] Cleanup error: {e}")
+    if gpio_initialized and GPIO_AVAILABLE:
+        try:
+            GPIO.output(MOTOR_IN1_PIN, GPIO.LOW)
+            GPIO.output(MOTOR_IN2_PIN, GPIO.LOW)
+        except Exception:
+            pass
+        finally:
+            try:
+                GPIO.cleanup([MOTOR_IN1_PIN, MOTOR_IN2_PIN])
+            except Exception:
+                pass
