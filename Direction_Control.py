@@ -14,6 +14,7 @@ import os
 import glob
 import time
 import queue
+from dataclasses import dataclass
 from threading import Thread
 
 import cv2
@@ -54,6 +55,11 @@ SPAN_PX = 200
 # Deadband around the image center (in pixels). Within this window the motor is
 # held stopped to prevent oscillations when the target is nearly centered.
 DEADZONE_PX = 2
+
+# Exponential smoothing factor for PWM duty updates. Set to 0.0 for immediate
+# changes or closer to 1.0 for very gradual adjustments. Values outside the
+# inclusive range [0.0, 1.0) are clamped to preserve stability.
+PWM_DUTY_SMOOTHING = 0.25
 
 # Preferred sysfs pwmchip path. If unavailable, an auto-probe searches others.
 PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
@@ -174,6 +180,17 @@ gpio_stby = gpio_ain1 = gpio_ain2 = None
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
 
+
+@dataclass
+class SceneAnalysis:
+    combined: np.ndarray
+    center_x: int
+    gap_center_x: int
+    zone_left: int
+    zone_right: int
+    line_y: int
+
+
 class PWMDriver:
     def __init__(self, chip_path: str, channel_index: int):
         self.chip_path = chip_path
@@ -287,6 +304,180 @@ def tb6612_set_direction(direction: int):
             gpio_ain1.write(0); gpio_ain2.write(1)
     # direction == 0 -> leave pins; stop is done with duty=0
 
+
+# =============================================================================
+# High-level perception + control helpers
+# =============================================================================
+
+def analyze_scene(frame0, depth0, frame1, depth1) -> SceneAnalysis:
+    h0, w0 = depth0.shape
+    h1, w1 = depth1.shape
+    points = []
+    for depth, x_offset, w, h, cam_idx in [
+        (depth0, 0, w0, h0, 0),
+        (depth1, w0, w1, h1, 1),
+    ]:
+        for c in range(cols):
+            for r in range(rows):
+                px = int((c + 0.5) * w / cols) + x_offset
+                py = int((r + 0.5) * h / rows)
+                z = float(depth[int(py), int(px - x_offset)])
+                points.append((px, py, z, cam_idx))
+    cloud = np.array(points, dtype=[("x", "f4"), ("y", "f4"), ("z", "f4"), ("cam", "i4")])
+
+    zs = cloud["z"]
+    mean_z, std_z = zs.mean(), zs.std()
+    thresh = max(depth_diff_threshold, std_multiplier * std_z)
+    mask = (mean_z - zs) > thresh
+
+    norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cmap0 = cv2.applyColorMap(
+        cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA
+    )
+    norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cmap1 = cv2.applyColorMap(
+        cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA
+    )
+
+    for cmap, h, w in [
+        (cmap0, frame0.shape[0], frame0.shape[1]),
+        (cmap1, frame1.shape[0], frame1.shape[1]),
+    ]:
+        top_y = top_cutoff_pixels
+        bottom_y = h - bottom_cutoff_pixels
+        cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
+        cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
+
+    combined = np.hstack((cmap0, cmap1))
+    h_combined = frame0.shape[0]
+    w_combined = frame0.shape[1] + frame1.shape[1]
+    line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
+    center_x = (w_combined // 2) + pull_zone_center_offset_px
+
+    zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
+    zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
+
+    red_xs_all, red_xs_in_zone = [], []
+    for is_obst, pt in zip(mask, cloud):
+        if not is_obst:
+            continue
+        px, py, cam = int(pt["x"]), int(pt["y"]), pt["cam"]
+        frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
+        if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels):
+            continue
+        red_xs_all.append(px)
+        if zone_left <= px <= zone_right:
+            red_xs_in_zone.append(px)
+    red_xs_all = sorted(set(red_xs_all))
+    red_xs_in_zone = sorted(set(red_xs_in_zone))
+    blockers_all = [0] + red_xs_all + [w_combined]
+
+    def widest_gap_center(blockers, preferred_x):
+        if len(blockers) < 2:
+            return preferred_x
+        best_width = -1
+        best_dist = 1e18
+        best_cx = preferred_x
+        for left, right in zip(blockers[:-1], blockers[1:]):
+            width = right - left
+            cx = (left + right) // 2
+            dist = abs(cx - preferred_x)
+            if (width > best_width) or (width == best_width and dist < best_dist):
+                best_width, best_dist, best_cx = width, dist, cx
+        return int(best_cx)
+
+    gap_cx = (
+        center_x
+        if len(red_xs_in_zone) == 0
+        else widest_gap_center(blockers_all, preferred_x=center_x)
+    )
+
+    return SceneAnalysis(
+        combined=combined,
+        center_x=int(center_x),
+        gap_center_x=int(gap_cx),
+        zone_left=int(zone_left),
+        zone_right=int(zone_right),
+        line_y=int(line_y),
+    )
+
+
+def update_guidance(target_x: int) -> int:
+    global blue_x, steer_control_x
+    if blue_x is None:
+        blue_x = float(target_x)
+    else:
+        blue_x = blue_x * blue_x_smoothness + target_x * (1 - blue_x_smoothness)
+    steer_control_x = int(round(blue_x))
+    return steer_control_x
+
+
+def apply_motor_control(center_x: int, steer_x: int) -> None:
+    global last_duty_ns, current_dir, pwm_error_reported
+    if not pwm_initialized or pwm_error_reported:
+        return
+
+    delta_px = steer_x - center_x
+    desired_dir = 0
+    if abs(delta_px) > DEADZONE_PX:
+        desired_dir = 1 if delta_px > 0 else -1
+
+    if desired_dir != 0 and desired_dir != current_dir:
+        pwm_driver.set_duty(0)
+        tb6612_set_direction(desired_dir)
+        current_dir = desired_dir
+
+    mag = 0.0 if desired_dir == 0 else min(abs(delta_px) / float(SPAN_PX), 1.0)
+    target_duty_ns = int(round(mag * PWM_PERIOD_NS))
+
+    smoothing = clamp(PWM_DUTY_SMOOTHING, 0.0, 0.999)
+    if last_duty_ns is None:
+        smoothed_duty = target_duty_ns
+    else:
+        alpha = 1.0 - smoothing
+        smoothed_duty = int(round(last_duty_ns + (target_duty_ns - last_duty_ns) * alpha))
+
+    if (last_duty_ns is None) or (smoothed_duty != last_duty_ns):
+        pwm_driver.set_duty(smoothed_duty)
+        last_duty_ns = smoothed_duty
+
+
+def overlay_visuals(analysis: SceneAnalysis, draw_x: int) -> np.ndarray:
+    combined = analysis.combined
+    cv2.circle(
+        combined,
+        (draw_x, analysis.line_y),
+        blue_circle_radius_px,
+        blue_circle_color,
+        blue_circle_thickness,
+    )
+    cv2.putText(
+        combined,
+        f"Steer Control: {draw_x}",
+        hud_text_position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA,
+    )
+    cv2.line(
+        combined,
+        (int(analysis.zone_left), 0),
+        (int(analysis.zone_left), combined.shape[0]),
+        pull_zone_line_color,
+        pull_zone_line_thickness,
+    )
+    cv2.line(
+        combined,
+        (int(analysis.zone_right), 0),
+        (int(analysis.zone_right), combined.shape[0]),
+        pull_zone_line_color,
+        pull_zone_line_thickness,
+    )
+    return combined
+
+
 # =============================================================================
 # Perception pipeline (depth model + stereo capture)
 # =============================================================================
@@ -349,159 +540,74 @@ Thread(target=infer, daemon=True).start()
 # =============================================================================
 # Main control loop
 # =============================================================================
-try:
-    # Init TB6612 pins + PWM (start stopped)
-    tb6612_pins_init()
-    pwm_driver, which_chip = pwm_autoprobe(PWM_PERIOD_NS, 0)  # starts disabled->enabled with duty=0
-    pwm_initialized = True
-    print(
-        "PWM initialized: target "
-        f"{PWM_FREQUENCY_HZ:,} Hz (achieved {PWM_ACTUAL_FREQUENCY_HZ:,} Hz) on {which_chip}/pwm0 "
-        "(duty=0%). TB6612 STBY=HIGH."
-    )
-    print("Direction mapping: Forward=AIN1 HIGH, AIN2 LOW; Reverse=AIN1 LOW, AIN2 HIGH.")
 
-    while True:
+
+def main():
+    global pwm_driver, pwm_initialized, running
+    try:
+        # Init TB6612 pins + PWM (start stopped)
+        tb6612_pins_init()
+        pwm_driver, which_chip = pwm_autoprobe(PWM_PERIOD_NS, 0)  # starts disabled->enabled with duty=0
+        pwm_initialized = True
+        print(
+            "PWM initialized: target "
+            f"{PWM_FREQUENCY_HZ:,} Hz (achieved {PWM_ACTUAL_FREQUENCY_HZ:,} Hz) on {which_chip}/pwm0 "
+            "(duty=0%). TB6612 STBY=HIGH."
+        )
+        print("Direction mapping: Forward=AIN1 HIGH, AIN2 LOW; Reverse=AIN1 LOW, AIN2 HIGH.")
+
+        while True:
+            try:
+                frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
+            except queue.Empty:
+                continue
+
+            analysis = analyze_scene(frame0, depth0, frame1, depth1)
+            steer_x = update_guidance(analysis.gap_center_x)
+            apply_motor_control(analysis.center_x, steer_x)
+            display_img = overlay_visuals(analysis, steer_x)
+
+            cv2.imshow("Depth: Camera 0 | Camera 1", display_img)
+            if (cv2.waitKey(1) & 0xFF) == 27:
+                break
+    finally:
+        running = False
         try:
-            frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
-        except queue.Empty:
-            continue
-
-        # --- Perception: build combined obstacle map ------------------------
-        h0, w0 = depth0.shape
-        h1, w1 = depth1.shape
-        points = []
-        for cam_idx, (depth, x_offset, w, h) in enumerate([
-            (depth0, 0, w0, h0), (depth1, w0, w1, h1)
-        ]):
-            for c in range(cols):
-                for r in range(rows):
-                    px = int((c + 0.5) * w / cols) + x_offset
-                    py = int((r + 0.5) * h / rows)
-                    z  = float(depth[int(py), int(px - x_offset)])
-                    points.append((px, py, z, cam_idx))
-        cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
-
-        zs = cloud['z']
-        mean_z, std_z = zs.mean(), zs.std()
-        thresh = max(depth_diff_threshold, std_multiplier * std_z)
-        mask = (mean_z - zs) > thresh
-
-        norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
-        norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
-
-        for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
-            top_y = top_cutoff_pixels
-            bottom_y = h - bottom_cutoff_pixels
-            cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
-            cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
-
-        combined = np.hstack((cmap0, cmap1))
-
-        h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
-        line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
-        center_x = (w_combined // 2) + pull_zone_center_offset_px
-
-        zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
-        zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
-
-        red_xs_all, red_xs_in_zone = [], []
-        for is_obst, pt in zip(mask, cloud):
-            if not is_obst: continue
-            px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
-            frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
-            if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels): continue
-            red_xs_all.append(px)
-            if zone_left <= px <= zone_right:
-                red_xs_in_zone.append(px)
-        red_xs_all = sorted(set(red_xs_all))
-        red_xs_in_zone = sorted(set(red_xs_in_zone))
-        blockers_all = [0] + red_xs_all + [w_combined]
-
-        def widest_gap_center(blockers, preferred_x):
-            if len(blockers) < 2:
-                return preferred_x
-            best_width = -1
-            best_dist = 1e18
-            best_cx = preferred_x
-            for left, right in zip(blockers[:-1], blockers[1:]):
-                width = right - left
-                cx = (left + right) // 2
-                dist = abs(cx - preferred_x)
-                if (width > best_width) or (width == best_width and dist < best_dist):
-                    best_width, best_dist, best_cx = width, dist, cx
-            return int(best_cx)
-
-        gap_cx = center_x if len(red_xs_in_zone) == 0 else widest_gap_center(blockers_all, preferred_x=center_x)
-
-        # --- Guidance: choose steering target --------------------------------
-        if blue_x is None:
-            blue_x = float(gap_cx)
-        else:
-            blue_x = blue_x * blue_x_smoothness + gap_cx * (1 - blue_x_smoothness)
-
-        draw_x = int(round(blue_x))
-        steer_control_x = draw_x
-
-        # --- Actuation: TB6612 motor control (PWM frequency driven by config) ----
-        if pwm_initialized and not pwm_error_reported:
-            delta_px = steer_control_x - center_x
-            desired_dir = 0
-            if abs(delta_px) > DEADZONE_PX:
-                desired_dir = 1 if delta_px > 0 else -1
-
-            # Flip direction safely with duty=0
-            if desired_dir != 0 and desired_dir != current_dir:
+            cap0.release()
+        except Exception:
+            pass
+        try:
+            cap1.release()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        # PWM cleanup only if it really initialised
+        try:
+            if pwm_initialized and pwm_driver is not None:
                 pwm_driver.set_duty(0)
-                tb6612_set_direction(desired_dir)
-                current_dir = desired_dir
+                pwm_driver.close()
+        except Exception as e:
+            print(f"[PWM] Cleanup warning: {e}")
+        # GPIO cleanup
+        try:
+            if not USE_SYSFS_GPIO:
+                GPIO.output(STBY_BOARD_PIN, GPIO.LOW)
+                GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
+                GPIO.output(AIN2_BOARD_PIN, GPIO.LOW)
+                GPIO.cleanup()
+            else:
+                if isinstance(gpio_stby, SysfsGPIO):
+                    gpio_stby.cleanup()
+                if isinstance(gpio_ain1, SysfsGPIO):
+                    gpio_ain1.cleanup()
+                if isinstance(gpio_ain2, SysfsGPIO):
+                    gpio_ain2.cleanup()
+        except Exception:
+            pass
 
-            mag = 0.0 if desired_dir == 0 else min(abs(delta_px) / float(SPAN_PX), 1.0)
-            duty_ns = int(mag * PWM_PERIOD_NS)  # 0..100% @ configured PWM frequency
-            if (last_duty_ns is None) or (duty_ns != last_duty_ns):
-                pwm_driver.set_duty(duty_ns)
-                last_duty_ns = duty_ns
-        # --- Visualisation ---------------------------------------------------
-        cv2.circle(combined, (draw_x, line_y), blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
-        cv2.putText(combined, f"Steer Control: {steer_control_x}", hud_text_position,
-                    cv2.FONT_HERSHEY_SIMPLEX, hud_text_scale, hud_text_color, hud_text_thickness, cv2.LINE_AA)
-        cv2.line(combined, (int(zone_left), 0), (int(zone_left), h_combined), pull_zone_line_color, pull_zone_line_thickness)
-        cv2.line(combined, (int(zone_right), 0), (int(zone_right), h_combined), pull_zone_line_color, pull_zone_line_thickness)
 
-        cv2.imshow("Depth: Camera 0 | Camera 1", combined)
-        if (cv2.waitKey(1) & 0xFF) == 27:
-            break
-
-# =============================================================================
-# Shutdown & resource cleanup
-# =============================================================================
-finally:
-    running = False
-    try: cap0.release()
-    except Exception: pass
-    try: cap1.release()
-    except Exception: pass
-    try: cv2.destroyAllWindows()
-    except Exception: pass
-    # PWM cleanup only if it really initialised
-    try:
-        if pwm_initialized and pwm_driver is not None:
-            pwm_driver.set_duty(0)
-            pwm_driver.close()
-    except Exception as e:
-        print(f"[PWM] Cleanup warning: {e}")
-    # GPIO cleanup
-    try:
-        if not USE_SYSFS_GPIO:
-            GPIO.output(STBY_BOARD_PIN, GPIO.LOW)
-            GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
-            GPIO.output(AIN2_BOARD_PIN, GPIO.LOW)
-            GPIO.cleanup()
-        else:
-            if isinstance(gpio_stby, SysfsGPIO): gpio_stby.cleanup()
-            if isinstance(gpio_ain1, SysfsGPIO): gpio_ain1.cleanup()
-            if isinstance(gpio_ain2, SysfsGPIO): gpio_ain2.cleanup()
-    except Exception:
-        pass
+if __name__ == "__main__":
+    main()
