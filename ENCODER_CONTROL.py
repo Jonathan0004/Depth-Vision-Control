@@ -85,6 +85,9 @@ encoder_spi_max_hz = 1000000
 encoder_deadband_px = 0          # stop when within this many screen pixels of target
 motor_speed_pct = 40.0            # fixed run speed percentage for the motor
 motor_accel_pct_per_s = 70.0     # acceleration/deceleration rate (percent per second)
+reverse_switch_threshold_pct = 6.0  # switch direction once duty <= this
+motor_start_kick_pct = 14.0         # brief starting boost duty
+motor_start_kick_time_s = 0.06      # boost duration (seconds)
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
 
@@ -279,6 +282,7 @@ def encoder_raw_to_norm(raw):
 
 current_motor_direction = 0
 current_motor_duty_pct = 0.0
+motor_kick_time_remaining = 0.0
 
 sim_encoder_enabled = False
 sim_encoder_norm = 0.5
@@ -309,8 +313,10 @@ def get_encoder_norm():
 
 
 def update_motor_control(target_px, actual_px, dt, period_ns):
-    global current_motor_direction, current_motor_duty_pct
+    global current_motor_direction, current_motor_duty_pct, motor_kick_time_remaining
 
+    motor_kick_time_remaining = max(0.0, motor_kick_time_remaining - dt)
+    prev_direction = current_motor_direction
     if actual_px is None or target_px is None:
         required_direction = 0
     else:
@@ -325,7 +331,7 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
 
     if required_direction == 0:
         target_speed_pct = 0.0
-        if current_motor_duty_pct <= 0.5:
+        if current_motor_duty_pct <= reverse_switch_threshold_pct:
             new_direction = 0
     else:
         if current_motor_direction == 0:
@@ -335,7 +341,7 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
             target_speed_pct = motor_speed_pct
         else:
             target_speed_pct = 0.0
-            if current_motor_duty_pct <= 0.5:
+            if current_motor_duty_pct <= reverse_switch_threshold_pct:
                 new_direction = required_direction
 
     max_delta = motor_accel_pct_per_s * dt
@@ -344,8 +350,17 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
     else:
         current_motor_duty_pct = max(target_speed_pct, current_motor_duty_pct - max_delta)
 
+    if new_direction != prev_direction and new_direction != 0:
+        motor_kick_time_remaining = motor_start_kick_time_s
+    elif new_direction == 0:
+        motor_kick_time_remaining = 0.0
+
+    output_duty_pct = current_motor_duty_pct
+    if motor_kick_time_remaining > 0.0 and new_direction != 0:
+        output_duty_pct = max(output_duty_pct, motor_start_kick_pct)
+
     current_motor_direction = new_direction
-    _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
+    _apply_motor_output(current_motor_direction, output_duty_pct, period_ns)
 
 
 def start_calibration():
