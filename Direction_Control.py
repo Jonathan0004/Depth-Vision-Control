@@ -17,6 +17,7 @@ import queue
 import math
 from dataclasses import dataclass
 from threading import Thread
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -111,6 +112,12 @@ pull_zone_center_offset_px = 0
 # changes or closer to 1.0 for a slower, more stable response.
 blue_x_smoothness = 0.7
 
+# --- Visual output toggle ----------------------------------------------------
+# Set to ``False`` to skip all rendering steps (color maps, overlays, display
+# windows). Motor control and perception stay active while avoiding the extra
+# GPU/CPU work associated with drawing.
+ENABLE_VISUAL_OUTPUT = True
+
 # --- On-screen display styling ----------------------------------------------
 cutoff_line_color = (0, 255, 0)
 cutoff_line_thickness = 1
@@ -184,7 +191,7 @@ def clamp(val, minn, maxn):
 
 @dataclass
 class SceneAnalysis:
-    combined: np.ndarray
+    combined: Optional[np.ndarray]
     center_x: int
     gap_center_x: int
     zone_left: int
@@ -331,29 +338,32 @@ def analyze_scene(frame0, depth0, frame1, depth1) -> SceneAnalysis:
     thresh = max(depth_diff_threshold, std_multiplier * std_z)
     mask = (mean_z - zs) > thresh
 
-    norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap0 = cv2.applyColorMap(
-        cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA
-    )
-    norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap1 = cv2.applyColorMap(
-        cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA
-    )
-
-    for cmap, h, w in [
-        (cmap0, frame0.shape[0], frame0.shape[1]),
-        (cmap1, frame1.shape[0], frame1.shape[1]),
-    ]:
-        top_y = top_cutoff_pixels
-        bottom_y = h - bottom_cutoff_pixels
-        cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
-        cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
-
-    combined = np.hstack((cmap0, cmap1))
+    combined = None
     h_combined = frame0.shape[0]
     w_combined = frame0.shape[1] + frame1.shape[1]
     line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
     center_x = (w_combined // 2) + pull_zone_center_offset_px
+
+    if ENABLE_VISUAL_OUTPUT:
+        norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap0 = cv2.applyColorMap(
+            cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA
+        )
+        norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap1 = cv2.applyColorMap(
+            cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA
+        )
+
+        for cmap, h, w in [
+            (cmap0, frame0.shape[0], frame0.shape[1]),
+            (cmap1, frame1.shape[0], frame1.shape[1]),
+        ]:
+            top_y = top_cutoff_pixels
+            bottom_y = h - bottom_cutoff_pixels
+            cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
+            cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
+
+        combined = np.hstack((cmap0, cmap1))
 
     zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
     zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
@@ -445,7 +455,10 @@ def apply_motor_control(center_x: int, steer_x: int) -> None:
         last_duty_ns = smoothed_duty
 
 
-def overlay_visuals(analysis: SceneAnalysis, draw_x: int) -> np.ndarray:
+def overlay_visuals(analysis: SceneAnalysis, draw_x: int) -> Optional[np.ndarray]:
+    if not ENABLE_VISUAL_OUTPUT or analysis.combined is None:
+        return None
+
     combined = analysis.combined
     cv2.circle(
         combined,
@@ -568,11 +581,13 @@ def main():
             analysis = analyze_scene(frame0, depth0, frame1, depth1)
             steer_x = update_guidance(analysis.gap_center_x)
             apply_motor_control(analysis.center_x, steer_x)
-            display_img = overlay_visuals(analysis, steer_x)
 
-            cv2.imshow("Depth: Camera 0 | Camera 1", display_img)
-            if (cv2.waitKey(1) & 0xFF) == 27:
-                break
+            if ENABLE_VISUAL_OUTPUT:
+                display_img = overlay_visuals(analysis, steer_x)
+                if display_img is not None:
+                    cv2.imshow("Depth: Camera 0 | Camera 1", display_img)
+                    if (cv2.waitKey(1) & 0xFF) == 27:
+                        break
     finally:
         running = False
         try:
@@ -583,10 +598,11 @@ def main():
             cap1.release()
         except Exception:
             pass
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
+        if ENABLE_VISUAL_OUTPUT:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
         # PWM cleanup only if it really initialised
         try:
             if pwm_initialized and pwm_driver is not None:
