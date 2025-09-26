@@ -6,10 +6,13 @@ bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
 """
 
+import os
 import queue
+import time
 from threading import Thread
 
 import cv2
+import Jetson.GPIO as GPIO
 import numpy as np
 import torch
 from PIL import Image
@@ -59,6 +62,15 @@ hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
 
+# Motor control configuration
+motor_pin_left = 29        # physical pin for left turn enable
+motor_pin_right = 31       # physical pin for right turn enable
+
+# PWM configuration (pin 32 routed via pwmchip sysfs)
+pwm_chip_path = "/sys/class/pwm/pwmchip3"
+pwm_channel = "pwm0"
+pwm_frequency_hz = 5000
+
 
 # ---------------------------------------------------------------------------
 # Runtime state (initialised once, then updated as frames stream in)
@@ -74,6 +86,85 @@ steer_control_x = None     # integer pixel location displayed as HUD text
 # Utility: clamp values between two bounds (used to keep overlays on-screen)
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
+
+
+# ---------------------------------------------------------------------------
+# Motor + PWM helpers
+# ---------------------------------------------------------------------------
+
+def _pwm_wr(path, val):
+    with open(path, "w") as f:
+        f.write(str(val))
+
+
+def _pwm_ns_period(freq_hz):
+    return int(round(1e9 / float(freq_hz)))
+
+
+def _pwm_ns_duty(period_ns, pct):
+    pct = max(0.0, min(100.0, float(pct)))
+    return int(period_ns * (pct / 100.0))
+
+
+pwm_channel_path = f"{pwm_chip_path}/{pwm_channel}"
+
+
+def initialise_motor_outputs():
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setwarnings(False)
+    GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
+
+    if not os.path.isdir(pwm_channel_path):
+        if not os.path.isdir(pwm_chip_path):
+            raise FileNotFoundError(f"{pwm_chip_path} does not exist. Check PWM configuration.")
+        _pwm_wr(f"{pwm_chip_path}/export", "0")
+        for _ in range(200):
+            if os.path.isdir(pwm_channel_path):
+                break
+            time.sleep(0.01)
+        else:
+            raise TimeoutError("PWM channel did not appear after export")
+
+    try:
+        _pwm_wr(f"{pwm_channel_path}/enable", "0")
+    except OSError:
+        pass
+
+    period_ns = _pwm_ns_period(pwm_frequency_hz)
+    _pwm_wr(f"{pwm_channel_path}/period", period_ns)
+    _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
+    _pwm_wr(f"{pwm_channel_path}/enable", "1")
+    return period_ns
+
+
+def set_motor_state(offset_px, period_ns):
+    if offset_px > 0:
+        GPIO.output(motor_pin_right, GPIO.HIGH)
+        GPIO.output(motor_pin_left, GPIO.LOW)
+    elif offset_px < 0:
+        GPIO.output(motor_pin_right, GPIO.LOW)
+        GPIO.output(motor_pin_left, GPIO.HIGH)
+    else:
+        GPIO.output(motor_pin_right, GPIO.LOW)
+        GPIO.output(motor_pin_left, GPIO.LOW)
+
+    if pull_influence_radius_px > 0:
+        duty_pct = min(100.0, (abs(offset_px) / pull_influence_radius_px) * 100.0)
+    else:
+        duty_pct = 100.0 if offset_px != 0 else 0.0
+    duty_ns = _pwm_ns_duty(period_ns, duty_pct)
+    _pwm_wr(f"{pwm_channel_path}/duty_cycle", duty_ns)
+
+
+def shutdown_motor_outputs():
+    try:
+        _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
+        _pwm_wr(f"{pwm_channel_path}/enable", "0")
+    except OSError:
+        pass
+    finally:
+        GPIO.cleanup()
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
@@ -137,6 +228,9 @@ def infer():
         result_q.put((f0, d0, f1, d1))
 
 Thread(target=infer, daemon=True).start()
+
+# Initialise motor outputs and PWM once
+motor_period_ns = initialise_motor_outputs()
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -276,10 +370,13 @@ while True:
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
 
+    # Update motor direction and speed based on steering offset
+    set_motor_state(draw_x - center_x, motor_period_ns)
 
 
 
-    
+
+
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
     cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
@@ -326,3 +423,4 @@ running = False
 cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
+shutdown_motor_outputs()
