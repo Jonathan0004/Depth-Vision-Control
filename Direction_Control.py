@@ -60,6 +60,10 @@ AIN2_BOARD_PIN = 29  # Reverse: AIN1=LOW,  AIN2=HIGH
 SPAN_PX = 300     # |delta_px| mapping to 100% duty (tune)
 DEADZONE_PX = 2   # near-center deadband
 
+# Preferred pwmchip (matches working pwmControl.py script). If missing, we
+# fall back to auto-probing other pwmchips.
+PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
+
 # ---------------------------------------------------------------------------
 # Display & perception config (from your original)
 # ---------------------------------------------------------------------------
@@ -201,7 +205,12 @@ def pwm_autoprobe(period_ns: int, initial_duty_ns: int = 0):
     Find a pwmchip whose pwm0 accepts the requested period.
     Returns (driver, chip_path) on success; raises on failure.
     """
-    candidates = sorted(glob.glob("/sys/class/pwm/pwmchip*"))
+    candidates = []
+    if PREFERRED_PWM_CHIP and os.path.isdir(PREFERRED_PWM_CHIP):
+        candidates.append(PREFERRED_PWM_CHIP)
+    for chip in sorted(glob.glob("/sys/class/pwm/pwmchip*")):
+        if chip not in candidates:
+            candidates.append(chip)
     last_err = None
     for chip in candidates:
         try:
