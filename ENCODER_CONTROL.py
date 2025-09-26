@@ -85,6 +85,7 @@ encoder_spi_max_hz = 1000000
 encoder_deadband_px = 0          # stop when within this many screen pixels of target
 motor_speed_pct = 40.0            # fixed run speed percentage for the motor
 motor_accel_pct_per_s = 70.0     # acceleration/deceleration rate (percent per second)
+reverse_switch_threshold_pct = 6.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
 
@@ -322,21 +323,27 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
 
     target_speed_pct = 0.0
     new_direction = current_motor_direction
+    kick_pct = min(reverse_switch_threshold_pct, motor_speed_pct)
 
     if required_direction == 0:
         target_speed_pct = 0.0
-        if current_motor_duty_pct <= 0.5:
+        if current_motor_duty_pct <= kick_pct:
             new_direction = 0
     else:
         if current_motor_direction == 0:
             new_direction = required_direction
             target_speed_pct = motor_speed_pct
+            current_motor_duty_pct = max(current_motor_duty_pct, kick_pct)
         elif current_motor_direction == required_direction:
             target_speed_pct = motor_speed_pct
+            if current_motor_duty_pct < kick_pct:
+                current_motor_duty_pct = kick_pct
         else:
             target_speed_pct = 0.0
-            if current_motor_duty_pct <= 0.5:
+            if current_motor_duty_pct <= kick_pct:
                 new_direction = required_direction
+                current_motor_duty_pct = max(current_motor_duty_pct, kick_pct)
+                target_speed_pct = motor_speed_pct
 
     max_delta = motor_accel_pct_per_s * dt
     if target_speed_pct > current_motor_duty_pct:
