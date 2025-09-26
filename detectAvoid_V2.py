@@ -6,7 +6,6 @@ bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
 """
 
-import os
 import queue
 from threading import Thread
 
@@ -15,8 +14,6 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
-
-from ENCODER_CONTROL import EncoderSteeringController
 
 
 # ---------------------------------------------------------------------------
@@ -62,18 +59,6 @@ hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
 
-# Motor control configuration
-motor_pin_left = 29        # physical pin for left turn enable
-motor_pin_right = 31       # physical pin for right turn enable
-
-# PWM configuration (pin 32 routed via pwmchip sysfs)
-pwm_chip_path = "/sys/class/pwm/pwmchip3"
-pwm_channel = "pwm0"
-pwm_frequency_hz = 5000
-
-# Persistent file that stores encoder calibration data
-encoder_calibration_file = os.path.join(os.path.dirname(__file__), "encoder_calibration.json")
-
 
 # ---------------------------------------------------------------------------
 # Runtime state (initialised once, then updated as frames stream in)
@@ -89,11 +74,6 @@ steer_control_x = None     # integer pixel location displayed as HUD text
 # Utility: clamp values between two bounds (used to keep overlays on-screen)
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
-
-
-# ---------------------------------------------------------------------------
-# Closed-loop motor controller (instantiated later once the cameras are ready)
-encoder_controller = None
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
@@ -157,16 +137,6 @@ def infer():
         result_q.put((f0, d0, f1, d1))
 
 Thread(target=infer, daemon=True).start()
-
-# Initialise the encoder-driven steering controller once
-encoder_controller = EncoderSteeringController(
-    motor_pin_left=motor_pin_left,
-    motor_pin_right=motor_pin_right,
-    pwm_chip_path=pwm_chip_path,
-    pwm_channel=pwm_channel,
-    pwm_frequency_hz=pwm_frequency_hz,
-    calibration_file=encoder_calibration_file,
-)
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -244,9 +214,6 @@ while True:
     zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
     zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
 
-    if encoder_controller is not None:
-        encoder_controller.update_screen_range(zone_left, zone_right)
-
     # Collect red-dot X positions that fall between the cutoff green lines (both cams)
     red_xs_all = []
     red_xs_in_zone = []
@@ -309,14 +276,6 @@ while True:
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
 
-    # Update motor direction and speed based on encoder feedback
-    if encoder_controller is not None:
-        encoder_controller.drive_to_screen_position(draw_x)
-
-
-
-
-
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
     cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
@@ -332,21 +291,6 @@ while True:
         hud_text_thickness,
         cv2.LINE_AA
     )
-
-    if encoder_controller is not None:
-        status_lines = encoder_controller.overlay_lines()
-        for idx, line in enumerate(status_lines, start=1):
-            pos = (hud_text_position[0], hud_text_position[1] + 20 * idx)
-            cv2.putText(
-                combined,
-                line,
-                pos,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                hud_text_scale,
-                hud_text_color,
-                hud_text_thickness,
-                cv2.LINE_AA,
-            )
 
     # Visualize the pull zone boundaries (blue vertical lines)
     cv2.line(
@@ -369,9 +313,7 @@ while True:
     cv2.imshow("Depth: Camera 0 | Camera 1", combined)
     key = cv2.waitKey(1) & 0xFF
 
-    if encoder_controller is not None:
-        encoder_controller.handle_key(key)
-
+    # Handle keys — currently only ESC to exit
     if key == 27:
         break
 
@@ -380,5 +322,3 @@ running = False
 cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
-if encoder_controller is not None:
-    encoder_controller.shutdown()
