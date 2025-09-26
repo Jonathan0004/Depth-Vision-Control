@@ -61,7 +61,7 @@ pull_influence_radius_px = 120   # half-width of the pull zone around centre
 pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left)
 
 # Smoothing factor for the steering cue (1 → frozen, 0 → instant response)
-blue_x_smoothness = 0.7
+blue_x_smoothness = 0.5
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -82,11 +82,11 @@ pwm_frequency_hz = 5000
 encoder_spi_bus = 0
 encoder_spi_device = 0
 encoder_spi_max_hz = 1000000
-encoder_deadband_px = 6          # stop when within this many screen pixels of target
+encoder_deadband_px = 0          # stop when within this many screen pixels of target
 motor_speed_pct = 40.0            # fixed run speed percentage for the motor
-motor_accel_pct_per_s = 160.0     # acceleration/deceleration rate (percent per second)
+motor_accel_pct_per_s = 70.0     # acceleration/deceleration rate (percent per second)
 calibration_file = Path("steering_calibration.json")
-simulated_step_norm = 0.02        # arrow-key increment when in simulated encoder mode
+simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
 
 
 # ---------------------------------------------------------------------------
