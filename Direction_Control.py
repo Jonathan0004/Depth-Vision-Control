@@ -5,6 +5,7 @@
 # Standard library imports
 # =============================================================================
 
+import json
 import os
 import time
 import queue
@@ -39,6 +40,7 @@ PWM_PERIOD_NS = int(round(1_000_000_000 / PWM_FREQUENCY_HZ))
 PWM_CHIP_PATH = "/sys/class/pwm/pwmchip3"
 DEADZONE_PX = 2
 STEERING_USAGE_FRACTION = 1.0  # 1.0 = use full pixel range, <1 tightens response (more sensitive)
+CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "encoder_calibration.json")
 
 GPIO.setmode(GPIO.BOARD)
 STBY_BOARD_PIN, AIN1_BOARD_PIN, AIN2_BOARD_PIN = 37, 31, 29
@@ -220,6 +222,8 @@ class AS5048AEncoder:
         self._pixel_half_span = 320.0
         self.deadband_fraction = 0.02
         self.pwm_gain = 0.85
+        self._calibration_path = CALIBRATION_FILE
+        self._load_calibration()
 
     # ---------------------------------------------------------------------
     # SPI helpers
@@ -342,6 +346,50 @@ class AS5048AEncoder:
             f"[Encoder] Usage fraction={self.usage_fraction:.2f}. "
             "Press '[' or ']' in the HUD window to tighten/loosen sensitivity."
         )
+        self._save_calibration()
+
+    def _save_calibration(self) -> None:
+        payload = {
+            "min_raw": int(self.min_raw),
+            "max_raw": int(self.max_raw),
+            "center_raw": int(self.center_raw),
+            "raw_half_span": float(self.raw_half_span),
+            "usage_fraction": float(self.usage_fraction),
+        }
+        try:
+            with open(self._calibration_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+        except Exception as exc:
+            print(f"[Encoder] Warning: Unable to save calibration: {exc}")
+        else:
+            print(f"[Encoder] Calibration saved to {self._calibration_path}.")
+
+    def _load_calibration(self) -> None:
+        if not os.path.isfile(self._calibration_path):
+            return
+        try:
+            with open(self._calibration_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            self.min_raw = int(payload["min_raw"])
+            self.max_raw = int(payload["max_raw"])
+            self.center_raw = int(payload["center_raw"])
+            raw_half_span = float(
+                payload.get("raw_half_span", (self.max_raw - self.min_raw) / 2.0)
+            )
+            self.raw_half_span = max(1.0, raw_half_span)
+            usage_fraction = payload.get("usage_fraction")
+            if usage_fraction is not None:
+                self.usage_fraction = clamp(float(usage_fraction), 0.1, 1.0)
+            self.calibrated = True
+        except Exception as exc:
+            print(f"[Encoder] Warning: Failed to load calibration: {exc}")
+            self.calibrated = False
+            self.raw_half_span = 1.0
+        else:
+            print(
+                "[Encoder] Loaded calibration: "
+                f"min={self.min_raw}, max={self.max_raw}, center={self.center_raw}."
+            )
 
     # ------------------------------------------------------------------
     # Sampling helpers
