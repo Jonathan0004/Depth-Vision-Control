@@ -6,7 +6,11 @@ bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
 """
 
+import json
+import os
 import queue
+import threading
+import time
 from threading import Thread
 
 import cv2
@@ -14,6 +18,74 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
+from typing import Tuple
+
+try:  # Jetson Nano GPIO for motor control
+    import Jetson.GPIO as GPIO
+    HAS_GPIO = True
+except (ImportError, RuntimeError):  # RuntimeError is raised if not run as root on Jetson
+    HAS_GPIO = False
+
+    class _DummyPWM:
+        def __init__(self, *_, **__):
+            self._duty = 0.0
+
+        def start(self, duty):
+            self._duty = duty
+
+        def ChangeDutyCycle(self, duty):
+            self._duty = duty
+
+        def stop(self):
+            pass
+
+    class _DummyGPIO:
+        BOARD = BCM = OUT = HIGH = LOW = None
+
+        @staticmethod
+        def setmode(*_):
+            pass
+
+        @staticmethod
+        def setup(*_, **__):
+            pass
+
+        @staticmethod
+        def output(*_, **__):
+            pass
+
+        @staticmethod
+        def cleanup():
+            pass
+
+        @staticmethod
+        def PWM(*_, **__):
+            return _DummyPWM()
+
+    GPIO = _DummyGPIO()
+
+try:  # SPI access for AS5048A
+    import spidev
+    HAS_SPI = True
+except ImportError:
+    HAS_SPI = False
+
+    class _DummySpiDev:
+        def __init__(self):
+            self.max_speed_hz = 0
+            self.mode = 0
+
+        def open(self, *_, **__):
+            pass
+
+        def xfer2(self, *_):
+            return [0x00, 0x00]
+
+        def close(self):
+            pass
+
+    class spidev:  # type: ignore
+        SpiDev = _DummySpiDev
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +93,26 @@ from transformers import pipeline
 # the rest of the code. Where possible, related values are grouped together and
 # documented so their impact is clear.
 # ---------------------------------------------------------------------------
+
+# Motor / encoder configuration ------------------------------------------------
+CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "as5048a_calibration.json")
+ENCODER_COUNTS = 16384  # AS5048A has a 14-bit output (0-16383)
+ENCODER_TOLERANCE_COUNTS = 40  # acceptable error band before the motor stops
+
+# GPIO pin assignments (BOARD numbering is used by default)
+GPIO_PIN_MODE = GPIO.BOARD
+MOTOR_PWM_PIN = 32       # PWM0 on Jetson Nano (adjust to match wiring)
+MOTOR_IN1_PIN = 31       # Direction pin A
+MOTOR_IN2_PIN = 33       # Direction pin B
+
+# Motion profile configuration
+MOTOR_PWM_FREQUENCY = 1000          # Hz
+MOTOR_TARGET_SPEED = 0.6            # duty cycle [0.0 - 1.0] when the motor is moving
+MOTOR_ACCELERATION_STEP = 0.05      # duty delta applied each control tick
+MOTOR_UPDATE_INTERVAL = 0.02        # seconds between control loop iterations
+
+# Calibration prompts
+CALIBRATION_SAMPLES = 12            # encoder samples averaged per limit capture
 
 # Grid resolution for sampling depth points across each frame (higher = denser)
 rows, cols = 25, 50
@@ -65,6 +157,299 @@ hud_text_thickness = 1
 # ---------------------------------------------------------------------------
 blue_x = None              # persistent, smoothed x-position of the blue circle
 steer_control_x = None     # integer pixel location displayed as HUD text
+
+
+# ---------------------------------------------------------------------------
+# Motor control helpers
+# ---------------------------------------------------------------------------
+
+
+class CalibrationManager:
+    def __init__(self, path: str):
+        self.path = path
+        self.data = None
+        self.current_screen_range = (0, 1)
+        self._load()
+
+    @property
+    def ready(self) -> bool:
+        return self.data is not None
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fp:
+                self.data = json.load(fp)
+            if self.data is not None:
+                self.current_screen_range = (
+                    int(self.data.get("steer_min", 0)),
+                    int(self.data.get("steer_max", 1)),
+                )
+        except (OSError, json.JSONDecodeError):
+            self.data = None
+
+    def save(self, encoder_min: int, encoder_max: int, screen_range: Tuple[int, int]) -> None:
+        payload = {
+            "encoder_min": int(encoder_min) % ENCODER_COUNTS,
+            "encoder_max": int(encoder_max) % ENCODER_COUNTS,
+            "steer_min": int(screen_range[0]),
+            "steer_max": int(screen_range[1]),
+            "timestamp": time.time(),
+        }
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2)
+        self.data = payload
+        self.current_screen_range = (
+            int(screen_range[0]),
+            int(screen_range[1]),
+        )
+
+    def update_screen_range(self, screen_min: int, screen_max: int) -> None:
+        self.current_screen_range = (screen_min, screen_max)
+
+    def map_steer_to_encoder(self, steer_value: float) -> int:
+        if not self.ready:
+            raise RuntimeError("Encoder calibration not available.")
+        steer_min, steer_max = self.current_screen_range
+        if steer_max == steer_min:
+            raise ZeroDivisionError("Screen range width is zero.")
+        norm = (steer_value - steer_min) / (steer_max - steer_min)
+        norm = max(0.0, min(1.0, norm))
+
+        encoder_min = self.data["encoder_min"]
+        encoder_max = self.data["encoder_max"]
+        span = (encoder_max - encoder_min) % ENCODER_COUNTS
+        target = (encoder_min + span * norm) % ENCODER_COUNTS
+        return int(round(target))
+
+
+class AS5048AEncoder:
+    ANGLE_REGISTER = 0x3FFF
+
+    def __init__(self, bus: int = 0, device: int = 0):
+        self.available = HAS_SPI
+        self.bus = bus
+        self.device = device
+        if self.available:
+            self.spi = spidev.SpiDev()
+            try:
+                self.spi.open(bus, device)
+                self.spi.max_speed_hz = 1_000_000
+                self.spi.mode = 0b01
+            except OSError:
+                self.available = False
+        else:
+            self.spi = spidev.SpiDev()
+
+    @staticmethod
+    def _even_parity(word: int) -> int:
+        parity = 0
+        for i in range(15):
+            parity ^= (word >> i) & 0x1
+        return parity & 0x1
+
+    def _read_register(self, address: int) -> int:
+        command = 0x4000 | (address & 0x3FFF)
+        command |= self._even_parity(command) << 15
+        tx = [(command >> 8) & 0xFF, command & 0xFF]
+        self.spi.xfer2(tx)
+        # second transfer retrieves data
+        data = self.spi.xfer2([0x00, 0x00])
+        value = ((data[0] << 8) | data[1]) & 0x3FFF
+        return value
+
+    def read_angle(self, samples: int = 1) -> int:
+        if not self.available:
+            return 0
+        values = []
+        for _ in range(max(1, samples)):
+            try:
+                values.append(self._read_register(self.ANGLE_REGISTER))
+            except OSError:
+                continue
+        if not values:
+            return 0
+        return int(round(sum(values) / len(values)))
+
+    def close(self) -> None:
+        if self.available:
+            try:
+                self.spi.close()
+            except OSError:
+                pass
+
+
+class MotorController:
+    def __init__(
+        self,
+        pwm_pin: int,
+        in1_pin: int,
+        in2_pin: int,
+        pwm_frequency: int,
+        target_speed: float,
+        acceleration_step: float,
+    ) -> None:
+        self.hardware = HAS_GPIO
+        self.pwm_pin = pwm_pin
+        self.in1_pin = in1_pin
+        self.in2_pin = in2_pin
+        self.pwm_frequency = pwm_frequency
+        self.target_speed = max(0.0, min(1.0, target_speed))
+        self.acceleration_step = max(0.001, acceleration_step)
+        self.current_speed = 0.0
+        self.current_direction = 0
+        self._pwm = None
+        self._setup_gpio()
+
+    def _setup_gpio(self) -> None:
+        try:
+            GPIO.setmode(GPIO_PIN_MODE)
+            GPIO.setup(self.in1_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self.in2_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self.pwm_pin, GPIO.OUT, initial=GPIO.LOW)
+            self._pwm = GPIO.PWM(self.pwm_pin, self.pwm_frequency)
+            self._pwm.start(0.0)
+        except Exception:
+            self.hardware = False
+            self._pwm = GPIO.PWM(self.pwm_pin, self.pwm_frequency)
+            self._pwm.start(0.0)
+
+    def _apply_direction(self, direction: int) -> None:
+        if direction > 0:
+            GPIO.output(self.in1_pin, GPIO.HIGH)
+            GPIO.output(self.in2_pin, GPIO.LOW)
+        elif direction < 0:
+            GPIO.output(self.in1_pin, GPIO.LOW)
+            GPIO.output(self.in2_pin, GPIO.HIGH)
+        else:
+            GPIO.output(self.in1_pin, GPIO.LOW)
+            GPIO.output(self.in2_pin, GPIO.LOW)
+
+    def _apply_pwm(self) -> None:
+        if self._pwm is None:
+            return
+        self._pwm.ChangeDutyCycle(max(0.0, min(100.0, self.current_speed * 100.0)))
+
+    def update(self, direction: int) -> None:
+        direction = max(-1, min(1, direction))
+        target_speed = self.target_speed if direction != 0 else 0.0
+        if self.current_speed < target_speed:
+            self.current_speed = min(target_speed, self.current_speed + self.acceleration_step)
+        elif self.current_speed > target_speed:
+            self.current_speed = max(target_speed, self.current_speed - self.acceleration_step)
+
+        if self.current_speed == 0.0:
+            direction = 0
+        if direction != self.current_direction:
+            self.current_direction = direction
+            self._apply_direction(direction)
+        self._apply_pwm()
+
+    def stop_immediately(self) -> None:
+        self.current_speed = 0.0
+        self.current_direction = 0
+        self._apply_direction(0)
+        self._apply_pwm()
+
+    def cleanup(self) -> None:
+        try:
+            if self._pwm is not None:
+                self._pwm.stop()
+        finally:
+            try:
+                GPIO.cleanup()
+            except Exception:
+                pass
+
+
+def encoder_delta(target: int, current: int) -> int:
+    half = ENCODER_COUNTS // 2
+    diff = (target - current + half) % ENCODER_COUNTS - half
+    return int(diff)
+
+
+calibration_manager = CalibrationManager(CALIBRATION_FILE)
+encoder = AS5048AEncoder()
+motor_controller = MotorController(
+    pwm_pin=MOTOR_PWM_PIN,
+    in1_pin=MOTOR_IN1_PIN,
+    in2_pin=MOTOR_IN2_PIN,
+    pwm_frequency=MOTOR_PWM_FREQUENCY,
+    target_speed=MOTOR_TARGET_SPEED,
+    acceleration_step=MOTOR_ACCELERATION_STEP,
+)
+
+motor_stop_event = threading.Event()
+calibration_active_event = threading.Event()
+
+if not calibration_manager.ready:
+    print("No encoder calibration found. Press 'c' to perform calibration.")
+if not encoder.available:
+    print("Warning: AS5048A encoder not detected. Encoder readings will be zero.")
+if not motor_controller.hardware:
+    print("Warning: Jetson.GPIO unavailable. Motor control is running in simulation mode.")
+
+
+def motor_control_loop() -> None:
+    while not motor_stop_event.is_set():
+        if calibration_active_event.is_set():
+            motor_controller.update(0)
+            time.sleep(MOTOR_UPDATE_INTERVAL)
+            continue
+
+        if not calibration_manager.ready or steer_control_x is None or not encoder.available:
+            motor_controller.update(0)
+            time.sleep(MOTOR_UPDATE_INTERVAL)
+            continue
+
+        try:
+            target = calibration_manager.map_steer_to_encoder(float(steer_control_x))
+            current = encoder.read_angle(samples=3)
+            diff = encoder_delta(target, current)
+            if abs(diff) <= ENCODER_TOLERANCE_COUNTS:
+                motor_controller.update(0)
+            else:
+                motor_controller.update(1 if diff > 0 else -1)
+        except Exception as exc:
+            print(f"Motor control error: {exc}")
+            motor_controller.update(0)
+
+        time.sleep(MOTOR_UPDATE_INTERVAL)
+
+    motor_controller.stop_immediately()
+
+
+def run_encoder_calibration(screen_range: Tuple[int, int]) -> None:
+    if calibration_active_event.is_set():
+        print("Calibration already in progress.")
+        return
+    if not encoder.available:
+        print("AS5048A encoder not detected. Connect the sensor before calibrating.")
+        return
+
+    calibration_active_event.set()
+    try:
+        motor_controller.stop_immediately()
+        print("\n=== Steering Calibration ===")
+        print("1. Manually move the steering to the LEFT mechanical stop.")
+        input("   Press Enter to record the left limit...")
+        left = encoder.read_angle(samples=CALIBRATION_SAMPLES)
+
+        print("2. Manually move the steering to the RIGHT mechanical stop.")
+        input("   Press Enter to record the right limit...")
+        right = encoder.read_angle(samples=CALIBRATION_SAMPLES)
+
+        calibration_manager.save(left, right, screen_range)
+        calibration_manager.update_screen_range(*screen_range)
+        print(
+            f"Calibration saved. Left={left} counts, Right={right} counts."
+        )
+    finally:
+        calibration_active_event.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +523,9 @@ def infer():
 
 Thread(target=infer, daemon=True).start()
 
+motor_thread = Thread(target=motor_control_loop, daemon=True)
+motor_thread.start()
+
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
 # ---------------------------------------------------------------------------
@@ -203,6 +591,7 @@ while True:
     
     # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
     h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
+    calibration_manager.update_screen_range(0, w_combined)
 
     # vertical midpoint between the two green cutoff lines (for blue circle)
     line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
@@ -314,11 +703,48 @@ while True:
     key = cv2.waitKey(1) & 0xFF
 
     # Handle keys — currently only ESC to exit
-    if key == 27:
+    if key == ord('c'):
+        run_encoder_calibration((0, w_combined))
+    elif key == 27:
         break
 
 # === Cleanup ===
 running = False
+motor_stop_event.set()
 cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
+motor_thread.join(timeout=1.0)
+motor_controller.cleanup()
+encoder.close()
+
+
+
+
+
+
+
+
+
+
+# =============================================================================
+# AS5048A ⇄ Jetson Nano Wiring Notes
+# =============================================================================
+# • Power the encoder from the Jetson Nano's 3.3 V rail (pin 1 or pin 17) and
+#   connect grounds together (pin 6 is a convenient ground).
+# • Use the SPI0 header (jetson-io "SPI1" in software):
+#       AS5048A SCK  → Jetson pin 23 (SCLK)
+#       AS5048A MISO → Jetson pin 21 (MISO)
+#       AS5048A MOSI → Jetson pin 19 (MOSI)
+#       AS5048A CSn  → Jetson pin 24 (SPI chip-select 0) or another free GPIO
+#         (update the spidev bus/device numbers if a different CS is used).
+# • Tie the AS5048A's VDD and VDDIO pins to the same 3.3 V supply.
+# • Enable the SPI interface on the Jetson Nano with `sudo /opt/nvidia/jetson-io`
+#   if it is not already active, then reboot.
+# • The motor driver connections in this script assume:
+#       PWM (enable) → pin 32 (PWM0)
+#       Direction A  → pin 31
+#       Direction B  → pin 33
+#   Adjust the `MOTOR_*_PIN` constants near the top of the file if you wire to
+#   different GPIOs or use an alternate H-bridge.
+# =============================================================================
