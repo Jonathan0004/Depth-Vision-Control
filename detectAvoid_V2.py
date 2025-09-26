@@ -8,15 +8,15 @@ All tunable parameters live together for quick iteration.
 
 import os
 import queue
-import time
 from threading import Thread
 
 import cv2
-import Jetson.GPIO as GPIO
 import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
+
+from ENCODER_CONTROL import EncoderSteeringController
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +71,9 @@ pwm_chip_path = "/sys/class/pwm/pwmchip3"
 pwm_channel = "pwm0"
 pwm_frequency_hz = 5000
 
+# Persistent file that stores encoder calibration data
+encoder_calibration_file = os.path.join(os.path.dirname(__file__), "encoder_calibration.json")
+
 
 # ---------------------------------------------------------------------------
 # Runtime state (initialised once, then updated as frames stream in)
@@ -89,82 +92,8 @@ def clamp(val, minn, maxn):
 
 
 # ---------------------------------------------------------------------------
-# Motor + PWM helpers
-# ---------------------------------------------------------------------------
-
-def _pwm_wr(path, val):
-    with open(path, "w") as f:
-        f.write(str(val))
-
-
-def _pwm_ns_period(freq_hz):
-    return int(round(1e9 / float(freq_hz)))
-
-
-def _pwm_ns_duty(period_ns, pct):
-    pct = max(0.0, min(100.0, float(pct)))
-    return int(period_ns * (pct / 100.0))
-
-
-pwm_channel_path = f"{pwm_chip_path}/{pwm_channel}"
-
-
-def initialise_motor_outputs():
-    GPIO.setmode(GPIO.BOARD)
-    GPIO.setwarnings(False)
-    GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
-
-    if not os.path.isdir(pwm_channel_path):
-        if not os.path.isdir(pwm_chip_path):
-            raise FileNotFoundError(f"{pwm_chip_path} does not exist. Check PWM configuration.")
-        _pwm_wr(f"{pwm_chip_path}/export", "0")
-        for _ in range(200):
-            if os.path.isdir(pwm_channel_path):
-                break
-            time.sleep(0.01)
-        else:
-            raise TimeoutError("PWM channel did not appear after export")
-
-    try:
-        _pwm_wr(f"{pwm_channel_path}/enable", "0")
-    except OSError:
-        pass
-
-    period_ns = _pwm_ns_period(pwm_frequency_hz)
-    _pwm_wr(f"{pwm_channel_path}/period", period_ns)
-    _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
-    _pwm_wr(f"{pwm_channel_path}/enable", "1")
-    return period_ns
-
-
-def set_motor_state(offset_px, period_ns):
-    if offset_px > 0:
-        GPIO.output(motor_pin_right, GPIO.HIGH)
-        GPIO.output(motor_pin_left, GPIO.LOW)
-    elif offset_px < 0:
-        GPIO.output(motor_pin_right, GPIO.LOW)
-        GPIO.output(motor_pin_left, GPIO.HIGH)
-    else:
-        GPIO.output(motor_pin_right, GPIO.LOW)
-        GPIO.output(motor_pin_left, GPIO.LOW)
-
-    if pull_influence_radius_px > 0:
-        duty_pct = min(100.0, (abs(offset_px) / pull_influence_radius_px) * 100.0)
-    else:
-        duty_pct = 100.0 if offset_px != 0 else 0.0
-    duty_ns = _pwm_ns_duty(period_ns, duty_pct)
-    _pwm_wr(f"{pwm_channel_path}/duty_cycle", duty_ns)
-
-
-def shutdown_motor_outputs():
-    try:
-        _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
-        _pwm_wr(f"{pwm_channel_path}/enable", "0")
-    except OSError:
-        pass
-    finally:
-        GPIO.cleanup()
+# Closed-loop motor controller (instantiated later once the cameras are ready)
+encoder_controller = None
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
@@ -229,8 +158,15 @@ def infer():
 
 Thread(target=infer, daemon=True).start()
 
-# Initialise motor outputs and PWM once
-motor_period_ns = initialise_motor_outputs()
+# Initialise the encoder-driven steering controller once
+encoder_controller = EncoderSteeringController(
+    motor_pin_left=motor_pin_left,
+    motor_pin_right=motor_pin_right,
+    pwm_chip_path=pwm_chip_path,
+    pwm_channel=pwm_channel,
+    pwm_frequency_hz=pwm_frequency_hz,
+    calibration_file=encoder_calibration_file,
+)
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -308,6 +244,9 @@ while True:
     zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
     zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
 
+    if encoder_controller is not None:
+        encoder_controller.update_screen_range(zone_left, zone_right)
+
     # Collect red-dot X positions that fall between the cutoff green lines (both cams)
     red_xs_all = []
     red_xs_in_zone = []
@@ -370,8 +309,9 @@ while True:
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
 
-    # Update motor direction and speed based on steering offset
-    set_motor_state(draw_x - center_x, motor_period_ns)
+    # Update motor direction and speed based on encoder feedback
+    if encoder_controller is not None:
+        encoder_controller.drive_to_screen_position(draw_x)
 
 
 
@@ -392,6 +332,21 @@ while True:
         hud_text_thickness,
         cv2.LINE_AA
     )
+
+    if encoder_controller is not None:
+        status_lines = encoder_controller.overlay_lines()
+        for idx, line in enumerate(status_lines, start=1):
+            pos = (hud_text_position[0], hud_text_position[1] + 20 * idx)
+            cv2.putText(
+                combined,
+                line,
+                pos,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                hud_text_scale,
+                hud_text_color,
+                hud_text_thickness,
+                cv2.LINE_AA,
+            )
 
     # Visualize the pull zone boundaries (blue vertical lines)
     cv2.line(
@@ -414,7 +369,9 @@ while True:
     cv2.imshow("Depth: Camera 0 | Camera 1", combined)
     key = cv2.waitKey(1) & 0xFF
 
-    # Handle keys — currently only ESC to exit
+    if encoder_controller is not None:
+        encoder_controller.handle_key(key)
+
     if key == 27:
         break
 
@@ -423,4 +380,5 @@ running = False
 cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
-shutdown_motor_outputs()
+if encoder_controller is not None:
+    encoder_controller.shutdown()
