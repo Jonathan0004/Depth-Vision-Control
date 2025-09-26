@@ -9,8 +9,8 @@ CHANNEL = "pwm0"
 
 FREQ_HZ = 5000          # PWM frequency (e.g., 5000 for 5 kHz)
 TARGET_DUTY_PCT = 100.0   # final duty cycle in percent (e.g., 10.0 for 10%)
-SOFT_START_S = 4.0       # time to ramp from 0% up to TARGET_DUTY_PCT (seconds)
-RAMP_STEPS = 50          # number of steps in the soft-start ramp
+SOFT_START_S = 2.0       # time to ramp from 0% up to TARGET_DUTY_PCT (seconds)
+RAMP_STEPS = 2          # number of steps in the soft-start ramp
 
 # ===== Derived timing in sysfs units (nanoseconds) =====
 def ns_period(freq_hz: float) -> int:
