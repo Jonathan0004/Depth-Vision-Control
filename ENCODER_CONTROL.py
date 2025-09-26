@@ -1,382 +1,324 @@
-"""Closed-loop steering controller for the Depth-Vision platform.
+"""Stereo depth estimation with obstacle detection and steering guidance.
 
-This module wraps the brushed motor H-bridge outputs and an AS5048A SPI
-magnetic encoder into a reusable controller that can be driven by
-``detectAvoid_V2.py``.  The controller provides calibration, persistence and
-status overlays so the steering command coming from the vision pipeline maps
-linearly to the physical steering angle.
-
-Hardware hook-up (Jetson Nano ↔ AS5048A):
-    * 3V3  -> AS5048A VCC (pin 1 on the Jetson Nano 40-pin header)
-    * GND  -> AS5048A GND (pin 6)
-    * SPI0_SCLK -> AS5048A CLK (pin 23)
-    * SPI0_MOSI -> AS5048A DI  (pin 19)
-    * SPI0_MISO -> AS5048A DO  (pin 21)
-    * Choose any free GPIO for chip-select, e.g. SPI0_CS0 on pin 24. Tie it to
-      the AS5048A CS pin.  The code below assumes ``spi_device=0`` which uses
-      CS0.
-
-Additional notes:
-    * Enable SPI on the Nano using ``sudo /opt/nvidia/jetson-io/jetson-io.py``
-      (or by editing the device-tree overlay).
-    * Keep all logic at 3.3 V.  The AS5048A is **not** 5 V tolerant on the SPI
-      lines.
-    * The motor enable pins are driven using Jetson.GPIO in BOARD numbering and
-      the PWM output is routed via ``/sys/class/pwm`` as in the previous motor
-      controller.
+The script streams from two cameras, infers depth using the
+``depth-anything`` model, highlights obstacles inside configurable cutoff
+bands, and visualises a blue steering cue that points toward the widest gap.
+All tunable parameters live together for quick iteration.
 """
 
-from __future__ import annotations
+import queue
+from threading import Thread
 
-import json
-import math
-import os
-import time
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional
-
-import Jetson.GPIO as GPIO
-
-try:
-    import spidev  # type: ignore
-except ImportError as exc:  # pragma: no cover - hardware dependency
-    raise RuntimeError(
-        "spidev is required for the AS5048A encoder. Install it with 'sudo apt "
-        "install python3-spidev' and ensure SPI is enabled."
-    ) from exc
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from transformers import pipeline
 
 
-@dataclass
-class Calibration:
-    """Persistent mapping between screen space and encoder angles."""
+# ---------------------------------------------------------------------------
+# Configuration — tweak these values to adjust behaviour without diving into
+# the rest of the code. Where possible, related values are grouped together and
+# documented so their impact is clear.
+# ---------------------------------------------------------------------------
 
-    angle_left: float
-    angle_right: float
-    span: float
-    screen_min: float
-    screen_max: float
-    timestamp: str
+# Grid resolution for sampling depth points across each frame (higher = denser)
+rows, cols = 25, 50
 
-    def to_dict(self) -> dict:
-        return {
-            "angle_left": self.angle_left,
-            "angle_right": self.angle_right,
-            "span": self.span,
-            "screen_min": self.screen_min,
-            "screen_max": self.screen_max,
-            "timestamp": self.timestamp,
-        }
+# Obstacle detection thresholds
+depth_diff_threshold = 8      # minimum mean-depth difference to flag a point
+std_multiplier = 0.3         # scales standard deviation term for adaptive thresholding
 
-    @classmethod
-    def from_dict(cls, payload: dict) -> "Calibration":
-        return cls(
-            angle_left=float(payload["angle_left"]),
-            angle_right=float(payload["angle_right"]),
-            span=float(payload["span"]),
-            screen_min=float(payload["screen_min"]),
-            screen_max=float(payload["screen_max"]),
-            timestamp=str(payload.get("timestamp", "")),
-        )
+# Cutoff bands (green) — obstacles outside these vertical limits are ignored
+top_cutoff_pixels = 10        # pixels from the top edge of each camera frame
+bottom_cutoff_pixels = 54     # pixels from the bottom edge of each camera frame
+cutoff_line_color = (0, 255, 0)
+cutoff_line_thickness = 1
+
+# Obstacle marker (red dots)
+obstacle_dot_radius_px = 5
+obstacle_dot_color = (0, 0, 255)
+
+# Blue steering cue (circle) rendered on the combined frame
+blue_circle_radius_px = 12
+blue_circle_color = (255, 0, 0)
+blue_circle_thickness = 3
+
+# Blue vertical cutoff lines indicate the "pull zone" used for gating logic
+pull_zone_line_color = (255, 0, 0)
+pull_zone_line_thickness = 1
+pull_influence_radius_px = 120   # half-width of the pull zone around centre
+pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left)
+
+# Smoothing factor for the steering cue (1 → frozen, 0 → instant response)
+blue_x_smoothness = 0.7
+
+# HUD text overlays on the combined frame
+hud_text_position = (10, 30)
+hud_text_color = (255, 255, 255)
+hud_text_scale = 0.54
+hud_text_thickness = 1
 
 
-class EncoderSteeringController:
-    """Closed-loop steering helper around an AS5048A absolute encoder."""
+# ---------------------------------------------------------------------------
+# Runtime state (initialised once, then updated as frames stream in)
+# ---------------------------------------------------------------------------
+blue_x = None              # persistent, smoothed x-position of the blue circle
+steer_control_x = None     # integer pixel location displayed as HUD text
 
-    def __init__(
-        self,
-        *,
-        motor_pin_left: int,
-        motor_pin_right: int,
-        pwm_chip_path: str,
-        pwm_channel: str,
-        pwm_frequency_hz: int,
-        calibration_file: str,
-        spi_bus: int = 0,
-        spi_device: int = 0,
-        tolerance_deg: float = 1.0,
-        kp: float = 0.9,
-        min_pwm_pct: float = 15.0,
-        max_pwm_pct: float = 75.0,
-    ) -> None:
-        self.motor_pin_left = motor_pin_left
-        self.motor_pin_right = motor_pin_right
-        self.pwm_chip_path = pwm_chip_path
-        self.pwm_channel = pwm_channel
-        self.pwm_frequency_hz = pwm_frequency_hz
-        self.calibration_file = calibration_file
-        self.spi_bus = spi_bus
-        self.spi_device = spi_device
-        self.tolerance_deg = tolerance_deg
-        self.kp = kp
-        self.min_pwm_pct = min_pwm_pct
-        self.max_pwm_pct = max_pwm_pct
 
-        self.screen_min = 0.0
-        self.screen_max = 1.0
-        self.calibration: Optional[Calibration] = None
-        self.calibration_stage: Optional[str] = None
-        self._calibration_samples = {}
-        self._status_messages: List[str] = []
-        self._target_unwrapped: Optional[float] = None
-        self._last_error: Optional[float] = None
+# ---------------------------------------------------------------------------
+# Helper utilities and pipeline initialisation
+# ---------------------------------------------------------------------------
 
-        self.spi = spidev.SpiDev()
-        self.spi.open(self.spi_bus, self.spi_device)
-        self.spi.max_speed_hz = 1_000_000
-        self.spi.mode = 0b01
+# Utility: clamp values between two bounds (used to keep overlays on-screen)
+def clamp(val, minn, maxn):
+    return max(min(val, maxn), minn)
 
-        self.pwm_channel_path = os.path.join(self.pwm_chip_path, self.pwm_channel)
-        self._ensure_pwm_ready()
-        self._setup_gpio()
 
-        self.calibration = self._load_calibration()
-        if self.calibration is None:
-            self._status_messages.append("Encoder: press 'c' to calibrate")
-        else:
-            self.screen_min = self.calibration.screen_min
-            self.screen_max = self.calibration.screen_max
-            self._status_messages.append(
-                f"Calibration loaded ({self.calibration.timestamp})"
-            )
+# Initialise the depth estimation model once (heavy call, so keep global)
+depth_pipe = pipeline(
+    task="depth-estimation",
+    model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
+    device=0
+)
 
-    # ------------------------------------------------------------------
-    # Public API used from detectAvoid_V2.py
-    # ------------------------------------------------------------------
-    def update_screen_range(self, zone_left: float, zone_right: float) -> None:
-        self.screen_min = float(zone_left)
-        self.screen_max = float(zone_right)
+# Build the camera-specific GStreamer pipeline string for a Jetson device
+def make_gst(sensor_id):
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        "video/x-raw(memory:NVMM),width=300,height=150,framerate=60/1 ! "
+        "nvvidconv flip-method=2 ! video/x-raw,format=BGRx ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink sync=false max-buffers=1 drop=true"
+    )
 
-    def drive_to_screen_position(self, screen_x: float) -> None:
-        if self.calibration_stage:
-            # During calibration the user moves the wheels manually.
-            self.stop_motor()
-            return
-        if self.calibration is None:
-            self.stop_motor()
-            return
-        if math.isclose(self.screen_min, self.screen_max):
-            return
+# Open both cameras and trim their internal buffers for minimal latency
+cap0 = cv2.VideoCapture(make_gst(0), cv2.CAP_GSTREAMER)
+cap1 = cv2.VideoCapture(make_gst(1), cv2.CAP_GSTREAMER)
+if not cap0.isOpened() or not cap1.isOpened():
+    raise RuntimeError("Failed to open one or both cameras.")
+cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        target_unwrapped = self._screen_to_unwrapped(screen_x)
-        current = self._read_unwrapped_angle()
-        error = target_unwrapped - current
-        self._last_error = error
-        self._target_unwrapped = target_unwrapped
+# Thread-safe queues for streaming frames and depth inference results
+frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
+running = True
 
-        if abs(error) <= self.tolerance_deg:
-            self.stop_motor()
-            return
 
-        direction = 1 if error > 0 else -1
-        duty_pct = min(
-            self.max_pwm_pct,
-            max(self.min_pwm_pct, abs(error) * self.kp),
-        )
-        self._apply_motor(direction, duty_pct)
+# ---------------------------------------------------------------------------
+# Background threads: one per camera for capture, one shared for inference
+# ---------------------------------------------------------------------------
 
-    def handle_key(self, key: int) -> None:
-        if key in (-1, 255):
-            return
-        if key == ord("c"):
-            self._begin_calibration()
-            return
-        if self.calibration_stage is None:
-            return
-        if key == ord(" "):
-            # Record current stage sample
-            angle = self._read_raw_angle()
-            if self.calibration_stage == "left":
-                self._calibration_samples["left"] = angle
-                self.calibration_stage = "right"
-                msg = "Move steering to RIGHT limit, press SPACE"
-                self._status_messages = [msg]
-                print("[Calibration] Recorded left limit at %.2f°" % angle)
-            elif self.calibration_stage == "right":
-                self._calibration_samples["right"] = angle
-                print("[Calibration] Recorded right limit at %.2f°" % angle)
-                self._finish_calibration()
-        elif key == 27:
-            # ESC cancels calibration but allow main loop to exit as well.
-            self._status_messages = ["Calibration cancelled"]
-            self.calibration_stage = None
-            self._calibration_samples = {}
+def grab(cam, q):
+    """Continuously read frames from `cam` and keep the freshest one in `q`."""
+    while running:
+        ret, frame = cam.read()
+        if ret:
+            if q.full(): q.get_nowait()
+            q.put(frame)
 
-    def overlay_lines(self) -> List[str]:
-        lines = list(self._status_messages)
-        if self.calibration_stage == "left":
-            lines.insert(0, "Calibration: move LEFT, press SPACE")
-        elif self.calibration_stage == "right":
-            lines.insert(0, "Calibration: move RIGHT, press SPACE")
-        elif self.calibration is None:
-            lines.insert(0, "Encoder: press 'c' to calibrate")
-        else:
-            if self._last_error is not None and self._target_unwrapped is not None:
-                lines.insert(
-                    0,
-                    "Encoder err: %.1f° target %.1f°" % (
-                        self._last_error,
-                        self._target_unwrapped,
-                    ),
-                )
-        return lines
+Thread(target=grab, args=(cap0, frame_q0), daemon=True).start()
+Thread(target=grab, args=(cap1, frame_q1), daemon=True).start()
 
-    def shutdown(self) -> None:
-        self.stop_motor()
+def infer():
+    """Fetch paired frames, run depth inference, and push the results downstream."""
+    while running:
         try:
-            self._pwm_write("duty_cycle", 0)
-            self._pwm_write("enable", 0)
-        except OSError:
-            pass
-        self.spi.close()
-        GPIO.cleanup()
+            f0 = frame_q0.get(timeout=0.01)
+            f1 = frame_q1.get(timeout=0.01)
+        except queue.Empty:
+            continue
+        imgs = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in (f0, f1)]
+        with torch.amp.autocast(device_type='cuda'), torch.no_grad():
+            outs = depth_pipe(imgs)
+        d0, d1 = [np.array(o['depth']) for o in outs]
+        if result_q.full(): result_q.get_nowait()
+        result_q.put((f0, d0, f1, d1))
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def stop_motor(self) -> None:
-        GPIO.output(self.motor_pin_left, GPIO.LOW)
-        GPIO.output(self.motor_pin_right, GPIO.LOW)
-        self._pwm_write("duty_cycle", 0)
+Thread(target=infer, daemon=True).start()
 
-    def _apply_motor(self, direction: int, duty_pct: float) -> None:
-        if direction >= 0:
-            GPIO.output(self.motor_pin_left, GPIO.LOW)
-            GPIO.output(self.motor_pin_right, GPIO.HIGH)
-        else:
-            GPIO.output(self.motor_pin_left, GPIO.HIGH)
-            GPIO.output(self.motor_pin_right, GPIO.LOW)
-        duty_ns = self._duty_from_percent(duty_pct)
-        self._pwm_write("duty_cycle", duty_ns)
+# ---------------------------------------------------------------------------
+# Main processing loop — consume depth results, annotate, and display
+# ---------------------------------------------------------------------------
+while True:
+    try:
+        frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
+    except queue.Empty:
+        continue
 
-    def _begin_calibration(self) -> None:
-        self.stop_motor()
-        self.calibration_stage = "left"
-        self._calibration_samples = {}
-        self._status_messages = [
-            "Calibration started", "Move steering to LEFT limit, press SPACE"
-        ]
-        print("[Calibration] Starting new calibration. Move to LEFT limit and press SPACE.")
+    # Build a sparse point cloud by sampling each depth map on a coarse grid
+    h0, w0 = depth0.shape
+    h1, w1 = depth1.shape
+    points = []
+    for cam_idx, (depth, x_offset, w, h) in enumerate([
+        (depth0, 0, w0, h0), (depth1, w0, w1, h1)
+    ]):
+        for c in range(cols):
+            for r in range(rows):
+                px = int((c + 0.5) * w / cols) + x_offset
+                py = int((r + 0.5) * h / rows)
+                z  = float(depth[int(py), int(px - x_offset)])
+                points.append((px, py, z, cam_idx))
+    cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
 
-    def _finish_calibration(self) -> None:
-        left = self._calibration_samples.get("left")
-        right = self._calibration_samples.get("right")
-        if left is None or right is None:
-            self._status_messages = ["Calibration failed: missing samples"]
-            self.calibration_stage = None
-            return
+    # Determine obstacle candidates by comparing each sample to the scene average
+    zs = cloud['z']
+    mean_z, std_z = zs.mean(), zs.std()
+    thresh = max(depth_diff_threshold, std_multiplier * std_z)
+    mask = (mean_z - zs) > thresh
 
-        span = self._unwrap_difference(left, right)
-        timestamp = datetime.utcnow().isoformat()
-        self.calibration = Calibration(
-            angle_left=left,
-            angle_right=right,
-            span=span,
-            screen_min=self.screen_min,
-            screen_max=self.screen_max,
-            timestamp=timestamp,
-        )
-        self._save_calibration(self.calibration)
-        self._status_messages = [f"Calibration saved {timestamp}"]
-        self.calibration_stage = None
-        self._calibration_samples = {}
-        print("[Calibration] Completed. Span %.2f°" % span)
+    # Convert depth arrays into coloured heatmaps for easier interpretation
+    norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
+    norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
 
-    def _load_calibration(self) -> Optional[Calibration]:
-        if not os.path.isfile(self.calibration_file):
-            return None
-        try:
-            with open(self.calibration_file, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"Failed to read calibration file {self.calibration_file}: {exc}")
-            return None
-        try:
-            return Calibration.from_dict(data)
-        except (KeyError, TypeError, ValueError):
-            print(f"Calibration file {self.calibration_file} is malformed. Ignoring.")
-            return None
+    # Draw cutoff lines on each camera to mark the active sensing band
+    for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
+        top_y = top_cutoff_pixels
+        bottom_y = h - bottom_cutoff_pixels
+        cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
+        cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
 
-    def _save_calibration(self, calibration: Calibration) -> None:
-        directory = os.path.dirname(self.calibration_file)
-        if directory and not os.path.isdir(directory):
-            os.makedirs(directory, exist_ok=True)
-        payload = calibration.to_dict()
-        with open(self.calibration_file, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
+    # Draw obstacle points only within cutoffs
+    for is_obst, pt in zip(mask, cloud):
+        if not is_obst:
+            continue
+        px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
+        # check cutoffs
+        if py < top_cutoff_pixels or py > ( (frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels ):
+            continue
+        # draw red dot
+        target = cmap0 if cam == 0 else cmap1
+        offset_x = 0 if cam == 0 else w0
 
-    def _screen_to_unwrapped(self, screen_x: float) -> float:
-        ratio = (screen_x - self.screen_min) / (self.screen_max - self.screen_min)
-        ratio = max(0.0, min(1.0, ratio))
-        base = self.calibration.angle_left
-        span = self.calibration.span
-        return base + span * ratio
+        #Red Dots:
+        # cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
 
-    def _read_unwrapped_angle(self) -> float:
-        angle = self._read_raw_angle()
-        base = self.calibration.angle_left
-        diff = self._unwrap_difference(base, angle)
-        return base + diff
+    # Show combined view
+    combined = np.hstack((cmap0, cmap1))
 
-    def _unwrap_difference(self, start: float, end: float) -> float:
-        diff = (end - start + 540.0) % 360.0 - 180.0
-        return diff
+    
+    
+    # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
+    h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
 
-    def _read_raw_angle(self) -> float:
-        command = self._build_command(0x3FFF)
-        self.spi.xfer2([(command >> 8) & 0xFF, command & 0xFF])
-        time.sleep(0.00001)
-        result = self.spi.xfer2([0x00, 0x00])
-        value = ((result[0] << 8) | result[1]) & 0x3FFF
-        return (value * 360.0) / 16383.0
+    # vertical midpoint between the two green cutoff lines (for blue circle)
+    line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
 
-    def _build_command(self, address: int) -> int:
-        command = 0x4000 | (address & 0x3FFF)
-        if self._parity(command):
-            command |= 0x8000
-        return command
+    # combined-frame center X, optionally offset for asymmetric steering bias
+    center_x = (w_combined // 2) + pull_zone_center_offset_px
 
-    @staticmethod
-    def _parity(value: int) -> int:
-        return bin(value).count("1") % 2
+    # pull zone boundaries (clamped to image)
+    zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
+    zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
 
-    def _ensure_pwm_ready(self) -> None:
-        if not os.path.isdir(self.pwm_channel_path):
-            if not os.path.isdir(self.pwm_chip_path):
-                raise FileNotFoundError(
-                    f"PWM chip {self.pwm_chip_path} not found. Check Jetson configuration."
-                )
-            self._pwm_write(os.path.join(self.pwm_chip_path, "export"), 0)
-            for _ in range(200):
-                if os.path.isdir(self.pwm_channel_path):
-                    break
-                time.sleep(0.01)
-            else:
-                raise TimeoutError("PWM channel did not appear after export")
-        try:
-            self._pwm_write("enable", 0)
-        except OSError:
-            pass
-        period = int(round(1e9 / float(self.pwm_frequency_hz)))
-        self.period_ns = period
-        self._pwm_write("period", period)
-        self._pwm_write("duty_cycle", 0)
-        self._pwm_write("enable", 1)
+    # Collect red-dot X positions that fall between the cutoff green lines (both cams)
+    red_xs_all = []
+    red_xs_in_zone = []
 
-    def _setup_gpio(self) -> None:
-        GPIO.setmode(GPIO.BOARD)
-        GPIO.setwarnings(False)
-        GPIO.setup(self.motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
-        GPIO.setup(self.motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
+    for is_obst, pt in zip(mask, cloud):
+        if not is_obst:
+            continue
+        px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
+        frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
+        if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels):
+            continue
+        red_xs_all.append(px)
+        if zone_left <= px <= zone_right:
+            red_xs_in_zone.append(px)
 
-    def _duty_from_percent(self, percent: float) -> int:
-        pct = max(0.0, min(100.0, percent))
-        return int(self.period_ns * (pct / 100.0))
+    # Deduplicate & sort to simplify gap computation
+    red_xs_all = sorted(set(red_xs_all))
+    red_xs_in_zone = sorted(set(red_xs_in_zone))
 
-    def _pwm_write(self, leaf: str, value: int) -> None:
-        path = leaf if os.path.isabs(leaf) else os.path.join(self.pwm_channel_path, leaf)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(str(value))
+    # Global blockers across the full width
+    blockers_all = [0] + red_xs_all + [w_combined]
 
+    def widest_gap_center(blockers, preferred_x):
+        """
+        Choose the center of the widest gap considering ALL blockers.
+        Tie-breaker: pick the gap whose center is closest to preferred_x.
+        """
+        if len(blockers) < 2:
+            return preferred_x
+        best_width = -1
+        best_dist = 1e18
+        best_cx = preferred_x
+        for left, right in zip(blockers[:-1], blockers[1:]):
+            width = right - left
+            cx = (left + right) // 2
+            dist = abs(cx - preferred_x)
+            if (width > best_width) or (width == best_width and dist < best_dist):
+                best_width = width
+                best_dist = dist
+                best_cx = cx
+        return int(best_cx)
 
-__all__ = ["EncoderSteeringController"]
+    # Gating:
+    # - No in-zone obstacles -> ignore outside, keep center
+    # - Any in-zone obstacles -> plan using ALL obstacles
+    if len(red_xs_in_zone) == 0:
+        gap_cx = center_x
+    else:
+        gap_cx = widest_gap_center(blockers_all, preferred_x=center_x)
+
+    # Smooth horizontal motion (keep as FLOAT; don't floor!)
+    if blue_x is None:
+        blue_x = float(gap_cx)
+    else:
+        blue_x = blue_x * blue_x_smoothness + gap_cx * (1 - blue_x_smoothness)
+
+    # Round ONLY for rendering / display to avoid bias
+    draw_x = int(round(blue_x))
+
+    # Update "Steer Control" variable every loop
+    steer_control_x = draw_x
+
+    # Draw the guidance circle
+    blue_pos = (draw_x, line_y)
+    cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
+
+    # Display "Steer Control" on the left frame
+    cv2.putText(
+        combined,
+        f"Steer Control: {steer_control_x}",
+        hud_text_position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA
+    )
+
+    # Visualize the pull zone boundaries (blue vertical lines)
+    cv2.line(
+        combined,
+        (int(zone_left), 0),
+        (int(zone_left), h_combined),
+        pull_zone_line_color,
+        pull_zone_line_thickness,
+    )
+    cv2.line(
+        combined,
+        (int(zone_right), 0),
+        (int(zone_right), h_combined),
+        pull_zone_line_color,
+        pull_zone_line_thickness,
+    )
+    # ────────────────────────────────────────────────────────────────────
+
+    # Present the final annotated view
+    cv2.imshow("Depth: Camera 0 | Camera 1", combined)
+    key = cv2.waitKey(1) & 0xFF
+
+    # Handle keys — currently only ESC to exit
+    if key == 27:
+        break
+
+# === Cleanup ===
+running = False
+cap0.release()
+cap1.release()
+cv2.destroyAllWindows()
