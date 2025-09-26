@@ -51,7 +51,7 @@ PWM_ACTUAL_FREQUENCY_HZ = int(round(1_000_000_000 / PWM_PERIOD_NS))
 # Number of pixels away from the center that map to 100% duty cycle. Lowering
 # this value makes the vehicle respond more aggressively to small offsets;
 # increasing it makes the steering more relaxed.
-SPAN_PX = 200
+SPAN_PX = 150
 
 # Deadband around the image center (in pixels). Within this window the motor is
 # held stopped to prevent oscillations when the target is nearly centered.
@@ -60,7 +60,7 @@ DEADZONE_PX = 2
 # Number of discrete steps used to ramp the PWM duty from 0 to 100%. Higher
 # values make duty changes more gradual, mirroring the soft-start behaviour in
 # ``pwmControl.py``.
-PWM_DUTY_RAMP_STEPS = 50
+PWM_DUTY_RAMP_STEPS = 20
 
 # Preferred sysfs pwmchip path. If unavailable, an auto-probe searches others.
 PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
