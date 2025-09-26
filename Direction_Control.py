@@ -10,7 +10,7 @@ import time
 import queue
 from dataclasses import dataclass
 from threading import Thread
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # =============================================================================
@@ -24,6 +24,11 @@ import Jetson.GPIO as GPIO
 from PIL import Image
 from transformers import pipeline
 
+try:
+    import spidev
+except ModuleNotFoundError:  # pragma: no cover - Jetson-specific dependency
+    spidev = None
+
 
 # =============================================================================
 # Core behaviour (constants and global configuration)
@@ -33,6 +38,7 @@ PWM_FREQUENCY_HZ = 5_000
 PWM_PERIOD_NS = int(round(1_000_000_000 / PWM_FREQUENCY_HZ))
 PWM_CHIP_PATH = "/sys/class/pwm/pwmchip3"
 DEADZONE_PX = 2
+STEERING_USAGE_FRACTION = 1.0  # 1.0 = use full pixel range, <1 tightens response (more sensitive)
 
 GPIO.setmode(GPIO.BOARD)
 STBY_BOARD_PIN, AIN1_BOARD_PIN, AIN2_BOARD_PIN = 37, 31, 29
@@ -63,6 +69,7 @@ HUD_TEXT_COLOR = (255, 255, 255)
 pwm_initialized = False
 pwm_driver = None
 current_dir = 0
+encoder = None
 
 
 # =============================================================================
@@ -168,11 +175,183 @@ def tb6612_set_direction(direction: int):
 
 
 # =============================================================================
-# Encoder feedback (placeholder for future implementation)
+# Encoder feedback (AS5048A SPI interface + calibration utilities)
 # =============================================================================
 
-# TODO: Encoder-based position tracking and duty-cycle adjustment will be added
-# here to maintain the steering alignment regardless of left/right orientation.
+
+class EncoderNotReady(RuntimeError):
+    """Raised when encoder data is requested before calibration."""
+
+
+class AS5048AEncoder:
+    """Minimal AS5048A helper with SPI wiring instructions for the Jetson Nano.
+
+    Wiring (Jetson Nano 40-pin header, BOARD numbering) -> AS5048A breakout:
+        - Pin 1  (3V3)  -> VDD/VCC (the AS5048A accepts 3.3 V logic)
+        - Pin 6  (GND)  -> GND
+        - Pin 19 (MOSI) -> SDI (controller -> sensor)
+        - Pin 21 (MISO) -> SDO (sensor -> controller)
+        - Pin 23 (SCLK) -> CLK
+        - Pin 24 (SPI0_CS0) -> CSn
+
+    Enable the SPI bus once (``sudo /opt/nvidia/jetson-io/jetson-io.py``) and
+    reboot the Nano so that ``/dev/spidev0.0`` is exposed. The class translates
+    the 14-bit magnetic angle into a normalised value that can be consumed by the
+    steering controller.
+    """
+
+    ANGLE_REGISTER = 0x3FFF
+    NOP_COMMAND = 0x0000
+
+    def __init__(self, spi_bus=0, spi_device=0, usage_fraction=1.0):
+        if spidev is None:
+            raise RuntimeError(
+                "spidev module not available. Install on Jetson and enable SPI"
+            )
+        self.spi_bus = int(spi_bus)
+        self.spi_device = int(spi_device)
+        self.usage_fraction = clamp(float(usage_fraction), 0.1, 1.0)
+        self._spi = None
+        self.calibrated = False
+        self.min_raw = 0
+        self.max_raw = 0
+        self.center_raw = 0
+        self.raw_half_span = 1.0
+        self._pixel_half_span = 320.0
+        self.deadband_fraction = 0.02
+        self.pwm_gain = 0.85
+
+    # ---------------------------------------------------------------------
+    # SPI helpers
+    # ---------------------------------------------------------------------
+    def connect(self, max_speed_hz=1_000_000):
+        if self._spi is not None:
+            return
+        spi = spidev.SpiDev()
+        spi.open(self.spi_bus, self.spi_device)
+        spi.max_speed_hz = max_speed_hz
+        spi.mode = 0b01  # CPOL=0, CPHA=1 -> AS5048A mode 1
+        spi.lsbfirst = False
+        self._spi = spi
+
+    def close(self):
+        if self._spi is not None:
+            try:
+                self._spi.close()
+            finally:
+                self._spi = None
+
+    def _with_parity(self, value: int) -> int:
+        value &= 0x7FFF
+        parity = bin(value).count("1") % 2
+        if parity == 1:
+            value |= 0x8000
+        return value
+
+    def _xfer16(self, value: int) -> int:
+        if self._spi is None:
+            raise EncoderNotReady("SPI device not initialised")
+        hi, lo = (value >> 8) & 0xFF, value & 0xFF
+        rx_hi, rx_lo = self._spi.xfer2([hi, lo])
+        return ((rx_hi & 0xFF) << 8) | (rx_lo & 0xFF)
+
+    def _read_register(self, reg: int) -> int:
+        cmd = 0x4000 | (reg & 0x3FFF)
+        self._xfer16(self._with_parity(cmd))
+        resp = self._xfer16(self._with_parity(self.NOP_COMMAND))
+        if resp & 0x4000:
+            raise RuntimeError("AS5048A error flag set during read")
+        return resp & 0x3FFF
+
+    # ---------------------------------------------------------------------
+    # Public utilities
+    # ---------------------------------------------------------------------
+    @property
+    def is_connected(self) -> bool:
+        return self._spi is not None
+
+    def set_usage_fraction(self, fraction: float) -> None:
+        self.usage_fraction = clamp(float(fraction), 0.1, 1.0)
+
+    def update_pixel_half_span(self, half_span_pixels: float) -> None:
+        self._pixel_half_span = max(1.0, float(half_span_pixels))
+
+    def read_raw_angle(self) -> int:
+        raw = self._read_register(self.ANGLE_REGISTER)
+        return raw & 0x3FFF
+
+    def read_degrees(self) -> float:
+        return (self.read_raw_angle() * 360.0) / 16384.0
+
+    def get_position_fraction(self) -> float:
+        if not self.calibrated:
+            raise EncoderNotReady("Encoder has not been calibrated yet")
+        raw = self.read_raw_angle()
+        offset = raw - self.center_raw
+        norm = offset / (self.raw_half_span * self.usage_fraction)
+        return clamp(norm, -1.0, 1.0)
+
+    def pixel_to_fraction(self, pixel_delta: float) -> float:
+        scale = self._pixel_half_span * self.usage_fraction
+        return clamp(pixel_delta / scale, -1.0, 1.0)
+
+    def compute_drive(self, pixel_delta: float) -> Tuple[int, float]:
+        if not self.calibrated:
+            raise EncoderNotReady("Run calibration (press 'c') before driving")
+        target_fraction = self.pixel_to_fraction(pixel_delta)
+        current_fraction = self.get_position_fraction()
+        error = clamp(target_fraction - current_fraction, -1.0, 1.0)
+        if abs(error) <= self.deadband_fraction:
+            return 0, 0.0
+        direction = 1 if error > 0 else -1
+        duty_fraction = clamp(abs(error) * self.pwm_gain, 0.0, 1.0)
+        return direction, duty_fraction
+
+    def interactive_calibration(self) -> None:
+        if not self.is_connected:
+            raise EncoderNotReady("Encoder SPI device is not connected")
+        print("\n[Encoder] Calibration started.")
+        print(
+            "Move the steering linkage to the LEFT mechanical limit, then press Enter."
+        )
+        input("Ready? ")
+        left = self._sample_average()
+        print("Move to the RIGHT mechanical limit, then press Enter.")
+        input("Ready? ")
+        right = self._sample_average()
+
+        if left == right:
+            raise RuntimeError("Encoder range is zero; check wiring and motion range")
+        if left > right:
+            left, right = right, left
+
+        span = right - left
+        if span <= 0:
+            raise RuntimeError("Calibration span invalid")
+
+        self.min_raw = left
+        self.max_raw = right
+        self.center_raw = (left + right) // 2
+        self.raw_half_span = max(1.0, span / 2.0)
+        self.calibrated = True
+        print(
+            f"[Encoder] Calibrated. Raw min={self.min_raw}, max={self.max_raw}, "
+            f"center={self.center_raw}."
+        )
+        print(
+            f"[Encoder] Usage fraction={self.usage_fraction:.2f}. "
+            "Press '[' or ']' in the HUD window to tighten/loosen sensitivity."
+        )
+
+    # ------------------------------------------------------------------
+    # Sampling helpers
+    # ------------------------------------------------------------------
+    def _sample_average(self, samples: int = 16, delay_s: float = 0.002) -> int:
+        vals = []
+        for _ in range(samples):
+            vals.append(self.read_raw_angle())
+            time.sleep(delay_s)
+        return int(round(sum(vals) / len(vals)))
 
 
 # =============================================================================
@@ -279,12 +458,41 @@ def update_guidance(target_x: int) -> int:
     return int(round(target_x))
 
 
-def apply_motor_control(center_x: int, steer_x: int) -> None:
+def apply_motor_control(center_x: int, steer_x: int, encoder_obj: Optional[AS5048AEncoder] = None) -> None:
     global current_dir
     if not pwm_initialized or pwm_driver is None:
         return
 
     delta_px = steer_x - center_x
+    if encoder_obj is not None:
+        encoder_obj.update_pixel_half_span(center_x)
+        try:
+            direction, duty_fraction = encoder_obj.compute_drive(delta_px)
+        except EncoderNotReady:
+            pass
+        except Exception as exc:
+            print(f"[Encoder] Warning: {exc}")
+        else:
+            duty_fraction = clamp(duty_fraction, 0.0, 1.0)
+            if direction == 0 or duty_fraction <= 0:
+                pwm_driver.set_duty(0)
+                if current_dir != 0:
+                    print("Direction: Hold | PWM: 0% (encoder aligned)")
+                current_dir = 0
+                return
+
+            desired_dir = 1 if direction > 0 else -1
+            if desired_dir != current_dir:
+                tb6612_set_direction(desired_dir)
+                direction_label = "Forward" if desired_dir > 0 else "Reverse"
+                print(
+                    f"Direction: {direction_label} | PWM: {int(duty_fraction * 100)}% "
+                    "(encoder closed-loop)"
+                )
+                current_dir = desired_dir
+            pwm_driver.set_duty(int(round(duty_fraction * PWM_PERIOD_NS)))
+            return
+
     if abs(delta_px) <= DEADZONE_PX:
         pwm_driver.set_duty(0)
         if current_dir != 0:
@@ -406,7 +614,7 @@ Thread(target=infer, daemon=True).start()
 
 
 def main():
-    global pwm_driver, pwm_initialized, running
+    global pwm_driver, pwm_initialized, running, encoder
     try:
         # Init TB6612 pins + PWM (start stopped)
         tb6612_pins_init()
@@ -419,6 +627,20 @@ def main():
         )
         print("Direction mapping: Forward=AIN1 HIGH, AIN2 LOW; Reverse=AIN1 LOW, AIN2 HIGH.")
 
+        if spidev is None:
+            print("[Encoder] spidev not installed. Encoder feedback disabled.")
+        else:
+            try:
+                encoder = AS5048AEncoder(usage_fraction=STEERING_USAGE_FRACTION)
+                encoder.connect()
+                print(
+                    "[Encoder] AS5048A detected on SPI bus. Press 'c' in the HUD window to "
+                    "calibrate left/right limits."
+                )
+            except Exception as exc:
+                encoder = None
+                print(f"[Encoder] Disabled: {exc}")
+
         while True:
             try:
                 frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
@@ -427,14 +649,30 @@ def main():
 
             analysis = analyze_scene(frame0, depth0, frame1, depth1)
             steer_x = update_guidance(analysis.gap_center_x)
-            apply_motor_control(analysis.center_x, steer_x)
+            apply_motor_control(analysis.center_x, steer_x, encoder)
 
             if ENABLE_VISUAL_OUTPUT:
                 display_img = overlay_visuals(analysis, steer_x)
                 if display_img is not None:
                     cv2.imshow("Depth: Camera 0 | Camera 1", display_img)
-                    if (cv2.waitKey(1) & 0xFF) == 27:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27:
                         break
+                    if key == ord('c') and encoder is not None:
+                        try:
+                            encoder.interactive_calibration()
+                        except Exception as exc:
+                            print(f"[Encoder] Calibration aborted: {exc}")
+                    if key == ord('[') and encoder is not None:
+                        encoder.set_usage_fraction(encoder.usage_fraction - 0.05)
+                        print(
+                            f"[Encoder] Tightened steering usage to {encoder.usage_fraction:.2f}"
+                        )
+                    if key == ord(']') and encoder is not None:
+                        encoder.set_usage_fraction(encoder.usage_fraction + 0.05)
+                        print(
+                            f"[Encoder] Loosened steering usage to {encoder.usage_fraction:.2f}"
+                        )
     finally:
         running = False
         try:
@@ -457,6 +695,11 @@ def main():
                 pwm_driver.close()
         except Exception as e:
             print(f"[PWM] Cleanup warning: {e}")
+        try:
+            if encoder is not None:
+                encoder.close()
+        except Exception as exc:
+            print(f"[Encoder] Cleanup warning: {exc}")
         # GPIO cleanup
         try:
             GPIO.output(STBY_BOARD_PIN, GPIO.LOW)
