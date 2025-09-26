@@ -1,11 +1,13 @@
 """Stereo depth estimation with obstacle detection and steering guidance.
 
-TB6612FNG (one motor, channel A) with fixed 5 kHz PWM (duty-only control).
-Direction from steering sign, speed from magnitude, center => 0% duty (stop).
+TB6612FNG (one motor, channel A) with adjustable PWM frequency (duty-only
+control). Direction from steering sign, speed from magnitude, center => 0%
+duty (stop).
 
 Robustness additions:
 - Jetson.GPIO -> sysfs GPIO fallback (container-friendly)
-- PWM auto-probe: find a working pwmchip*/pwm0 that accepts 5 kHz
+- PWM auto-probe: find a working pwmchip*/pwm0 that accepts the requested
+  carrier frequency
 - Safe PWM init order: duty_cycle -> period -> enable (avoids EINVAL)
 """
 
@@ -24,16 +26,34 @@ from transformers import pipeline
 # =============================================================================
 # Tunable parameters (grouped by subsystem)
 # =============================================================================
+# Tip: Adjust these values to suit your platform. Inline notes explain how each
+# setting impacts behaviour so you can iterate quickly without digging through
+# the control logic below.
 
 # --- Motor control behaviour -------------------------------------------------
-# Period for the TB6612 PWM signal in nanoseconds. 200_000 ns -> 5 kHz carrier.
-PWM_PERIOD_NS = 200_000
+# Base PWM carrier frequency in Hertz. Increase for quieter operation, decrease
+# if the driver struggles to keep up. The period in nanoseconds is derived from
+# this value automatically; use whole numbers to avoid floating point rounding
+# surprises.
+PWM_FREQUENCY_HZ = 5_000
+if PWM_FREQUENCY_HZ <= 0:
+    raise ValueError("PWM_FREQUENCY_HZ must be a positive, non-zero value.")
 
-# Number of pixels away from the center that map to 100% duty cycle. Affects
-# how aggressively the vehicle reacts to perceived steering error.
+# Derived PWM period in nanoseconds. Only override directly if you require a
+# non-integer frequency. Otherwise, tweak ``PWM_FREQUENCY_HZ`` above.
+PWM_PERIOD_NS = int(round(1_000_000_000 / PWM_FREQUENCY_HZ))
+
+# Convenience reference of the actual integer frequency created by
+# ``PWM_PERIOD_NS``. Useful for logging or verifying rounding behaviour.
+PWM_ACTUAL_FREQUENCY_HZ = int(round(1_000_000_000 / PWM_PERIOD_NS))
+
+# Number of pixels away from the center that map to 100% duty cycle. Lowering
+# this value makes the vehicle respond more aggressively to small offsets;
+# increasing it makes the steering more relaxed.
 SPAN_PX = 300
 
-# Deadband around the image center (in pixels) where no motion is commanded.
+# Deadband around the image center (in pixels). Within this window the motor is
+# held stopped to prevent oscillations when the target is nearly centered.
 DEADZONE_PX = 2
 
 # Preferred sysfs pwmchip path. If unavailable, an auto-probe searches others.
@@ -56,22 +76,29 @@ AIN1_GPIO_NUM = 0    # TB6612 AIN1 (forward)
 AIN2_GPIO_NUM = 0    # TB6612 AIN2 (reverse)
 
 # --- Depth & perception heuristics ------------------------------------------
-# Grid sampling density for the point cloud derived from the depth maps.
+# Grid sampling density for the point cloud derived from the depth maps. Higher
+# values yield smoother obstacle estimates but cost more compute per frame.
 rows, cols = 25, 50
 
-# Threshold logic for obstacle extraction: base difference and std-dev factor.
+# Threshold logic for obstacle extraction. ``depth_diff_threshold`` is the base
+# difference (in depth units) and ``std_multiplier`` scales the per-frame depth
+# variation. Tweak to balance sensitivity vs. noise.
 depth_diff_threshold = 8
 std_multiplier = 0.3
 
 # Pixels to ignore at the top/bottom of the frame, trimming sky/hood regions.
+# Increase if environmental clutter is triggering false obstacles.
 top_cutoff_pixels = 10
 bottom_cutoff_pixels = 54
 
-# Pull-zone configuration encourages steering towards open space.
+# Pull-zone configuration encourages steering towards open space. Shift the
+# ``pull_zone_center_offset_px`` if the cameras are not perfectly aligned with
+# the vehicle center.
 pull_influence_radius_px = 120
 pull_zone_center_offset_px = 0
 
-# Low-pass smoothing for the blue steering indicator (0 -> instant response).
+# Low-pass smoothing for the blue steering indicator. Set to 0 for immediate
+# changes or closer to 1.0 for a slower, more stable response.
 blue_x_smoothness = 0.7
 
 # --- On-screen display styling ----------------------------------------------
@@ -232,7 +259,8 @@ def pwm_autoprobe(period_ns: int, initial_duty_ns: int = 0):
         try:
             drv = PWMDriver(chip, 0)          # try channel 0 first
             drv.init(period_ns, initial_duty_ns)
-            print(f"[PWM] Using {chip}/pwm0 @ {int(1e9/period_ns)} Hz")
+            achieved_hz = int(round(1_000_000_000 / period_ns))
+            print(f"[PWM] Using {chip}/pwm0 @ {achieved_hz} Hz")
             return drv, chip
         except Exception as e:
             last_err = e
@@ -281,6 +309,11 @@ depth_pipe = pipeline(
 )
 
 def make_gst(sensor_id):
+    """Build a GStreamer string for the Jetson camera pipeline.
+
+    Adjust the width/height/framerate caps below to match your sensors. Keep
+    ``max-buffers=1`` so latency stays low for the control loop.
+    """
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
         "video/x-raw(memory:NVMM),width=300,height=150,framerate=60/1 ! "
@@ -333,7 +366,11 @@ try:
     tb6612_pins_init()
     pwm_driver, which_chip = pwm_autoprobe(PWM_PERIOD_NS, 0)  # starts disabled->enabled with duty=0
     pwm_initialized = True
-    print(f"PWM initialized: 5 kHz on {which_chip}/pwm0 (duty=0%). TB6612 STBY=HIGH.")
+    print(
+        "PWM initialized: target "
+        f"{PWM_FREQUENCY_HZ:,} Hz (achieved {PWM_ACTUAL_FREQUENCY_HZ:,} Hz) on {which_chip}/pwm0 "
+        "(duty=0%). TB6612 STBY=HIGH."
+    )
     print("Direction mapping: Forward=AIN1 HIGH, AIN2 LOW; Reverse=AIN1 LOW, AIN2 HIGH.")
 
     while True:
@@ -420,7 +457,7 @@ try:
         draw_x = int(round(blue_x))
         steer_control_x = draw_x
 
-        # --- Actuation: TB6612 motor control (5 kHz) -------------------------
+        # --- Actuation: TB6612 motor control (PWM frequency driven by config) ----
         if pwm_initialized and not pwm_error_reported:
             delta_px = steer_control_x - center_x
             desired_dir = 0
@@ -434,7 +471,7 @@ try:
                 current_dir = desired_dir
 
             mag = 0.0 if desired_dir == 0 else min(abs(delta_px) / float(SPAN_PX), 1.0)
-            duty_ns = int(mag * PWM_PERIOD_NS)  # 0..100% @ 5 kHz
+            duty_ns = int(mag * PWM_PERIOD_NS)  # 0..100% @ configured PWM frequency
             if (last_duty_ns is None) or (duty_ns != last_duty_ns):
                 pwm_driver.set_duty(duty_ns)
                 last_duty_ns = duty_ns
