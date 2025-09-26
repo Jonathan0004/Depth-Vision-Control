@@ -1,6 +1,3 @@
-"""Minimal stereo depth steering loop with fixed 50% PWM output."""
-
-
 # =============================================================================
 # Standard library imports
 # =============================================================================
@@ -76,7 +73,7 @@ hardware_encoder = None
 simulated_encoder = None
 manual_encoder_mode = False
 
-SIM_ENCODER_FINE_STEP_PX = 4
+SIM_ENCODER_FINE_STEP_PX = 8
 SIM_ENCODER_COARSE_STEP_PX = 12
 
 
