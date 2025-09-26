@@ -21,13 +21,78 @@ import torch
 from PIL import Image
 from transformers import pipeline
 
-# ---------------------------------------------------------------------------
-# Motor control configuration
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Tunable parameters (grouped by subsystem)
+# =============================================================================
 
-# Target PWM: 5 kHz
-PWM_PERIOD_NS = 200_000  # 5 kHz -> 200 µs
-# Duty will vary 0 .. PWM_PERIOD_NS (no servo-style pulses)
+# --- Motor control behaviour -------------------------------------------------
+# Period for the TB6612 PWM signal in nanoseconds. 200_000 ns -> 5 kHz carrier.
+PWM_PERIOD_NS = 200_000
+
+# Number of pixels away from the center that map to 100% duty cycle. Affects
+# how aggressively the vehicle reacts to perceived steering error.
+SPAN_PX = 300
+
+# Deadband around the image center (in pixels) where no motion is commanded.
+DEADZONE_PX = 2
+
+# Preferred sysfs pwmchip path. If unavailable, an auto-probe searches others.
+PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
+
+# --- GPIO selection ----------------------------------------------------------
+# Whether to bypass Jetson.GPIO and use the sysfs GPIO shim. This flag is
+# usually overwritten below during auto-detection but remains exposed for
+# manual tweaks while tuning hardware behaviour.
+USE_SYSFS_GPIO = False
+
+# BOARD pin choices when Jetson.GPIO is available.
+STBY_BOARD_PIN = 37  # STBY HIGH enables the driver
+AIN1_BOARD_PIN = 31  # Forward: AIN1=HIGH, AIN2=LOW
+AIN2_BOARD_PIN = 29  # Reverse: AIN1=LOW,  AIN2=HIGH
+
+# Sysfs GPIO line numbers (only used if USE_SYSFS_GPIO becomes True).
+STBY_GPIO_NUM = 0    # TB6612 STBY
+AIN1_GPIO_NUM = 0    # TB6612 AIN1 (forward)
+AIN2_GPIO_NUM = 0    # TB6612 AIN2 (reverse)
+
+# --- Depth & perception heuristics ------------------------------------------
+# Grid sampling density for the point cloud derived from the depth maps.
+rows, cols = 25, 50
+
+# Threshold logic for obstacle extraction: base difference and std-dev factor.
+depth_diff_threshold = 8
+std_multiplier = 0.3
+
+# Pixels to ignore at the top/bottom of the frame, trimming sky/hood regions.
+top_cutoff_pixels = 10
+bottom_cutoff_pixels = 54
+
+# Pull-zone configuration encourages steering towards open space.
+pull_influence_radius_px = 120
+pull_zone_center_offset_px = 0
+
+# Low-pass smoothing for the blue steering indicator (0 -> instant response).
+blue_x_smoothness = 0.7
+
+# --- On-screen display styling ----------------------------------------------
+cutoff_line_color = (0, 255, 0)
+cutoff_line_thickness = 1
+
+blue_circle_radius_px = 12
+blue_circle_color = (255, 0, 0)
+blue_circle_thickness = 3
+
+pull_zone_line_color = (255, 0, 0)
+pull_zone_line_thickness = 1
+
+hud_text_position = (10, 30)
+hud_text_color = (255, 255, 255)
+hud_text_scale = 0.54
+hud_text_thickness = 1
+
+# -----------------------------------------------------------------------------
+# Jetson.GPIO detection (auto-switches to sysfs fallback when unavailable)
+# -----------------------------------------------------------------------------
 
 # Try Jetson.GPIO first; if unavailable, use sysfs GPIO fallback
 USE_SYSFS_GPIO = False
@@ -40,56 +105,11 @@ except Exception as e:
     GPIO_WORKS = False
     USE_SYSFS_GPIO = True
 
-# ------ Sysfs fallback numbers (Linux GPIO line numbers, not BOARD pins) -----
-# Find with: `gpioinfo` (from package gpiod) or NVIDIA pinmux spreadsheet.
-STBY_GPIO_NUM = 0    # <-- set if using sysfs fallback (TB6612 STBY)
-AIN1_GPIO_NUM = 0    # <-- set if using sysfs fallback (TB6612 AIN1)
-AIN2_GPIO_NUM = 0    # <-- set if using sysfs fallback (TB6612 AIN2)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Hardware abstraction helpers
+# =============================================================================
 
-# If Jetson.GPIO is available, set BOARD pin numbers here (ignored by sysfs):
-STBY_BOARD_PIN = 37  # STBY HIGH enables the driver
-AIN1_BOARD_PIN = 31  # Forward: AIN1=HIGH, AIN2=LOW
-AIN2_BOARD_PIN = 29  # Reverse: AIN1=LOW,  AIN2=HIGH
-# Which pins go HIGH:
-#   Forward  -> AIN1 HIGH, AIN2 LOW
-#   Reverse  -> AIN1 LOW,  AIN2 HIGH
-#   STBY     -> HIGH (enable driver)
-
-# Steering-to-speed mapping
-SPAN_PX = 300     # |delta_px| mapping to 100% duty (tune)
-DEADZONE_PX = 2   # near-center deadband
-
-# Preferred pwmchip (matches working pwmControl.py script). If missing, we
-# fall back to auto-probing other pwmchips.
-PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
-
-# ---------------------------------------------------------------------------
-# Display & perception config (from your original)
-# ---------------------------------------------------------------------------
-rows, cols = 25, 50
-depth_diff_threshold = 8
-std_multiplier = 0.3
-top_cutoff_pixels = 10
-bottom_cutoff_pixels = 54
-cutoff_line_color = (0, 255, 0)
-cutoff_line_thickness = 1
-blue_circle_radius_px = 12
-blue_circle_color = (255, 0, 0)
-blue_circle_thickness = 3
-pull_zone_line_color = (255, 0, 0)
-pull_zone_line_thickness = 1
-pull_influence_radius_px = 120
-pull_zone_center_offset_px = 0
-blue_x_smoothness = 0.7
-hud_text_position = (10, 30)
-hud_text_color = (255, 255, 255)
-hud_text_scale = 0.54
-hud_text_thickness = 1
-
-# ---------------------------------------------------------------------------
-# Small GPIO shim for sysfs fallback
-# ---------------------------------------------------------------------------
+# --- Sysfs GPIO shim ---------------------------------------------------------
 class SysfsGPIO:
     def __init__(self, num):
         self.num = int(num)
@@ -125,9 +145,7 @@ class SysfsGPIO:
         except Exception:
             pass
 
-# ---------------------------------------------------------------------------
-# Runtime state
-# ---------------------------------------------------------------------------
+# --- Runtime state -----------------------------------------------------------
 blue_x = None
 steer_control_x = None
 pwm_initialized = False
@@ -137,9 +155,7 @@ pwm_driver = None
 current_dir = 0  # +1 forward, -1 reverse, 0 unknown
 gpio_stby = gpio_ain1 = gpio_ain2 = None
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Utility helpers ---------------------------------------------------------
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
 
@@ -255,9 +271,9 @@ def tb6612_set_direction(direction: int):
             gpio_ain1.write(0); gpio_ain2.write(1)
     # direction == 0 -> leave pins; stop is done with duty=0
 
-# ---------------------------------------------------------------------------
-# Depth model + cameras (unchanged logic)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Perception pipeline (depth model + stereo capture)
+# =============================================================================
 depth_pipe = pipeline(
     task="depth-estimation",
     model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
@@ -309,9 +325,9 @@ def infer():
 
 Thread(target=infer, daemon=True).start()
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Main control loop
+# =============================================================================
 try:
     # Init TB6612 pins + PWM (start stopped)
     tb6612_pins_init()
@@ -326,7 +342,7 @@ try:
         except queue.Empty:
             continue
 
-        # === perception & steering (same as your logic) ===
+        # --- Perception: build combined obstacle map ------------------------
         h0, w0 = depth0.shape
         h1, w1 = depth1.shape
         points = []
@@ -395,6 +411,7 @@ try:
 
         gap_cx = center_x if len(red_xs_in_zone) == 0 else widest_gap_center(blockers_all, preferred_x=center_x)
 
+        # --- Guidance: choose steering target --------------------------------
         if blue_x is None:
             blue_x = float(gap_cx)
         else:
@@ -403,7 +420,7 @@ try:
         draw_x = int(round(blue_x))
         steer_control_x = draw_x
 
-        # -------------------- TB6612 motor control (5 kHz) --------------------
+        # --- Actuation: TB6612 motor control (5 kHz) -------------------------
         if pwm_initialized and not pwm_error_reported:
             delta_px = steer_control_x - center_x
             desired_dir = 0
@@ -421,9 +438,7 @@ try:
             if (last_duty_ns is None) or (duty_ns != last_duty_ns):
                 pwm_driver.set_duty(duty_ns)
                 last_duty_ns = duty_ns
-        # ---------------------------------------------------------------------
-
-        # Draw UI
+        # --- Visualisation ---------------------------------------------------
         cv2.circle(combined, (draw_x, line_y), blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
         cv2.putText(combined, f"Steer Control: {steer_control_x}", hud_text_position,
                     cv2.FONT_HERSHEY_SIMPLEX, hud_text_scale, hud_text_color, hud_text_thickness, cv2.LINE_AA)
@@ -434,6 +449,9 @@ try:
         if (cv2.waitKey(1) & 0xFF) == 27:
             break
 
+# =============================================================================
+# Shutdown & resource cleanup
+# =============================================================================
 finally:
     running = False
     try: cap0.release()
