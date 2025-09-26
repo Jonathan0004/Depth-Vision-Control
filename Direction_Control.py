@@ -1,11 +1,21 @@
 """Minimal stereo depth steering loop with fixed 50% PWM output."""
 
+
+# =============================================================================
+# Standard library imports
+# =============================================================================
+
 import os
 import time
 import queue
 from dataclasses import dataclass
 from threading import Thread
 from typing import Optional
+
+
+# =============================================================================
+# Third-party imports
+# =============================================================================
 
 import cv2
 import numpy as np
@@ -14,7 +24,11 @@ import Jetson.GPIO as GPIO
 from PIL import Image
 from transformers import pipeline
 
-# Core behaviour (kept small so there are only a few obvious knobs)
+
+# =============================================================================
+# Core behaviour (constants and global configuration)
+# =============================================================================
+
 PWM_FREQUENCY_HZ = 5_000
 PWM_PERIOD_NS = int(round(1_000_000_000 / PWM_FREQUENCY_HZ))
 PWM_CHIP_PATH = "/sys/class/pwm/pwmchip3"
@@ -23,7 +37,11 @@ DEADZONE_PX = 2
 GPIO.setmode(GPIO.BOARD)
 STBY_BOARD_PIN, AIN1_BOARD_PIN, AIN2_BOARD_PIN = 37, 31, 29
 
-# Vision heuristics (kept inline for clarity)
+
+# =============================================================================
+# Vision heuristics and HUD styling
+# =============================================================================
+
 ROWS, COLS = 25, 50
 DEPTH_DIFF_THRESHOLD = 8
 STD_MULTIPLIER = 0.3
@@ -37,9 +55,19 @@ PULL_LINE_COLOR = (255, 0, 0)
 BLUE_MARKER_COLOR = (255, 0, 0)
 HUD_TEXT_COLOR = (255, 255, 255)
 
+
+# =============================================================================
+# Global state variables
+# =============================================================================
+
 pwm_initialized = False
 pwm_driver = None
 current_dir = 0
+
+
+# =============================================================================
+# Helper utilities
+# =============================================================================
 
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
@@ -53,6 +81,11 @@ class SceneAnalysis:
     zone_left: int
     zone_right: int
     line_y: int
+
+
+# =============================================================================
+# PWM driver interaction
+# =============================================================================
 
 
 class PWMDriver:
@@ -112,6 +145,12 @@ class PWMDriver:
             except Exception:
                 pass
 
+
+# =============================================================================
+# TB6612 motor driver helpers
+# =============================================================================
+
+
 def tb6612_pins_init():
     GPIO.setup(STBY_BOARD_PIN, GPIO.OUT, initial=GPIO.HIGH)  # STBY HIGH
     GPIO.setup(AIN1_BOARD_PIN, GPIO.OUT, initial=GPIO.LOW)
@@ -126,6 +165,14 @@ def tb6612_set_direction(direction: int):
         GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
         GPIO.output(AIN2_BOARD_PIN, GPIO.HIGH)
     # direction == 0 -> leave pins; stop is done with duty=0
+
+
+# =============================================================================
+# Encoder feedback (placeholder for future implementation)
+# =============================================================================
+
+# TODO: Encoder-based position tracking and duty-cycle adjustment will be added
+# here to maintain the steering alignment regardless of left/right orientation.
 
 
 # =============================================================================
