@@ -6,9 +6,11 @@ bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
 """
 
+import json
 import os
 import queue
 import time
+from pathlib import Path
 from threading import Thread
 
 import cv2
@@ -17,6 +19,11 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
+
+try:
+    import spidev
+except ImportError:  # pragma: no cover - hardware dependency
+    spidev = None
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +77,16 @@ motor_pin_right = 31       # physical pin for right turn enable
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
 pwm_channel = "pwm0"
 pwm_frequency_hz = 5000
+
+# Encoder + steering control configuration
+encoder_spi_bus = 0
+encoder_spi_device = 0
+encoder_spi_max_hz = 1000000
+encoder_deadband_px = 6          # stop when within this many screen pixels of target
+motor_speed_pct = 40.0            # fixed run speed percentage for the motor
+motor_accel_pct_per_s = 160.0     # acceleration/deceleration rate (percent per second)
+calibration_file = Path("steering_calibration.json")
+simulated_step_norm = 0.02        # arrow-key increment when in simulated encoder mode
 
 
 # ---------------------------------------------------------------------------
@@ -138,22 +155,18 @@ def initialise_motor_outputs():
     return period_ns
 
 
-def set_motor_state(offset_px, period_ns):
-    if offset_px > 0:
+def _apply_motor_output(direction, duty_pct, period_ns):
+    duty_pct = max(0.0, min(100.0, duty_pct))
+    if direction > 0:
         GPIO.output(motor_pin_right, GPIO.HIGH)
         GPIO.output(motor_pin_left, GPIO.LOW)
-    elif offset_px < 0:
+    elif direction < 0:
         GPIO.output(motor_pin_right, GPIO.LOW)
         GPIO.output(motor_pin_left, GPIO.HIGH)
     else:
         GPIO.output(motor_pin_right, GPIO.LOW)
         GPIO.output(motor_pin_left, GPIO.LOW)
-
-    if pull_influence_radius_px > 0:
-        duty_pct = min(100.0, (abs(offset_px) / pull_influence_radius_px) * 100.0)
-    else:
-        duty_pct = 100.0 if offset_px != 0 else 0.0
-    duty_ns = _pwm_ns_duty(period_ns, duty_pct)
+    duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
     _pwm_wr(f"{pwm_channel_path}/duty_cycle", duty_ns)
 
 
@@ -165,6 +178,217 @@ def shutdown_motor_outputs():
         pass
     finally:
         GPIO.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Encoder helpers and calibration persistence
+# ---------------------------------------------------------------------------
+
+encoder_spi = None
+encoder_available = False
+calibration_data = {"encoder_min_raw": None, "encoder_max_raw": None}
+calibration_loaded = False
+
+
+def initialise_encoder():
+    global encoder_spi, encoder_available
+    if spidev is None:
+        encoder_available = False
+        return
+    encoder_spi = spidev.SpiDev()
+    try:
+        encoder_spi.open(encoder_spi_bus, encoder_spi_device)
+        encoder_spi.max_speed_hz = encoder_spi_max_hz
+        encoder_spi.mode = 0b01
+        encoder_available = True
+    except (FileNotFoundError, OSError):
+        encoder_spi = None
+        encoder_available = False
+
+
+def shutdown_encoder():
+    global encoder_spi
+    if encoder_spi is not None:
+        try:
+            encoder_spi.close()
+        finally:
+            encoder_spi = None
+
+
+def load_calibration():
+    global calibration_data, calibration_loaded
+    if calibration_loaded:
+        return
+    if calibration_file.exists():
+        try:
+            data = json.loads(calibration_file.read_text())
+            if {
+                "encoder_min_raw",
+                "encoder_max_raw",
+            } <= data.keys():
+                calibration_data = {
+                    "encoder_min_raw": int(data["encoder_min_raw"]),
+                    "encoder_max_raw": int(data["encoder_max_raw"]),
+                }
+        except (json.JSONDecodeError, ValueError):
+            pass
+    calibration_loaded = True
+
+
+def save_calibration(min_raw, max_raw):
+    global calibration_data, calibration_loaded
+    calibration_data = {
+        "encoder_min_raw": int(min_raw),
+        "encoder_max_raw": int(max_raw),
+    }
+    calibration_file.write_text(json.dumps(calibration_data, indent=2))
+    calibration_loaded = True
+
+
+def encoder_span():
+    if calibration_data["encoder_min_raw"] is None or calibration_data["encoder_max_raw"] is None:
+        return None
+    span = calibration_data["encoder_max_raw"] - calibration_data["encoder_min_raw"]
+    return span if span > 0 else None
+
+
+def read_encoder_raw():
+    if not encoder_available or encoder_spi is None:
+        return None
+    try:
+        resp = encoder_spi.xfer2([0xFF, 0xFF])
+    except OSError:
+        return None
+    if len(resp) != 2:
+        return None
+    raw = ((resp[0] & 0x3F) << 8) | resp[1]
+    return raw
+
+
+def encoder_raw_to_norm(raw):
+    span = encoder_span()
+    if span is None:
+        return None
+    norm = (raw - calibration_data["encoder_min_raw"]) / span
+    return float(clamp(norm, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Runtime steering state (encoder + simulation + motor ramp)
+# ---------------------------------------------------------------------------
+
+current_motor_direction = 0
+current_motor_duty_pct = 0.0
+
+sim_encoder_enabled = False
+sim_encoder_norm = 0.5
+
+latest_encoder_raw = None
+latest_encoder_norm = None
+
+calibration_active = False
+calibration_stage = None
+calibration_status_text = ""
+calibration_samples = {}
+
+
+def get_encoder_norm():
+    global latest_encoder_raw, latest_encoder_norm
+    if sim_encoder_enabled:
+        latest_encoder_raw = None
+        latest_encoder_norm = sim_encoder_norm
+        return sim_encoder_norm
+    raw = read_encoder_raw()
+    latest_encoder_raw = raw
+    if raw is None:
+        latest_encoder_norm = None
+        return None
+    norm = encoder_raw_to_norm(raw)
+    latest_encoder_norm = norm
+    return norm
+
+
+def update_motor_control(target_px, actual_px, dt, period_ns):
+    global current_motor_direction, current_motor_duty_pct
+
+    if actual_px is None or target_px is None:
+        required_direction = 0
+    else:
+        error_px = target_px - actual_px
+        if abs(error_px) <= encoder_deadband_px:
+            required_direction = 0
+        else:
+            required_direction = 1 if error_px > 0 else -1
+
+    target_speed_pct = 0.0
+    new_direction = current_motor_direction
+
+    if required_direction == 0:
+        target_speed_pct = 0.0
+        if current_motor_duty_pct <= 0.5:
+            new_direction = 0
+    else:
+        if current_motor_direction == 0:
+            new_direction = required_direction
+            target_speed_pct = motor_speed_pct
+        elif current_motor_direction == required_direction:
+            target_speed_pct = motor_speed_pct
+        else:
+            target_speed_pct = 0.0
+            if current_motor_duty_pct <= 0.5:
+                new_direction = required_direction
+
+    max_delta = motor_accel_pct_per_s * dt
+    if target_speed_pct > current_motor_duty_pct:
+        current_motor_duty_pct = min(target_speed_pct, current_motor_duty_pct + max_delta)
+    else:
+        current_motor_duty_pct = max(target_speed_pct, current_motor_duty_pct - max_delta)
+
+    current_motor_direction = new_direction
+    _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
+
+
+def start_calibration():
+    global calibration_active, calibration_stage, calibration_samples, calibration_status_text
+    if not encoder_available or encoder_spi is None:
+        calibration_status_text = "Cannot start calibration: encoder interface unavailable"
+        calibration_active = False
+        calibration_stage = None
+        return
+    calibration_active = True
+    calibration_stage = "min"
+    calibration_samples = {}
+    calibration_status_text = "Calibration: move steering to LEFT limit, press SPACE"
+
+
+def capture_calibration_point():
+    global calibration_active, calibration_stage, calibration_status_text, calibration_samples
+    if not encoder_available or encoder_spi is None:
+        calibration_status_text = "Calibration failed: encoder interface unavailable"
+        calibration_active = False
+        calibration_stage = None
+        return
+    raw = read_encoder_raw()
+    if raw is None:
+        calibration_status_text = "Calibration failed: unable to read encoder"
+        calibration_active = False
+        calibration_stage = None
+        return
+    if calibration_stage == "min":
+        calibration_samples["min"] = raw
+        calibration_stage = "max"
+        calibration_status_text = "Calibration: move steering to RIGHT limit, press SPACE"
+    elif calibration_stage == "max":
+        calibration_samples["max"] = raw
+        min_raw = min(calibration_samples["min"], calibration_samples["max"])
+        max_raw = max(calibration_samples["min"], calibration_samples["max"])
+        if min_raw == max_raw:
+            calibration_status_text = "Calibration failed: encoder range is zero"
+        else:
+            save_calibration(min_raw, max_raw)
+            calibration_status_text = "Calibration saved"
+        calibration_active = False
+        calibration_stage = None
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
@@ -231,6 +455,9 @@ Thread(target=infer, daemon=True).start()
 
 # Initialise motor outputs and PWM once
 motor_period_ns = initialise_motor_outputs()
+load_calibration()
+initialise_encoder()
+last_loop_time = time.perf_counter()
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -240,6 +467,10 @@ while True:
         frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
     except queue.Empty:
         continue
+
+    now = time.perf_counter()
+    dt = max(1e-4, now - last_loop_time)
+    last_loop_time = now
 
     # Build a sparse point cloud by sampling each depth map on a coarse grid
     h0, w0 = depth0.shape
@@ -370,8 +601,21 @@ while True:
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
 
-    # Update motor direction and speed based on steering offset
-    set_motor_state(draw_x - center_x, motor_period_ns)
+    encoder_norm = get_encoder_norm()
+    encoder_px = None
+    if encoder_norm is not None:
+        scale = max(1, w_combined - 1)
+        encoder_px = int(round(encoder_norm * scale))
+        encoder_px = int(clamp(encoder_px, 0, w_combined - 1))
+        cv2.line(
+            combined,
+            (encoder_px, 0),
+            (encoder_px, h_combined),
+            (0, 255, 255),
+            1,
+        )
+
+    update_motor_control(draw_x, encoder_px, dt, motor_period_ns)
 
 
 
@@ -386,6 +630,34 @@ while True:
         combined,
         f"Steer Control: {steer_control_x}",
         hud_text_position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA
+    )
+
+    encoder_text = "Encoder: --"
+    if encoder_px is not None:
+        encoder_text = f"Encoder: {encoder_px} px"
+    elif sim_encoder_enabled:
+        encoder_text = "Encoder: simulated"
+    cv2.putText(
+        combined,
+        encoder_text,
+        (hud_text_position[0], hud_text_position[1] + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA
+    )
+
+    motor_text = f"Motor duty: {current_motor_duty_pct:.1f}%"
+    cv2.putText(
+        combined,
+        motor_text,
+        (hud_text_position[0], hud_text_position[1] + 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         hud_text_scale,
         hud_text_color,
@@ -410,6 +682,45 @@ while True:
     )
     # ────────────────────────────────────────────────────────────────────
 
+    if sim_encoder_enabled:
+        slider_left = 20
+        slider_right = w_combined - 20
+        slider_y = h_combined - 30
+        cv2.line(
+            combined,
+            (slider_left, slider_y),
+            (slider_right, slider_y),
+            (200, 200, 200),
+            2,
+        )
+        slider_x = int(round(slider_left + sim_encoder_norm * (slider_right - slider_left)))
+        cv2.circle(combined, (slider_x, slider_y), 8, (0, 200, 255), -1)
+        cv2.putText(
+            combined,
+            "Sim encoder: arrow keys to jog, 's' to exit",
+            (20, h_combined - 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    message_to_show = calibration_status_text
+    if not message_to_show and encoder_span() is None:
+        message_to_show = "Press 'c' to calibrate steering range"
+    if message_to_show:
+        cv2.putText(
+            combined,
+            message_to_show,
+            (20, h_combined - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
     # Present the final annotated view
     cv2.imshow("Depth: Camera 0 | Camera 1", combined)
     key = cv2.waitKey(1) & 0xFF
@@ -418,9 +729,56 @@ while True:
     if key == 27:
         break
 
+    if key == ord('s'):
+        sim_encoder_enabled = not sim_encoder_enabled
+        if sim_encoder_enabled:
+            if latest_encoder_norm is not None:
+                sim_encoder_norm = latest_encoder_norm
+            else:
+                sim_encoder_norm = 0.5
+            calibration_status_text = "Simulated encoder enabled"
+        else:
+            calibration_status_text = "Simulated encoder disabled"
+
+    if sim_encoder_enabled and key in (81, 83):
+        delta = -simulated_step_norm if key == 81 else simulated_step_norm
+        sim_encoder_norm = clamp(sim_encoder_norm + delta, 0.0, 1.0)
+
+    if key == ord('c'):
+        start_calibration()
+
+    if calibration_active and key == 32:  # space bar
+        capture_calibration_point()
+
 # === Cleanup ===
 running = False
 cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
 shutdown_motor_outputs()
+shutdown_encoder()
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# AS5048A → Jetson Nano wiring quick reference
+# ---------------------------------------------------------------------------
+# 1. Power: connect AS5048A VDD to the Jetson Nano's 3.3 V pin (pin 1 or 17).
+#    Tie the AS5048A GND to any ground pin on the Nano (for example pin 6).
+# 2. SPI signals (assuming SPI0):
+#      • AS5048A CLK  → Jetson Nano SPI0_SCK  (physical pin 23).
+#      • AS5048A DO   → Jetson Nano SPI0_MISO (physical pin 21).
+#      • AS5048A DI   → Jetson Nano SPI0_MOSI (physical pin 19).
+#      • AS5048A CSn  → Jetson Nano SPI0_CS0 (physical pin 24).
+#    If you use a different chip-select pin, update encoder_spi_bus/device
+#    or handle chip-select manually in software.
+# 3. Keep wiring runs short, twist signal with ground where possible, and add a
+#    0.1 µF decoupling capacitor close to the sensor's supply pins for best
+#    noise performance.
+# 4. Enable the SPI interface on the Jetson Nano via `sudo /opt/nvidia/jetson-io/jetson-io.py`
+#    (interface configuration) and reboot afterwards. Once enabled, `/dev/spidev0.0`
+#    should exist and the script will be able to talk to the encoder.
+# 5. Mount the AS5048A so the magnet sits centred above the die at the specified
+#    air gap (≈1–2 mm). Ensure the magnet rotates with the steering shaft.
