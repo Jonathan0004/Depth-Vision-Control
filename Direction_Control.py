@@ -13,6 +13,10 @@ Notes:
 - When direction changes, we drop duty to 0 first, then flip IN1/IN2.
 """
 
+###############################################################################
+# Imports
+###############################################################################
+
 import os
 import time
 import queue
@@ -28,35 +32,74 @@ import Jetson.GPIO as GPIO  # <-- for AIN1/AIN2/STBY control
 
 
 # ---------------------------------------------------------------------------
-# Configuration — visual processing (unchanged)
+# User configuration
 # ---------------------------------------------------------------------------
 
-rows, cols = 25, 50
-depth_diff_threshold = 8
-std_multiplier = 0.3
+# === Master feature toggles ===
+# When False, skips rendering/visual overlays to save GPU cycles while keeping
+# all perception and control logic active.
+VISUALS_ENABLED = True
 
-top_cutoff_pixels = 10
-bottom_cutoff_pixels = 54
-cutoff_line_color = (0, 255, 0)
-cutoff_line_thickness = 1
+# === Depth sampling & detection ===
+# Number of vertical samples per camera used when constructing the sparse depth
+# cloud.
+GRID_ROWS = 25
 
-obstacle_dot_radius_px = 5
-obstacle_dot_color = (0, 0, 255)
+# Number of horizontal samples per camera used when constructing the sparse
+# depth cloud.
+GRID_COLS = 50
 
-blue_circle_radius_px = 12
-blue_circle_color = (255, 0, 0)
-blue_circle_thickness = 3
+# Minimum disparity (in model depth units) for a pixel to be treated as an
+# obstacle relative to the scene mean.
+DEPTH_DIFF_THRESHOLD = 8
 
-pull_zone_line_color = (255, 0, 0)
-pull_zone_line_thickness = 1
-pull_influence_radius_px = 120
-pull_zone_center_offset_px = 0
+# Scales the standard deviation of the depth distribution to form an adaptive
+# obstacle threshold (max of this value and DEPTH_DIFF_THRESHOLD).
+STD_MULTIPLIER = 0.3
 
-blue_x_smoothness = 0.7
-hud_text_position = (10, 30)
-hud_text_color = (255, 255, 255)
-hud_text_scale = 0.54
-hud_text_thickness = 1
+# === Region of interest for obstacle consideration ===
+# Ignore everything this many pixels down from the top (sky/ceiling removal).
+TOP_CUTOFF_PIXELS = 10
+
+# Ignore everything this many pixels up from the bottom (hood/ground removal).
+BOTTOM_CUTOFF_PIXELS = 54
+
+# === Visual styling (only used when VISUALS_ENABLED is True) ===
+# Colour and thickness for the ROI guide lines drawn across each camera feed.
+CUTOFF_LINE_COLOR = (0, 255, 0)
+CUTOFF_LINE_THICKNESS = 1
+
+# Appearance of per-point obstacle markers (useful for debugging the mask).
+OBSTACLE_DOT_RADIUS_PX = 5
+OBSTACLE_DOT_COLOR = (0, 0, 255)
+
+# Appearance of the smoothed steering target cue.
+BLUE_CIRCLE_RADIUS_PX = 12
+BLUE_CIRCLE_COLOR = (255, 0, 0)
+BLUE_CIRCLE_THICKNESS = 3
+
+# Appearance of the pull-zone vertical boundaries.
+PULL_ZONE_LINE_COLOR = (255, 0, 0)
+PULL_ZONE_LINE_THICKNESS = 1
+
+# HUD text placement and styling for telemetry overlay.
+HUD_TEXT_POSITION = (10, 30)
+HUD_TEXT_COLOR = (255, 255, 255)
+HUD_TEXT_SCALE = 0.54
+HUD_TEXT_THICKNESS = 1
+
+# === Route-planning heuristics ===
+# Half-width (in pixels) of the preferred corridor used to bias the widest gap
+# search around the image center.
+PULL_INFLUENCE_RADIUS_PX = 120
+
+# Horizontal offset (pixels) applied to the pull zone centre if the rig is not
+# perfectly centred.
+PULL_ZONE_CENTER_OFFSET_PX = 0
+
+# Exponential smoothing factor applied to the steering target to reduce jitter.
+# Lower values respond faster, higher values are steadier.
+BLUE_X_SMOOTHNESS = 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +137,7 @@ RIGHT_IS_FORWARD = True
 CENTER_DEADBAND_PX = 5
 
 # Pixel distance from center that maps to 100% duty (tune as you like)
-SPAN_PX = pull_influence_radius_px  # use your pull zone half-width
+SPAN_PX = PULL_INFLUENCE_RADIUS_PX  # use your pull zone half-width
 
 
 # ---------------------------------------------------------------------------
@@ -284,55 +327,33 @@ try:
         except queue.Empty:
             continue
 
-        # Build sparse point cloud
+        # --- Build sparse point cloud -------------------------------------------------
         h0, w0 = depth0.shape
         h1, w1 = depth1.shape
         points = []
         for cam_idx, (depth, x_offset, w, h) in enumerate([
             (depth0, 0, w0, h0), (depth1, w0, w1, h1)
         ]):
-            for c in range(cols):
-                for r in range(rows):
-                    px = int((c + 0.5) * w / cols) + x_offset
-                    py = int((r + 0.5) * h / rows)
+            for c in range(GRID_COLS):
+                for r in range(GRID_ROWS):
+                    px = int((c + 0.5) * w / GRID_COLS) + x_offset
+                    py = int((r + 0.5) * h / GRID_ROWS)
                     z  = float(depth[int(py), int(px - x_offset)])
                     points.append((px, py, z, cam_idx))
-        cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
+        cloud = np.array(points, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('cam', 'i4')])
 
-        # Obstacle candidates
+        # --- Identify obstacle candidates -------------------------------------------
         zs = cloud['z']
         mean_z, std_z = zs.mean(), zs.std()
-        thresh = max(depth_diff_threshold, std_multiplier * std_z)
+        thresh = max(DEPTH_DIFF_THRESHOLD, STD_MULTIPLIER * std_z)
         mask = (mean_z - zs) > thresh
 
-        # Visualisation
-        norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
-        norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
-
-        for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
-            top_y = top_cutoff_pixels
-            bottom_y = h - bottom_cutoff_pixels
-            cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
-            cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
-
-        for is_obst, pt in zip(mask, cloud):
-            if not is_obst:
-                continue
-            px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
-            if py < top_cutoff_pixels or py > ((frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels):
-                continue
-            # optional obstacle dots omitted for clarity
-
-        combined = np.hstack((cmap0, cmap1))
-
-        # Route planner
+        # --- Navigation corridor geometry -------------------------------------------
         h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
-        line_y = (top_cutoff_pixels + (h_combined - bottom_cutoff_pixels)) // 2
-        center_x = (w_combined // 2) + pull_zone_center_offset_px
-        zone_left = clamp(center_x - pull_influence_radius_px, 0, w_combined)
-        zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
+        line_y = (TOP_CUTOFF_PIXELS + (h_combined - BOTTOM_CUTOFF_PIXELS)) // 2
+        center_x = (w_combined // 2) + PULL_ZONE_CENTER_OFFSET_PX
+        zone_left = clamp(center_x - PULL_INFLUENCE_RADIUS_PX, 0, w_combined)
+        zone_right = clamp(center_x + PULL_INFLUENCE_RADIUS_PX, 0, w_combined)
 
         red_xs_all, red_xs_in_zone = [], []
         for is_obst, pt in zip(mask, cloud):
@@ -340,7 +361,7 @@ try:
                 continue
             px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
             frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
-            if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels):
+            if py < TOP_CUTOFF_PIXELS or py > (frame_h - BOTTOM_CUTOFF_PIXELS):
                 continue
             red_xs_all.append(px)
             if zone_left <= px <= zone_right:
@@ -368,11 +389,11 @@ try:
 
         gap_cx = center_x if len(red_xs_in_zone) == 0 else widest_gap_center(blockers_all, preferred_x=center_x)
 
-        # Smooth & draw
+        # --- Smooth steering target --------------------------------------------------
         if blue_x is None:
             blue_x = float(gap_cx)
         else:
-            blue_x = blue_x * blue_x_smoothness + gap_cx * (1 - blue_x_smoothness)
+            blue_x = blue_x * BLUE_X_SMOOTHNESS + gap_cx * (1 - BLUE_X_SMOOTHNESS)
         draw_x = int(round(blue_x))
         steer_control_x = draw_x
 
@@ -442,26 +463,70 @@ try:
 
         duty_pct = (last_duty_ns / float(PWM_PERIOD_NS)) * 100 if PWM_PERIOD_NS else 0.0
 
-        # Draw blue cue & HUD
-        blue_pos = (draw_x, line_y)
-        cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
-        cv2.putText(
-            combined,
-            f"Steer Control X: {steer_control_x}  | Duty: {duty_pct:5.1f}%  | Dir: {direction_label}",
-            hud_text_position,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            cv2.LINE_AA
-        )
-        cv2.line(combined, (int(zone_left), 0), (int(zone_left), frame0.shape[0]), pull_zone_line_color, pull_zone_line_thickness)
-        cv2.line(combined, (int(zone_right), 0), (int(zone_right), frame0.shape[0]), pull_zone_line_color, pull_zone_line_thickness)
+        # --- Visualization & HUD (optional) ---------------------------------------
+        if VISUALS_ENABLED:
+            norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
+            cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
 
-        cv2.imshow("Depth: Camera 0 | Camera 1", combined)
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27:
-            break
+            for cmap, h, w in [
+                (cmap0, frame0.shape[0], frame0.shape[1]),
+                (cmap1, frame1.shape[0], frame1.shape[1]),
+            ]:
+                top_y = TOP_CUTOFF_PIXELS
+                bottom_y = h - BOTTOM_CUTOFF_PIXELS
+                cv2.line(cmap, (0, top_y), (w, top_y), CUTOFF_LINE_COLOR, CUTOFF_LINE_THICKNESS)
+                cv2.line(cmap, (0, bottom_y), (w, bottom_y), CUTOFF_LINE_COLOR, CUTOFF_LINE_THICKNESS)
+
+            combined = np.hstack((cmap0, cmap1))
+
+            for is_obst, pt in zip(mask, cloud):
+                if not is_obst:
+                    continue
+                px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
+                frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
+                if py < TOP_CUTOFF_PIXELS or py > (frame_h - BOTTOM_CUTOFF_PIXELS):
+                    continue
+                cv2.circle(
+                    combined,
+                    (px, py),
+                    OBSTACLE_DOT_RADIUS_PX,
+                    OBSTACLE_DOT_COLOR,
+                    -1,
+                )
+
+            blue_pos = (draw_x, line_y)
+            cv2.circle(combined, blue_pos, BLUE_CIRCLE_RADIUS_PX, BLUE_CIRCLE_COLOR, BLUE_CIRCLE_THICKNESS)
+            cv2.putText(
+                combined,
+                f"Steer Control X: {steer_control_x}  | Duty: {duty_pct:5.1f}%  | Dir: {direction_label}",
+                HUD_TEXT_POSITION,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                HUD_TEXT_SCALE,
+                HUD_TEXT_COLOR,
+                HUD_TEXT_THICKNESS,
+                cv2.LINE_AA,
+            )
+            cv2.line(
+                combined,
+                (int(zone_left), 0),
+                (int(zone_left), frame0.shape[0]),
+                PULL_ZONE_LINE_COLOR,
+                PULL_ZONE_LINE_THICKNESS,
+            )
+            cv2.line(
+                combined,
+                (int(zone_right), 0),
+                (int(zone_right), frame0.shape[0]),
+                PULL_ZONE_LINE_COLOR,
+                PULL_ZONE_LINE_THICKNESS,
+            )
+
+            cv2.imshow("Depth: Camera 0 | Camera 1", combined)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                break
 
 finally:
     running = False
