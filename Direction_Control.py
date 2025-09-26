@@ -165,6 +165,10 @@ class PWMDriver:
             raise RuntimeError("PWM not initialised. Call init() first.")
         duty_ns = max(0, min(int(duty_ns), int(PWM_PERIOD_NS)))
         self._duty_file.seek(0)
+        # Truncate so shorter writes don't leave trailing characters that
+        # confuse the sysfs driver (e.g. writing "50000" after "150000"
+        # would otherwise leave "500000").
+        self._duty_file.truncate()
         self._duty_file.write(str(duty_ns))
         self._duty_file.flush()
 
