@@ -129,6 +129,7 @@ steer_control_x = None
 pwm_initialized = False
 pwm_error_reported = False
 last_duty_ns = None
+last_duty_percent = 0.0
 pwm_driver = None
 current_dir = 0  # +1 forward, -1 reverse, 0 unknown
 gpio_stby = gpio_ain1 = gpio_ain2 = None
@@ -145,6 +146,9 @@ class PWMDriver:
         self.channel_index = int(channel_index)
         self.pwm_path = os.path.join(self.chip_path, f"pwm{self.channel_index}")
         self._duty_file = None
+        self._duty_path = os.path.join(self.pwm_path, "duty_cycle")
+        self._enable_path = os.path.join(self.pwm_path, "enable")
+        self._period_path = os.path.join(self.pwm_path, "period")
 
     @staticmethod
     def _wr(path, value):
@@ -164,27 +168,24 @@ class PWMDriver:
 
         # Disable; set duty=0 BEFORE period to avoid EINVAL, then enable
         try:
-            PWMDriver._wr(os.path.join(self.pwm_path, "enable"), "0")
+            PWMDriver._wr(self._enable_path, "0")
         except OSError:
             pass
         # Defensive: duty=0 first, then period, then duty to requested value
         try:
-            PWMDriver._wr(os.path.join(self.pwm_path, "duty_cycle"), 0)
+            PWMDriver._wr(self._duty_path, 0)
         except OSError:
             pass
-        PWMDriver._wr(os.path.join(self.pwm_path, "period"), period_ns)
-        PWMDriver._wr(os.path.join(self.pwm_path, "duty_cycle"), duty_ns)
-        PWMDriver._wr(os.path.join(self.pwm_path, "enable"), "1")
-        self._duty_file = open(os.path.join(self.pwm_path, "duty_cycle"), "w")
+        PWMDriver._wr(self._period_path, period_ns)
+        PWMDriver._wr(self._duty_path, duty_ns)
+        PWMDriver._wr(self._enable_path, "1")
 
     def set_duty(self, duty_ns: int):
-        if self._duty_file is None:
+        if not os.path.isdir(self.pwm_path):
             raise RuntimeError("PWM not initialised.")
         if duty_ns < 0: duty_ns = 0
         if duty_ns > PWM_PERIOD_NS: duty_ns = PWM_PERIOD_NS
-        self._duty_file.seek(0)
-        self._duty_file.write(str(int(duty_ns)))
-        self._duty_file.flush()
+        PWMDriver._wr(self._duty_path, int(duty_ns))
 
     def close(self):
         try:
@@ -192,7 +193,7 @@ class PWMDriver:
                 self._duty_file.close()
         finally:
             try:
-                PWMDriver._wr(os.path.join(self.pwm_path, "enable"), "0")
+                PWMDriver._wr(self._enable_path, "0")
             except Exception:
                 pass
 
@@ -412,11 +413,16 @@ try:
             if (last_duty_ns is None) or (duty_ns != last_duty_ns):
                 pwm_driver.set_duty(duty_ns)
                 last_duty_ns = duty_ns
+            last_duty_percent = 0.0 if last_duty_ns is None else (last_duty_ns / PWM_PERIOD_NS) * 100.0
+        else:
+            last_duty_percent = 0.0
         # ---------------------------------------------------------------------
 
         # Draw UI
         cv2.circle(combined, (draw_x, line_y), blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
         cv2.putText(combined, f"Steer Control: {steer_control_x}", hud_text_position,
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_text_scale, hud_text_color, hud_text_thickness, cv2.LINE_AA)
+        cv2.putText(combined, f"PWM Duty: {last_duty_percent:5.1f}%", (hud_text_position[0], hud_text_position[1] + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_text_scale, hud_text_color, hud_text_thickness, cv2.LINE_AA)
         cv2.line(combined, (int(zone_left), 0), (int(zone_left), h_combined), pull_zone_line_color, pull_zone_line_thickness)
         cv2.line(combined, (int(zone_right), 0), (int(zone_right), h_combined), pull_zone_line_color, pull_zone_line_thickness)
