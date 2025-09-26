@@ -151,7 +151,7 @@ pwm_error_reported = False
 last_duty_ns = 0
 pwm_driver = None
 
-current_dir = None  # "FORWARD" / "REVERSE" / None
+current_dir = None  # "FORWARD" / "REVERSE" / "STOP" / None
 last_sign = 0       # -1, 0, +1
 
 
@@ -231,11 +231,12 @@ def set_direction(new_dir: str):
     Set AIN1/AIN2 for desired direction.
     FORWARD  -> STBY=HIGH, AIN1=HIGH, AIN2=LOW
     REVERSE  -> STBY=HIGH, AIN1=LOW,  AIN2=HIGH
+    STOP     -> STBY=HIGH, AIN1=LOW,  AIN2=LOW (coast)
     """
     global current_dir
     if new_dir == current_dir:
         return
-    if new_dir not in ("FORWARD", "REVERSE"):
+    if new_dir not in ("FORWARD", "REVERSE", "STOP"):
         return
 
     # STBY must be HIGH to operate
@@ -245,10 +246,14 @@ def set_direction(new_dir: str):
         GPIO.output(AIN1_PIN, GPIO.HIGH)
         GPIO.output(AIN2_PIN, GPIO.LOW)
         print("[DIR] FORWARD  — STBY=HIGH, AIN1=HIGH, AIN2=LOW")
-    else:
+    elif new_dir == "REVERSE":
         GPIO.output(AIN1_PIN, GPIO.LOW)
         GPIO.output(AIN2_PIN, GPIO.HIGH)
         print("[DIR] REVERSE  — STBY=HIGH, AIN1=LOW,  AIN2=HIGH")
+    else:  # STOP / coast
+        GPIO.output(AIN1_PIN, GPIO.LOW)
+        GPIO.output(AIN2_PIN, GPIO.LOW)
+        print("[DIR] STOP     — STBY=HIGH, AIN1=LOW,  AIN2=LOW")
 
     current_dir = new_dir
 
@@ -431,40 +436,40 @@ try:
             mag = min(abs(delta_px) / float(max(1, SPAN_PX)), 1.0)
             duty_ns = int(mag * PWM_PERIOD_NS) if sign != 0 else 0
 
-            # Pick direction based on side (RIGHT_IS_FORWARD controls mapping)
+            # Pick direction based on steer side (RIGHT_IS_FORWARD controls mapping)
             if sign == 0:
-                # Stop: duty = 0, keep current IN pins as-is
-                if last_duty_ns != 0:
-                    pwm_driver.set_duty(0)
-                    last_duty_ns = 0
+                desired_dir = "STOP"
+            elif (sign > 0 and RIGHT_IS_FORWARD) or (sign < 0 and not RIGHT_IS_FORWARD):
+                desired_dir = "FORWARD"
             else:
-                desired_dir = None
-                if (sign > 0 and RIGHT_IS_FORWARD) or (sign < 0 and not RIGHT_IS_FORWARD):
-                    desired_dir = "FORWARD"
-                else:
-                    desired_dir = "REVERSE"
+                desired_dir = "REVERSE"
 
-                # Update the label to reflect the steering indication after
-                # accounting for the wiring orientation set by RIGHT_IS_FORWARD.
+            # Update the label to reflect the steering indication after wiring
+            # orientation is applied. When stopped we keep "CENTER".
+            if desired_dir != "STOP":
                 if RIGHT_IS_FORWARD:
                     direction_label = "RIGHT" if desired_dir == "FORWARD" else "LEFT"
                 else:
                     direction_label = "LEFT" if desired_dir == "FORWARD" else "RIGHT"
 
+            if desired_dir == "STOP":
+                if last_duty_ns != 0:
+                    pwm_driver.set_duty(0)
+                    last_duty_ns = 0
+                set_direction("STOP")
+            else:
                 # If direction changed, first drop duty to 0, then flip pins
                 if current_dir != desired_dir:
                     if last_duty_ns != 0:
                         pwm_driver.set_duty(0)
                         last_duty_ns = 0
-                        # next loop we'll actually switch pins
                     else:
                         set_direction(desired_dir)
 
                 # After pins are correct, apply duty
-                if current_dir == desired_dir:
-                    if duty_ns != last_duty_ns:
-                        pwm_driver.set_duty(duty_ns)
-                        last_duty_ns = duty_ns
+                if current_dir == desired_dir and duty_ns != last_duty_ns:
+                    pwm_driver.set_duty(duty_ns)
+                    last_duty_ns = duty_ns
         # ==========================================================================
 
         duty_pct = (last_duty_ns / float(PWM_PERIOD_NS)) * 100 if PWM_PERIOD_NS else 0.0
