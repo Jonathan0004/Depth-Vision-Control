@@ -76,16 +76,16 @@ motor_pin_right = 31       # physical pin for right turn enable
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
 pwm_channel = "pwm0"
-pwm_frequency_hz = 5000
+pwm_frequency_hz = 8000
 
 # Encoder + steering control configuration
 encoder_spi_bus = 0
 encoder_spi_device = 0
 encoder_spi_max_hz = 1000000
-encoder_deadband_px = 0          # stop when within this many screen pixels of target
+encoder_deadband_px = 5          # stop when within this many screen pixels of target
 motor_speed_pct = 40.0            # fixed run speed percentage for the motor
-motor_accel_pct_per_s = 70.0     # acceleration/deceleration rate (percent per second)
-reverse_switch_threshold_pct = 6.0  # switch direction min duty
+motor_accel_pct_per_s = 60.0     # acceleration/deceleration rate (percent per second)
+reverse_switch_threshold_pct = 20.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
 
