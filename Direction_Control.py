@@ -49,7 +49,7 @@ PWM_ACTUAL_FREQUENCY_HZ = int(round(1_000_000_000 / PWM_PERIOD_NS))
 # Number of pixels away from the center that map to 100% duty cycle. Lowering
 # this value makes the vehicle respond more aggressively to small offsets;
 # increasing it makes the steering more relaxed.
-SPAN_PX = 300
+SPAN_PX = 200
 
 # Deadband around the image center (in pixels). Within this window the motor is
 # held stopped to prevent oscillations when the target is nearly centered.
