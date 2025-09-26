@@ -409,25 +409,24 @@ try:
                 pwm_error_reported = True
                 print(f"[PWM] Initialization error: {e}")
 
-        direction_label = "CENTER"
+        # Steering offset from center
+        delta_px = steer_control_x - center_x
+
+        # Decide sign: -1 left, +1 right, 0 near center
+        if abs(delta_px) <= CENTER_DEADBAND_PX:
+            sign = 0
+        else:
+            sign = 1 if delta_px > 0 else -1
+
+        # Default label reflects the steer side regardless of PWM availability
+        if sign == 0:
+            direction_label = "CENTER"
+        elif sign > 0:
+            direction_label = "RIGHT"
+        else:
+            direction_label = "LEFT"
 
         if pwm_initialized:
-            # Steering offset from center
-            delta_px = steer_control_x - center_x
-
-            # Decide sign: -1 left, +1 right, 0 near center
-            if abs(delta_px) <= CENTER_DEADBAND_PX:
-                sign = 0
-            else:
-                sign = 1 if delta_px > 0 else -1
-
-            if sign == 0:
-                direction_label = "CENTER"
-            elif sign > 0:
-                direction_label = "RIGHT"
-            else:
-                direction_label = "LEFT"
-
             # Map distance to duty fraction [0,1]
             mag = min(abs(delta_px) / float(max(1, SPAN_PX)), 1.0)
             duty_ns = int(mag * PWM_PERIOD_NS) if sign != 0 else 0
@@ -444,6 +443,13 @@ try:
                     desired_dir = "FORWARD"
                 else:
                     desired_dir = "REVERSE"
+
+                # Update the label to reflect the steering indication after
+                # accounting for the wiring orientation set by RIGHT_IS_FORWARD.
+                if RIGHT_IS_FORWARD:
+                    direction_label = "RIGHT" if desired_dir == "FORWARD" else "LEFT"
+                else:
+                    direction_label = "LEFT" if desired_dir == "FORWARD" else "RIGHT"
 
                 # If direction changed, first drop duty to 0, then flip pins
                 if current_dir != desired_dir:
