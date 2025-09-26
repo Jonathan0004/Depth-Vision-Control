@@ -72,6 +72,12 @@ pwm_initialized = False
 pwm_driver = None
 current_dir = 0
 encoder = None
+hardware_encoder = None
+simulated_encoder = None
+manual_encoder_mode = False
+
+SIM_ENCODER_FINE_STEP_PX = 4
+SIM_ENCODER_COARSE_STEP_PX = 12
 
 
 # =============================================================================
@@ -183,6 +189,74 @@ def tb6612_set_direction(direction: int):
 
 class EncoderNotReady(RuntimeError):
     """Raised when encoder data is requested before calibration."""
+
+
+class SimulatedEncoder:
+    """In-process encoder stand-in controlled via keyboard input."""
+
+    def __init__(self, usage_fraction: float = 1.0):
+        self.usage_fraction = clamp(float(usage_fraction), 0.1, 1.0)
+        self.deadband_fraction = 0.02
+        self.pwm_gain = 0.85
+        self.calibrated = True
+        self.min_raw = -8192
+        self.max_raw = 8192
+        self.center_raw = 0
+        self.raw_half_span = 8192.0
+        self._pixel_half_span = 320.0
+        self._position_fraction = 0.0
+        self.is_simulated = True
+
+    @property
+    def is_connected(self) -> bool:
+        return True
+
+    def connect(self, *_, **__):
+        return
+
+    def close(self):
+        return
+
+    def update_pixel_half_span(self, half_span_pixels: float) -> None:
+        self._pixel_half_span = max(1.0, float(half_span_pixels))
+
+    def set_usage_fraction(self, fraction: float) -> None:
+        self.usage_fraction = clamp(float(fraction), 0.1, 1.0)
+
+    def get_position_fraction(self) -> float:
+        return clamp(self._position_fraction, -1.0, 1.0)
+
+    def adjust_by_pixels(self, pixel_delta: float) -> None:
+        delta_fraction = self.pixel_to_fraction(pixel_delta)
+        self.adjust_fraction(delta_fraction)
+
+    def adjust_fraction(self, fraction_delta: float) -> None:
+        self._position_fraction = clamp(
+            self._position_fraction + float(fraction_delta), -1.0, 1.0
+        )
+
+    def set_position_fraction(self, fraction: float) -> None:
+        self._position_fraction = clamp(float(fraction), -1.0, 1.0)
+
+    def recenter(self) -> None:
+        self._position_fraction = 0.0
+
+    def pixel_to_fraction(self, pixel_delta: float) -> float:
+        scale = self._pixel_half_span * self.usage_fraction
+        return clamp(pixel_delta / scale, -1.0, 1.0)
+
+    def compute_drive(self, pixel_delta: float) -> Tuple[int, float]:
+        target_fraction = self.pixel_to_fraction(pixel_delta)
+        current_fraction = self.get_position_fraction()
+        error = clamp(target_fraction - current_fraction, -1.0, 1.0)
+        if abs(error) <= self.deadband_fraction:
+            return 0, 0.0
+        direction = 1 if error > 0 else -1
+        duty_fraction = clamp(abs(error) * self.pwm_gain, 0.0, 1.0)
+        return direction, duty_fraction
+
+    def interactive_calibration(self) -> None:
+        print("[Encoder] Simulation active: calibration not required.")
 
 
 class AS5048AEncoder:
@@ -558,7 +632,12 @@ def apply_motor_control(center_x: int, steer_x: int, encoder_obj: Optional[AS504
     pwm_driver.set_duty(PWM_PERIOD_NS // 2)
 
 
-def overlay_visuals(analysis: SceneAnalysis, draw_x: int) -> Optional[np.ndarray]:
+def overlay_visuals(
+    analysis: SceneAnalysis,
+    draw_x: int,
+    encoder_obj=None,
+    manual_mode: bool = False,
+) -> Optional[np.ndarray]:
     if not ENABLE_VISUAL_OUTPUT or analysis.combined is None:
         return None
 
@@ -594,6 +673,47 @@ def overlay_visuals(analysis: SceneAnalysis, draw_x: int) -> Optional[np.ndarray
         PULL_LINE_COLOR,
         1,
     )
+
+    if manual_mode and isinstance(encoder_obj, SimulatedEncoder):
+        fraction = encoder_obj.get_position_fraction()
+        bar_w, bar_h = 240, 18
+        pad = 12
+        x0 = pad
+        y0 = combined.shape[0] - (bar_h + pad + 30)
+        x1 = x0 + bar_w
+        y1 = y0 + bar_h
+        cv2.rectangle(combined, (x0, y0), (x1, y1), HUD_TEXT_COLOR, 1)
+        center_x = x0 + bar_w // 2
+        cv2.line(combined, (center_x, y0), (center_x, y1), HUD_TEXT_COLOR, 1)
+        fill_width = int(round((fraction + 1.0) / 2.0 * bar_w))
+        fill_x1 = x0 + clamp(fill_width, 0, bar_w)
+        cv2.rectangle(
+            combined,
+            (x0, y0),
+            (fill_x1, y1),
+            (0, 200, 255),
+            -1,
+        )
+        cv2.putText(
+            combined,
+            f"Sim encoder: {fraction:+.2f}",
+            (x0, y1 + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            HUD_TEXT_COLOR,
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            combined,
+            "Use ←/→ for fine, ↑/↓ for coarse, SPACE to center",
+            (x0, y1 + 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            HUD_TEXT_COLOR,
+            1,
+            cv2.LINE_AA,
+        )
     return combined
 
 
@@ -663,6 +783,7 @@ Thread(target=infer, daemon=True).start()
 
 def main():
     global pwm_driver, pwm_initialized, running, encoder
+    global hardware_encoder, simulated_encoder, manual_encoder_mode
     try:
         # Init TB6612 pins + PWM (start stopped)
         tb6612_pins_init()
@@ -675,19 +796,33 @@ def main():
         )
         print("Direction mapping: Forward=AIN1 HIGH, AIN2 LOW; Reverse=AIN1 LOW, AIN2 HIGH.")
 
+        simulated_encoder = SimulatedEncoder(usage_fraction=STEERING_USAGE_FRACTION)
+        hardware_encoder = None
+        manual_encoder_mode = False
+
         if spidev is None:
-            print("[Encoder] spidev not installed. Encoder feedback disabled.")
+            encoder = simulated_encoder
+            manual_encoder_mode = True
+            print("[Encoder] spidev not installed. Using simulated encoder mode.")
+            print("[Encoder] Use arrow keys in the HUD window to adjust the simulated position.")
         else:
             try:
-                encoder = AS5048AEncoder(usage_fraction=STEERING_USAGE_FRACTION)
-                encoder.connect()
+                hardware_encoder = AS5048AEncoder(usage_fraction=STEERING_USAGE_FRACTION)
+                hardware_encoder.connect()
+                encoder = hardware_encoder
                 print(
                     "[Encoder] AS5048A detected on SPI bus. Press 'c' in the HUD window to "
                     "calibrate left/right limits."
                 )
+                print(
+                    "[Encoder] Press 'm' to toggle into simulated encoder mode for manual testing."
+                )
             except Exception as exc:
-                encoder = None
+                encoder = simulated_encoder
+                manual_encoder_mode = True
+                hardware_encoder = None
                 print(f"[Encoder] Disabled: {exc}")
+                print("[Encoder] Falling back to simulated encoder mode. Use arrow keys to adjust.")
 
         while True:
             try:
@@ -696,16 +831,56 @@ def main():
                 continue
 
             analysis = analyze_scene(frame0, depth0, frame1, depth1)
+            half_span = analysis.center_x
+            if simulated_encoder is not None:
+                simulated_encoder.update_pixel_half_span(half_span)
+            if hardware_encoder is not None:
+                try:
+                    hardware_encoder.update_pixel_half_span(half_span)
+                except Exception:
+                    pass
             steer_x = update_guidance(analysis.gap_center_x)
             apply_motor_control(analysis.center_x, steer_x, encoder)
 
             if ENABLE_VISUAL_OUTPUT:
-                display_img = overlay_visuals(analysis, steer_x)
+                display_img = overlay_visuals(
+                    analysis, steer_x, encoder, manual_encoder_mode
+                )
                 if display_img is not None:
                     cv2.imshow("Depth: Camera 0 | Camera 1", display_img)
                     key = cv2.waitKey(1) & 0xFF
                     if key == 27:
                         break
+                    elif key in (ord('m'), ord('M')):
+                        if hardware_encoder is None:
+                            print("[Encoder] No hardware encoder detected; simulation only.")
+                        else:
+                            manual_encoder_mode = not manual_encoder_mode
+                            if manual_encoder_mode:
+                                try:
+                                    simulated_encoder.set_usage_fraction(
+                                        hardware_encoder.usage_fraction
+                                    )
+                                    simulated_encoder.set_position_fraction(
+                                        hardware_encoder.get_position_fraction()
+                                    )
+                                except Exception:
+                                    pass
+                                encoder = simulated_encoder
+                                print(
+                                    "[Encoder] Manual simulation active. Use arrow keys to "
+                                    "adjust encoder alignment."
+                                )
+                            else:
+                                try:
+                                    hardware_encoder.set_usage_fraction(
+                                        simulated_encoder.usage_fraction
+                                    )
+                                except Exception:
+                                    pass
+                                encoder = hardware_encoder
+                                print("[Encoder] Hardware encoder control restored.")
+                        continue
                     if key == ord('c') and encoder is not None:
                         try:
                             encoder.interactive_calibration()
@@ -713,14 +888,46 @@ def main():
                             print(f"[Encoder] Calibration aborted: {exc}")
                     if key == ord('[') and encoder is not None:
                         encoder.set_usage_fraction(encoder.usage_fraction - 0.05)
+                        if manual_encoder_mode and hardware_encoder is not None:
+                            try:
+                                hardware_encoder.set_usage_fraction(
+                                    encoder.usage_fraction
+                                )
+                            except Exception:
+                                pass
+                        elif not manual_encoder_mode and simulated_encoder is not None:
+                            simulated_encoder.set_usage_fraction(encoder.usage_fraction)
                         print(
                             f"[Encoder] Tightened steering usage to {encoder.usage_fraction:.2f}"
                         )
                     if key == ord(']') and encoder is not None:
                         encoder.set_usage_fraction(encoder.usage_fraction + 0.05)
+                        if manual_encoder_mode and hardware_encoder is not None:
+                            try:
+                                hardware_encoder.set_usage_fraction(
+                                    encoder.usage_fraction
+                                )
+                            except Exception:
+                                pass
+                        elif not manual_encoder_mode and simulated_encoder is not None:
+                            simulated_encoder.set_usage_fraction(encoder.usage_fraction)
                         print(
                             f"[Encoder] Loosened steering usage to {encoder.usage_fraction:.2f}"
                         )
+                    if (
+                        manual_encoder_mode
+                        and isinstance(encoder, SimulatedEncoder)
+                    ):
+                        if key == 81:  # Left arrow
+                            encoder.adjust_by_pixels(-SIM_ENCODER_FINE_STEP_PX)
+                        elif key == 83:  # Right arrow
+                            encoder.adjust_by_pixels(SIM_ENCODER_FINE_STEP_PX)
+                        elif key == 82:  # Up arrow
+                            encoder.adjust_by_pixels(SIM_ENCODER_COARSE_STEP_PX)
+                        elif key == 84:  # Down arrow
+                            encoder.adjust_by_pixels(-SIM_ENCODER_COARSE_STEP_PX)
+                        elif key == 32:  # Space bar
+                            encoder.recenter()
     finally:
         running = False
         try:
@@ -748,6 +955,11 @@ def main():
                 encoder.close()
         except Exception as exc:
             print(f"[Encoder] Cleanup warning: {exc}")
+        if hardware_encoder is not None and hardware_encoder is not encoder:
+            try:
+                hardware_encoder.close()
+            except Exception as exc:
+                print(f"[Encoder] Cleanup warning: {exc}")
         # GPIO cleanup
         try:
             GPIO.output(STBY_BOARD_PIN, GPIO.LOW)
