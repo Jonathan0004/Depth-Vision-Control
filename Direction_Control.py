@@ -388,6 +388,8 @@ try:
                 pwm_error_reported = True
                 print(f"[PWM] Initialization error: {e}")
 
+        direction_label = "CENTER"
+
         if pwm_initialized:
             # Steering offset from center
             delta_px = steer_control_x - center_x
@@ -397,6 +399,13 @@ try:
                 sign = 0
             else:
                 sign = 1 if delta_px > 0 else -1
+
+            if sign == 0:
+                direction_label = "CENTER"
+            elif sign > 0:
+                direction_label = "RIGHT"
+            else:
+                direction_label = "LEFT"
 
             # Map distance to duty fraction [0,1]
             mag = min(abs(delta_px) / float(max(1, SPAN_PX)), 1.0)
@@ -431,12 +440,14 @@ try:
                         last_duty_ns = duty_ns
         # ==========================================================================
 
+        duty_pct = (last_duty_ns / float(PWM_PERIOD_NS)) * 100 if PWM_PERIOD_NS else 0.0
+
         # Draw blue cue & HUD
         blue_pos = (draw_x, line_y)
         cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
         cv2.putText(
             combined,
-            f"Steer Control X: {steer_control_x}  | Duty: {last_duty_ns}/{PWM_PERIOD_NS}  | Dir: {current_dir}",
+            f"Steer Control X: {steer_control_x}  | Duty: {duty_pct:5.1f}%  | Dir: {direction_label}",
             hud_text_position,
             cv2.FONT_HERSHEY_SIMPLEX,
             hud_text_scale,
