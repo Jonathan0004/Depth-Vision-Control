@@ -5,13 +5,10 @@ control). Direction from steering sign, speed from magnitude, center => 0%
 duty (stop).
 
 Robustness additions:
-- PWM auto-probe: find a working pwmchip*/pwm0 that accepts the requested
-  carrier frequency
 - Safe PWM init order: duty_cycle -> period -> enable (avoids EINVAL)
 """
 
 import os
-import glob
 import time
 import queue
 import math
@@ -22,6 +19,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import torch
+import Jetson.GPIO as GPIO
 from PIL import Image
 from transformers import pipeline
 
@@ -63,28 +61,15 @@ DEADZONE_PX = 2
 # ``pwmControl.py``.
 PWM_DUTY_RAMP_STEPS = 20
 
-# Preferred sysfs pwmchip path. If unavailable, an auto-probe searches others.
-PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
-
-# --- GPIO selection ----------------------------------------------------------
-# Whether to bypass Jetson.GPIO and use the sysfs GPIO shim. Toggle this if you
-# prefer explicit sysfs control instead of the Jetson.GPIO library.
-USE_SYSFS_GPIO = False
+# PWM sysfs path.
+PWM_CHIP_PATH = "/sys/class/pwm/pwmchip3"
 
 # BOARD pin choices when Jetson.GPIO is available.
 STBY_BOARD_PIN = 37  # STBY HIGH enables the driver
 AIN1_BOARD_PIN = 31  # Forward: AIN1=HIGH, AIN2=LOW
 AIN2_BOARD_PIN = 29  # Reverse: AIN1=LOW,  AIN2=HIGH
 
-# Sysfs GPIO line numbers (only used if USE_SYSFS_GPIO becomes True).
-STBY_GPIO_NUM = 0    # TB6612 STBY
-AIN1_GPIO_NUM = 0    # TB6612 AIN1 (forward)
-AIN2_GPIO_NUM = 0    # TB6612 AIN2 (reverse)
-
-GPIO = None
-if not USE_SYSFS_GPIO:
-    import Jetson.GPIO as GPIO
-    GPIO.setmode(GPIO.BOARD)          # BOARD numbering when Jetson.GPIO is active
+GPIO.setmode(GPIO.BOARD)          # BOARD numbering when Jetson.GPIO is active
 
 # --- Depth & perception heuristics ------------------------------------------
 # Grid sampling density for the point cloud derived from the depth maps. Higher
@@ -138,42 +123,6 @@ hud_text_thickness = 1
 # Hardware abstraction helpers
 # =============================================================================
 
-# --- Sysfs GPIO shim ---------------------------------------------------------
-class SysfsGPIO:
-    def __init__(self, num):
-        self.num = int(num)
-        self.base = f"/sys/class/gpio/gpio{self.num}"
-        if not os.path.isdir(self.base):
-            try:
-                with open("/sys/class/gpio/export", "w") as f:
-                    f.write(str(self.num))
-            except Exception as e:
-                raise RuntimeError(f"Export GPIO{self.num} failed: {e}")
-            for _ in range(100):
-                if os.path.isdir(self.base):
-                    break
-                time.sleep(0.01)
-        try:
-            with open(os.path.join(self.base, "direction"), "w") as f:
-                f.write("out")
-        except Exception as e:
-            raise RuntimeError(f"GPIO{self.num} direction set failed: {e}")
-        self.vpath = os.path.join(self.base, "value")
-
-    def write(self, val: int):
-        try:
-            with open(self.vpath, "w") as f:
-                f.write("1" if val else "0")
-        except Exception as e:
-            raise RuntimeError(f"GPIO{self.num} write failed: {e}")
-
-    def cleanup(self):
-        try:
-            with open("/sys/class/gpio/unexport", "w") as f:
-                f.write(str(self.num))
-        except Exception:
-            pass
-
 # --- Runtime state -----------------------------------------------------------
 blue_x = None
 steer_control_x = None
@@ -182,7 +131,6 @@ pwm_error_reported = False
 last_duty_ns = None
 pwm_driver = None
 current_dir = 0  # +1 forward, -1 reverse, 0 unknown
-gpio_stby = gpio_ain1 = gpio_ain2 = None
 
 # --- Utility helpers ---------------------------------------------------------
 def clamp(val, minn, maxn):
@@ -256,60 +204,19 @@ class PWMDriver:
             except Exception:
                 pass
 
-def pwm_autoprobe(period_ns: int, initial_duty_ns: int = 0):
-    """
-    Find a pwmchip whose pwm0 accepts the requested period.
-    Returns (driver, chip_path) on success; raises on failure.
-    """
-    candidates = []
-    if PREFERRED_PWM_CHIP and os.path.isdir(PREFERRED_PWM_CHIP):
-        candidates.append(PREFERRED_PWM_CHIP)
-    for chip in sorted(glob.glob("/sys/class/pwm/pwmchip*")):
-        if chip not in candidates:
-            candidates.append(chip)
-    last_err = None
-    for chip in candidates:
-        try:
-            drv = PWMDriver(chip, 0)          # try channel 0 first
-            drv.init(period_ns, initial_duty_ns)
-            achieved_hz = int(round(1_000_000_000 / period_ns))
-            print(f"[PWM] Using {chip}/pwm0 @ {achieved_hz} Hz")
-            return drv, chip
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"No pwmchip accepted period_ns={period_ns}. Last error: {last_err}")
-
 def tb6612_pins_init():
-    global gpio_stby, gpio_ain1, gpio_ain2
-    if not USE_SYSFS_GPIO:
-        GPIO.setup(STBY_BOARD_PIN, GPIO.OUT, initial=GPIO.HIGH)  # STBY HIGH
-        GPIO.setup(AIN1_BOARD_PIN, GPIO.OUT, initial=GPIO.LOW)
-        GPIO.setup(AIN2_BOARD_PIN, GPIO.OUT, initial=GPIO.LOW)
-    else:
-        if not all([STBY_GPIO_NUM, AIN1_GPIO_NUM, AIN2_GPIO_NUM]):
-            raise RuntimeError(
-                "Sysfs GPIO fallback active: please set STBY_GPIO_NUM, AIN1_GPIO_NUM, AIN2_GPIO_NUM."
-            )
-        gpio_stby = SysfsGPIO(STBY_GPIO_NUM)
-        gpio_ain1 = SysfsGPIO(AIN1_GPIO_NUM)
-        gpio_ain2 = SysfsGPIO(AIN2_GPIO_NUM)
-        gpio_stby.write(1)  # STBY HIGH
+    GPIO.setup(STBY_BOARD_PIN, GPIO.OUT, initial=GPIO.HIGH)  # STBY HIGH
+    GPIO.setup(AIN1_BOARD_PIN, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(AIN2_BOARD_PIN, GPIO.OUT, initial=GPIO.LOW)
 
 def tb6612_set_direction(direction: int):
     # Forward: AIN1=HIGH, AIN2=LOW. Reverse: AIN1=LOW, AIN2=HIGH.
-    if not USE_SYSFS_GPIO:
-        if direction > 0:
-            GPIO.output(AIN1_BOARD_PIN, GPIO.HIGH)
-            GPIO.output(AIN2_BOARD_PIN, GPIO.LOW)
-        elif direction < 0:
-            GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
-            GPIO.output(AIN2_BOARD_PIN, GPIO.HIGH)
-    else:
-        if direction > 0:
-            gpio_ain1.write(1); gpio_ain2.write(0)
-        elif direction < 0:
-            gpio_ain1.write(0); gpio_ain2.write(1)
+    if direction > 0:
+        GPIO.output(AIN1_BOARD_PIN, GPIO.HIGH)
+        GPIO.output(AIN2_BOARD_PIN, GPIO.LOW)
+    elif direction < 0:
+        GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
+        GPIO.output(AIN2_BOARD_PIN, GPIO.HIGH)
     # direction == 0 -> leave pins; stop is done with duty=0
 
 
@@ -563,11 +470,12 @@ def main():
     try:
         # Init TB6612 pins + PWM (start stopped)
         tb6612_pins_init()
-        pwm_driver, which_chip = pwm_autoprobe(PWM_PERIOD_NS, 0)  # starts disabled->enabled with duty=0
+        pwm_driver = PWMDriver(PWM_CHIP_PATH, 0)
+        pwm_driver.init(PWM_PERIOD_NS, 0)
         pwm_initialized = True
         print(
             "PWM initialized: target "
-            f"{PWM_FREQUENCY_HZ:,} Hz (achieved {PWM_ACTUAL_FREQUENCY_HZ:,} Hz) on {which_chip}/pwm0 "
+            f"{PWM_FREQUENCY_HZ:,} Hz (achieved {PWM_ACTUAL_FREQUENCY_HZ:,} Hz) on {PWM_CHIP_PATH}/pwm0 "
             "(duty=0%). TB6612 STBY=HIGH."
         )
         print("Direction mapping: Forward=AIN1 HIGH, AIN2 LOW; Reverse=AIN1 LOW, AIN2 HIGH.")
@@ -612,18 +520,10 @@ def main():
             print(f"[PWM] Cleanup warning: {e}")
         # GPIO cleanup
         try:
-            if not USE_SYSFS_GPIO:
-                GPIO.output(STBY_BOARD_PIN, GPIO.LOW)
-                GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
-                GPIO.output(AIN2_BOARD_PIN, GPIO.LOW)
-                GPIO.cleanup()
-            else:
-                if isinstance(gpio_stby, SysfsGPIO):
-                    gpio_stby.cleanup()
-                if isinstance(gpio_ain1, SysfsGPIO):
-                    gpio_ain1.cleanup()
-                if isinstance(gpio_ain2, SysfsGPIO):
-                    gpio_ain2.cleanup()
+            GPIO.output(STBY_BOARD_PIN, GPIO.LOW)
+            GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
+            GPIO.output(AIN2_BOARD_PIN, GPIO.LOW)
+            GPIO.cleanup()
         except Exception:
             pass
 
