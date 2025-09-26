@@ -14,6 +14,7 @@ import os
 import glob
 import time
 import queue
+import math
 from dataclasses import dataclass
 from threading import Thread
 
@@ -56,10 +57,10 @@ SPAN_PX = 200
 # held stopped to prevent oscillations when the target is nearly centered.
 DEADZONE_PX = 2
 
-# Exponential smoothing factor for PWM duty updates. Set to 0.0 for immediate
-# changes or closer to 1.0 for very gradual adjustments. Values outside the
-# inclusive range [0.0, 1.0) are clamped to preserve stability.
-PWM_DUTY_SMOOTHING = 0.25
+# Number of discrete steps used to ramp the PWM duty from 0 to 100%. Higher
+# values make duty changes more gradual, mirroring the soft-start behaviour in
+# ``pwmControl.py``.
+PWM_DUTY_RAMP_STEPS = 50
 
 # Preferred sysfs pwmchip path. If unavailable, an auto-probe searches others.
 PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
@@ -430,12 +431,14 @@ def apply_motor_control(center_x: int, steer_x: int) -> None:
     mag = 0.0 if desired_dir == 0 else min(abs(delta_px) / float(SPAN_PX), 1.0)
     target_duty_ns = int(round(mag * PWM_PERIOD_NS))
 
-    smoothing = clamp(PWM_DUTY_SMOOTHING, 0.0, 0.999)
-    if last_duty_ns is None:
+    if PWM_DUTY_RAMP_STEPS <= 0 or last_duty_ns is None:
         smoothed_duty = target_duty_ns
     else:
-        alpha = 1.0 - smoothing
-        smoothed_duty = int(round(last_duty_ns + (target_duty_ns - last_duty_ns) * alpha))
+        step_ns = max(1, int(math.ceil(PWM_PERIOD_NS / float(PWM_DUTY_RAMP_STEPS))))
+        if target_duty_ns > last_duty_ns:
+            smoothed_duty = min(target_duty_ns, last_duty_ns + step_ns)
+        else:
+            smoothed_duty = max(target_duty_ns, last_duty_ns - step_ns)
 
     if (last_duty_ns is None) or (smoothed_duty != last_duty_ns):
         pwm_driver.set_duty(smoothed_duty)
