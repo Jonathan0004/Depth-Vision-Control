@@ -5,7 +5,6 @@ control). Direction from steering sign, speed from magnitude, center => 0%
 duty (stop).
 
 Robustness additions:
-- Jetson.GPIO -> sysfs GPIO fallback (container-friendly)
 - PWM auto-probe: find a working pwmchip*/pwm0 that accepts the requested
   carrier frequency
 - Safe PWM init order: duty_cycle -> period -> enable (avoids EINVAL)
@@ -60,9 +59,8 @@ DEADZONE_PX = 2
 PREFERRED_PWM_CHIP = "/sys/class/pwm/pwmchip3"
 
 # --- GPIO selection ----------------------------------------------------------
-# Whether to bypass Jetson.GPIO and use the sysfs GPIO shim. This flag is
-# usually overwritten below during auto-detection but remains exposed for
-# manual tweaks while tuning hardware behaviour.
+# Whether to bypass Jetson.GPIO and use the sysfs GPIO shim. Toggle this if you
+# prefer explicit sysfs control instead of the Jetson.GPIO library.
 USE_SYSFS_GPIO = False
 
 # BOARD pin choices when Jetson.GPIO is available.
@@ -74,6 +72,11 @@ AIN2_BOARD_PIN = 29  # Reverse: AIN1=LOW,  AIN2=HIGH
 STBY_GPIO_NUM = 0    # TB6612 STBY
 AIN1_GPIO_NUM = 0    # TB6612 AIN1 (forward)
 AIN2_GPIO_NUM = 0    # TB6612 AIN2 (reverse)
+
+GPIO = None
+if not USE_SYSFS_GPIO:
+    import Jetson.GPIO as GPIO
+    GPIO.setmode(GPIO.BOARD)          # BOARD numbering when Jetson.GPIO is active
 
 # --- Depth & perception heuristics ------------------------------------------
 # Grid sampling density for the point cloud derived from the depth maps. Higher
@@ -116,21 +119,6 @@ hud_text_position = (10, 30)
 hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
-
-# -----------------------------------------------------------------------------
-# Jetson.GPIO detection (auto-switches to sysfs fallback when unavailable)
-# -----------------------------------------------------------------------------
-
-# Try Jetson.GPIO first; if unavailable, use sysfs GPIO fallback
-USE_SYSFS_GPIO = False
-try:
-    import Jetson.GPIO as GPIO
-    GPIO.setmode(GPIO.BOARD)          # BOARD numbering if Jetson.GPIO works
-    GPIO_WORKS = True
-except Exception as e:
-    print(f"[GPIO] Jetson.GPIO unavailable: {e}\n[GPIO] Falling back to sysfs GPIO.")
-    GPIO_WORKS = False
-    USE_SYSFS_GPIO = True
 
 # =============================================================================
 # Hardware abstraction helpers
@@ -506,7 +494,7 @@ finally:
         print(f"[PWM] Cleanup warning: {e}")
     # GPIO cleanup
     try:
-        if not USE_SYSFS_GPIO and GPIO_WORKS:
+        if not USE_SYSFS_GPIO:
             GPIO.output(STBY_BOARD_PIN, GPIO.LOW)
             GPIO.output(AIN1_BOARD_PIN, GPIO.LOW)
             GPIO.output(AIN2_BOARD_PIN, GPIO.LOW)
