@@ -3,9 +3,12 @@
 
 import os, time
 
+import Jetson.GPIO as GPIO
+
 # ===== User-tunable settings =====
 PWMCHIP = "/sys/class/pwm/pwmchip3"  # adjust if your board exposes a different pwmchipN
 CHANNEL = "pwm0"
+PIN_HOLD_HIGH = 31      # physical BOARD pin kept high for entire runtime
 
 FREQ_HZ = 5000          # PWM frequency (e.g., 5000 for 5 kHz)
 TARGET_DUTY_PCT = 100.0   # final duty cycle in percent (e.g., 10.0 for 10%)
@@ -55,6 +58,14 @@ wr(f"{CH_PATH}/duty_cycle", 0)
 # Enable output
 wr(f"{CH_PATH}/enable", "1")
 
+pin_configured = False
+
+# Configure GPIO pin 31 to stay high while the program is running
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+GPIO.setup(PIN_HOLD_HIGH, GPIO.OUT, initial=GPIO.HIGH)
+pin_configured = True
+
 # Soft-start ramp to TARGET_DUTY_PCT
 final_dc_ns = ns_duty_from_pct(PERIOD_NS, TARGET_DUTY_PCT)
 if SOFT_START_S > 0 and RAMP_STEPS > 0 and final_dc_ns > 0:
@@ -72,7 +83,12 @@ try:
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
+    pass
+finally:
     try:
         wr(f"{CH_PATH}/enable", "0")
     except OSError:
         pass
+    if pin_configured:
+        GPIO.output(PIN_HOLD_HIGH, GPIO.LOW)
+    GPIO.cleanup()
