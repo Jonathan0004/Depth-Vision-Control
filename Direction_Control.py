@@ -61,6 +61,13 @@ DEADZONE_PX = 2
 # ``pwmControl.py``.
 PWM_DUTY_RAMP_STEPS = 20
 
+# Multiplier applied to the ramp step size. Values above 1.0 increase how fast
+# the duty ramps towards the target (more aggressive acceleration), while values
+# between 0 and 1 slow it down for extra smoothness. Must remain positive.
+PWM_DUTY_ACCELERATION = 1.0
+if PWM_DUTY_ACCELERATION <= 0:
+    raise ValueError("PWM_DUTY_ACCELERATION must be greater than zero.")
+
 # PWM sysfs path.
 PWM_CHIP_PATH = "/sys/class/pwm/pwmchip3"
 
@@ -351,7 +358,8 @@ def apply_motor_control(center_x: int, steer_x: int) -> None:
     if PWM_DUTY_RAMP_STEPS <= 0 or last_duty_ns is None:
         smoothed_duty = target_duty_ns
     else:
-        step_ns = max(1, int(math.ceil(PWM_PERIOD_NS / float(PWM_DUTY_RAMP_STEPS))))
+        base_step = PWM_PERIOD_NS / float(PWM_DUTY_RAMP_STEPS)
+        step_ns = max(1, int(round(base_step * PWM_DUTY_ACCELERATION)))
         if target_duty_ns > last_duty_ns:
             smoothed_duty = min(target_duty_ns, last_duty_ns + step_ns)
         else:
