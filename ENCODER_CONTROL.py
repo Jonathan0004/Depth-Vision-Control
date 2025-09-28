@@ -21,9 +21,12 @@ from PIL import Image
 from transformers import pipeline
 
 try:
-    import spidev
+    from smbus2 import SMBus
 except ImportError:  # pragma: no cover - hardware dependency
-    spidev = None
+    try:
+        from smbus import SMBus  # type: ignore
+    except ImportError:  # pragma: no cover - hardware dependency
+        SMBus = None
 
 
 # ---------------------------------------------------------------------------
@@ -79,9 +82,8 @@ pwm_channel = "pwm0"
 pwm_frequency_hz = 8000
 
 # Encoder + steering control configuration
-encoder_spi_bus = 0
-encoder_spi_device = 0
-encoder_spi_max_hz = 1000000
+encoder_i2c_bus = 1
+encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
 motor_speed_pct = 40.0            # fixed run speed percentage for the motor
 motor_accel_pct_per_s = 60.0     # acceleration/deceleration rate (percent per second)
@@ -185,35 +187,32 @@ def shutdown_motor_outputs():
 # Encoder helpers and calibration persistence
 # ---------------------------------------------------------------------------
 
-encoder_spi = None
+encoder_bus = None
 encoder_available = False
 calibration_data = {"encoder_min_raw": None, "encoder_max_raw": None}
 calibration_loaded = False
 
 
 def initialise_encoder():
-    global encoder_spi, encoder_available
-    if spidev is None:
+    global encoder_bus, encoder_available
+    if SMBus is None:
         encoder_available = False
         return
-    encoder_spi = spidev.SpiDev()
     try:
-        encoder_spi.open(encoder_spi_bus, encoder_spi_device)
-        encoder_spi.max_speed_hz = encoder_spi_max_hz
-        encoder_spi.mode = 0b01
+        encoder_bus = SMBus(encoder_i2c_bus)
         encoder_available = True
     except (FileNotFoundError, OSError):
-        encoder_spi = None
+        encoder_bus = None
         encoder_available = False
 
 
 def shutdown_encoder():
-    global encoder_spi
-    if encoder_spi is not None:
+    global encoder_bus
+    if encoder_bus is not None:
         try:
-            encoder_spi.close()
+            encoder_bus.close()
         finally:
-            encoder_spi = None
+            encoder_bus = None
 
 
 def load_calibration():
@@ -254,15 +253,14 @@ def encoder_span():
 
 
 def read_encoder_raw():
-    if not encoder_available or encoder_spi is None:
+    if not encoder_available or encoder_bus is None:
         return None
     try:
-        resp = encoder_spi.xfer2([0xFF, 0xFF])
+        high = encoder_bus.read_byte_data(encoder_i2c_address, 0x0C)
+        low = encoder_bus.read_byte_data(encoder_i2c_address, 0x0D)
     except OSError:
         return None
-    if len(resp) != 2:
-        return None
-    raw = ((resp[0] & 0x3F) << 8) | resp[1]
+    raw = ((high & 0x0F) << 8) | low
     return raw
 
 
@@ -357,7 +355,7 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
 
 def start_calibration():
     global calibration_active, calibration_stage, calibration_samples, calibration_status_text
-    if not encoder_available or encoder_spi is None:
+    if not encoder_available or encoder_bus is None:
         calibration_status_text = "Cannot start calibration: encoder interface unavailable"
         calibration_active = False
         calibration_stage = None
@@ -370,7 +368,7 @@ def start_calibration():
 
 def capture_calibration_point():
     global calibration_active, calibration_stage, calibration_status_text, calibration_samples
-    if not encoder_available or encoder_spi is None:
+    if not encoder_available or encoder_bus is None:
         calibration_status_text = "Calibration failed: encoder interface unavailable"
         calibration_active = False
         calibration_stage = None
@@ -770,22 +768,21 @@ shutdown_encoder()
 
 
 # ---------------------------------------------------------------------------
-# AS5048A → Jetson Nano wiring quick reference
+# AS5600 → Jetson Nano wiring quick reference
 # ---------------------------------------------------------------------------
-# 1. Power: connect AS5048A VDD to the Jetson Nano's 3.3 V pin (pin 1 or 17).
-#    Tie the AS5048A GND to any ground pin on the Nano (for example pin 6).
-# 2. SPI signals (assuming SPI0):
-#      • AS5048A CLK  → Jetson Nano SPI0_SCK  (physical pin 23).
-#      • AS5048A DO   → Jetson Nano SPI0_MISO (physical pin 21).
-#      • AS5048A DI   → Jetson Nano SPI0_MOSI (physical pin 19).
-#      • AS5048A CSn  → Jetson Nano SPI0_CS0 (physical pin 24).
-#    If you use a different chip-select pin, update encoder_spi_bus/device
-#    or handle chip-select manually in software.
-# 3. Keep wiring runs short, twist signal with ground where possible, and add a
-#    0.1 µF decoupling capacitor close to the sensor's supply pins for best
-#    noise performance.
-# 4. Enable the SPI interface on the Jetson Nano via `sudo /opt/nvidia/jetson-io/jetson-io.py`
-#    (interface configuration) and reboot afterwards. Once enabled, `/dev/spidev0.0`
-#    should exist and the script will be able to talk to the encoder.
-# 5. Mount the AS5048A so the magnet sits centred above the die at the specified
+# 1. Power: connect AS5600 VCC to the Jetson Nano's 3.3 V pin (pin 1 or 17) and
+#    AS5600 GND to any ground pin (for example pin 6).
+# 2. Signal pins (left to right when text is facing you):
+#      • OUT can optionally feed an analog reader; it is unused in this script.
+#      • DIR selects count direction; tie to GND for default behaviour.
+#      • SCL → Jetson Nano I²C SCL (physical pin 5 on I2C bus 1).
+#      • SDA → Jetson Nano I²C SDA (physical pin 3 on I2C bus 1).
+#      • GPO is an optional programmable output; leave unconnected unless used.
+# 3. Keep wiring short and add a 0.1 µF decoupling capacitor close to the sensor
+#    supply pins for stable readings.
+# 4. Enable the I²C interface on the Jetson Nano via
+#    `sudo /opt/nvidia/jetson-io/jetson-io.py` (interface configuration) and
+#    reboot afterwards. Once enabled, `/dev/i2c-1` should exist and the script
+#    will be able to talk to the encoder.
+# 5. Mount the AS5600 so the magnet sits centred above the die at the specified
 #    air gap (≈1–2 mm). Ensure the magnet rotates with the steering shaft.
