@@ -85,8 +85,8 @@ pwm_frequency_hz = 8000
 encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
-motor_speed_pct = 40.0            # fixed run speed percentage for the motor
-motor_accel_pct_per_s = 60.0     # acceleration/deceleration rate (percent per second)
+motor_speed_pct = 40.0            # Max motor speed
+motor_accel_pct_per_s = 80.0     # Larger number = slower acceleration
 reverse_switch_threshold_pct = 20.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
