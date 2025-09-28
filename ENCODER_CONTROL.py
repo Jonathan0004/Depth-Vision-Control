@@ -82,7 +82,7 @@ pwm_channel = "pwm0"
 pwm_frequency_hz = 8000
 
 # Encoder + steering control configuration
-encoder_i2c_bus = 1
+encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
 motor_speed_pct = 40.0            # fixed run speed percentage for the motor
