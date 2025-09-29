@@ -403,7 +403,7 @@ def capture_calibration_point():
 # Initialise the depth estimation model once (heavy call, so keep global)
 depth_pipe = pipeline(
     task="depth-estimation",
-    model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
+    model="depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
     device=0
 )
 
