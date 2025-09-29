@@ -89,7 +89,7 @@ motor_speed_pct = 40.0            # Max motor speed
 motor_accel_pct_per_s = 80.0     # Larger number = slower acceleration
 reverse_switch_threshold_pct = 20.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
-simulated_step_norm = 0.02        # arrow-key increment when in simulated encoder mode
+simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +99,6 @@ blue_x = None              # persistent, smoothed x-position of the blue circle
 steer_control_x = None     # integer pixel location displayed as HUD text
 
 
-# Cache for grid sampling (reused each frame to avoid recomputation)
-sampling_cache = None
-
-
 # ---------------------------------------------------------------------------
 # Helper utilities and pipeline initialisation
 # ---------------------------------------------------------------------------
@@ -110,54 +106,6 @@ sampling_cache = None
 # Utility: clamp values between two bounds (used to keep overlays on-screen)
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
-
-
-# Precompute the sampling grid for both cameras (reused every frame)
-def ensure_sampling_cache(shape0, shape1):
-    """Return cached sampling coordinates for the given depth shapes."""
-    global sampling_cache
-
-    key = (shape0[0], shape0[1], shape1[0], shape1[1])
-    if sampling_cache and sampling_cache.get("key") == key:
-        return sampling_cache
-
-    def build_entry(h, w, x_offset, cam_idx):
-        col_positions = ((np.arange(cols, dtype=np.float32) + 0.5) * w / cols).astype(np.int32)
-        row_positions = ((np.arange(rows, dtype=np.float32) + 0.5) * h / rows).astype(np.int32)
-        if w > 0:
-            col_positions = np.clip(col_positions, 0, w - 1)
-        if h > 0:
-            row_positions = np.clip(row_positions, 0, h - 1)
-        grid_x, grid_y = np.meshgrid(col_positions, row_positions)
-        local_x = grid_x.reshape(-1)
-        local_y = grid_y.reshape(-1)
-        px = local_x + x_offset
-        py = local_y
-        return {
-            "local_x": local_x,
-            "local_y": local_y,
-            "px": px,
-            "py": py,
-            "px_float": px.astype(np.float32, copy=False),
-            "py_float": py.astype(np.float32, copy=False),
-            "cam": np.full(local_x.shape, cam_idx, dtype=np.int32),
-        }
-
-    entries = [
-        build_entry(shape0[0], shape0[1], 0, 0),
-        build_entry(shape1[0], shape1[1], shape0[1], 1),
-    ]
-
-    sampling_cache = {
-        "key": key,
-        "entries": entries,
-        "px": np.concatenate([entry["px"] for entry in entries]),
-        "py": np.concatenate([entry["py"] for entry in entries]),
-        "px_float": np.concatenate([entry["px_float"] for entry in entries]),
-        "py_float": np.concatenate([entry["py_float"] for entry in entries]),
-        "cam": np.concatenate([entry["cam"] for entry in entries]),
-    }
-    return sampling_cache
 
 
 # ---------------------------------------------------------------------------
@@ -532,16 +480,17 @@ while True:
     # Build a sparse point cloud by sampling each depth map on a coarse grid
     h0, w0 = depth0.shape
     h1, w1 = depth1.shape
-    cache = ensure_sampling_cache(depth0.shape, depth1.shape)
-    entry0, entry1 = cache["entries"]
-    z_samples0 = depth0[entry0["local_y"], entry0["local_x"]].astype(np.float32, copy=False)
-    z_samples1 = depth1[entry1["local_y"], entry1["local_x"]].astype(np.float32, copy=False)
-    z_samples = np.concatenate((z_samples0, z_samples1)).astype(np.float32, copy=False)
-    cloud = np.empty(z_samples.shape[0], dtype=[("x", "f4"), ("y", "f4"), ("z", "f4"), ("cam", "i4")])
-    cloud["x"] = cache["px_float"]
-    cloud["y"] = cache["py_float"]
-    cloud["z"] = z_samples
-    cloud["cam"] = cache["cam"]
+    points = []
+    for cam_idx, (depth, x_offset, w, h) in enumerate([
+        (depth0, 0, w0, h0), (depth1, w0, w1, h1)
+    ]):
+        for c in range(cols):
+            for r in range(rows):
+                px = int((c + 0.5) * w / cols) + x_offset
+                py = int((r + 0.5) * h / rows)
+                z  = float(depth[int(py), int(px - x_offset)])
+                points.append((px, py, z, cam_idx))
+    cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
 
     # Determine obstacle candidates by comparing each sample to the scene average
     zs = cloud['z']
@@ -562,18 +511,20 @@ while True:
         cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
         cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
 
-    obstacle_pts = cloud[mask]
-    if obstacle_pts.size:
-        heights = np.where(obstacle_pts["cam"] == 0, frame0.shape[0], frame1.shape[0])
-        in_band = (
-            (obstacle_pts["y"] >= top_cutoff_pixels)
-            & (obstacle_pts["y"] <= (heights - bottom_cutoff_pixels))
-        )
-        obstacle_pts_in_band = obstacle_pts[in_band]
-    else:
-        obstacle_pts_in_band = obstacle_pts
+    # Draw obstacle points only within cutoffs
+    for is_obst, pt in zip(mask, cloud):
+        if not is_obst:
+            continue
+        px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
+        # check cutoffs
+        if py < top_cutoff_pixels or py > ( (frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels ):
+            continue
+        # draw red dot
+        target = cmap0 if cam == 0 else cmap1
+        offset_x = 0 if cam == 0 else w0
 
-    # Red dot rendering remains disabled (see commented circle drawing above)
+        #Red Dots:
+        # cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
 
     # Show combined view
     combined = np.hstack((cmap0, cmap1))
@@ -594,14 +545,23 @@ while True:
     zone_right = clamp(center_x + pull_influence_radius_px, 0, w_combined)
 
     # Collect red-dot X positions that fall between the cutoff green lines (both cams)
-    if obstacle_pts_in_band.size:
-        red_xs = obstacle_pts_in_band["x"].astype(np.int32, copy=False)
-        red_xs_all = np.unique(red_xs).tolist()
-        in_zone_mask = (red_xs >= zone_left) & (red_xs <= zone_right)
-        red_xs_in_zone = np.unique(red_xs[in_zone_mask]).tolist()
-    else:
-        red_xs_all = []
-        red_xs_in_zone = []
+    red_xs_all = []
+    red_xs_in_zone = []
+
+    for is_obst, pt in zip(mask, cloud):
+        if not is_obst:
+            continue
+        px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
+        frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
+        if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels):
+            continue
+        red_xs_all.append(px)
+        if zone_left <= px <= zone_right:
+            red_xs_in_zone.append(px)
+
+    # Deduplicate & sort to simplify gap computation
+    red_xs_all = sorted(set(red_xs_all))
+    red_xs_in_zone = sorted(set(red_xs_in_zone))
 
     # Global blockers across the full width
     blockers_all = [0] + red_xs_all + [w_combined]
