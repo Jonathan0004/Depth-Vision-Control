@@ -99,6 +99,10 @@ blue_x = None              # persistent, smoothed x-position of the blue circle
 steer_control_x = None     # integer pixel location displayed as HUD text
 
 
+# Cache for sampling grids so expensive mesh computations run once per shape
+_sample_grid_cache = {}
+
+
 # ---------------------------------------------------------------------------
 # Helper utilities and pipeline initialisation
 # ---------------------------------------------------------------------------
@@ -441,6 +445,25 @@ def grab(cam, q):
 Thread(target=grab, args=(cap0, frame_q0), daemon=True).start()
 Thread(target=grab, args=(cap1, frame_q1), daemon=True).start()
 
+
+def _ensure_sample_grid(height, width, x_offset):
+    """Build and cache integer pixel coordinates for sparse depth sampling."""
+    key = (height, width, x_offset)
+    grid = _sample_grid_cache.get(key)
+    if grid is None:
+        col_coords = ((np.arange(cols, dtype=np.float32) + 0.5) * width / cols).astype(np.int32)
+        row_coords = ((np.arange(rows, dtype=np.float32) + 0.5) * height / rows).astype(np.int32)
+        px_local = np.repeat(col_coords, rows)
+        py = np.tile(row_coords, cols)
+        grid = {
+            "px_local": px_local,
+            "py": py,
+            "px_global": (px_local + int(x_offset)).astype(np.int32),
+        }
+        _sample_grid_cache[key] = grid
+    return grid
+
+
 def infer():
     """Fetch paired frames, run depth inference, and push the results downstream."""
     while running:
@@ -450,8 +473,9 @@ def infer():
         except queue.Empty:
             continue
         imgs = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in (f0, f1)]
-        with torch.amp.autocast(device_type='cuda'), torch.no_grad():
-            outs = depth_pipe(imgs)
+        with torch.inference_mode():
+            with torch.amp.autocast(device_type="cuda"):
+                outs = depth_pipe(imgs)
         d0, d1 = [np.array(o['depth']) for o in outs]
         if result_q.full(): result_q.get_nowait()
         result_q.put((f0, d0, f1, d1))
@@ -480,17 +504,27 @@ while True:
     # Build a sparse point cloud by sampling each depth map on a coarse grid
     h0, w0 = depth0.shape
     h1, w1 = depth1.shape
-    points = []
-    for cam_idx, (depth, x_offset, w, h) in enumerate([
-        (depth0, 0, w0, h0), (depth1, w0, w1, h1)
-    ]):
-        for c in range(cols):
-            for r in range(rows):
-                px = int((c + 0.5) * w / cols) + x_offset
-                py = int((r + 0.5) * h / rows)
-                z  = float(depth[int(py), int(px - x_offset)])
-                points.append((px, py, z, cam_idx))
-    cloud = np.array(points, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
+    grid0 = _ensure_sample_grid(h0, w0, 0)
+    grid1 = _ensure_sample_grid(h1, w1, w0)
+
+    px0_local, py0, px0_global = grid0["px_local"], grid0["py"], grid0["px_global"]
+    px1_local, py1, px1_global = grid1["px_local"], grid1["py"], grid1["px_global"]
+
+    z0 = depth0[py0, px0_local]
+    z1 = depth1[py1, px1_local]
+
+    count0 = px0_global.size
+    count1 = px1_global.size
+    cloud = np.empty(count0 + count1, dtype=[('x','f4'),('y','f4'),('z','f4'),('cam','i4')])
+
+    cloud['x'][:count0] = px0_global.astype(np.float32)
+    cloud['x'][count0:] = px1_global.astype(np.float32)
+    cloud['y'][:count0] = py0.astype(np.float32)
+    cloud['y'][count0:] = py1.astype(np.float32)
+    cloud['z'][:count0] = z0.astype(np.float32)
+    cloud['z'][count0:] = z1.astype(np.float32)
+    cloud['cam'][:count0] = 0
+    cloud['cam'][count0:] = 1
 
     # Determine obstacle candidates by comparing each sample to the scene average
     zs = cloud['z']
@@ -510,21 +544,6 @@ while True:
         bottom_y = h - bottom_cutoff_pixels
         cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
         cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
-
-    # Draw obstacle points only within cutoffs
-    for is_obst, pt in zip(mask, cloud):
-        if not is_obst:
-            continue
-        px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
-        # check cutoffs
-        if py < top_cutoff_pixels or py > ( (frame0.shape[0] if cam==0 else frame1.shape[0]) - bottom_cutoff_pixels ):
-            continue
-        # draw red dot
-        target = cmap0 if cam == 0 else cmap1
-        offset_x = 0 if cam == 0 else w0
-
-        #Red Dots:
-        # cv2.circle(target, (px - offset_x, py), obstacle_dot_radius_px, obstacle_dot_color, -1)
 
     # Show combined view
     combined = np.hstack((cmap0, cmap1))
@@ -548,16 +567,19 @@ while True:
     red_xs_all = []
     red_xs_in_zone = []
 
-    for is_obst, pt in zip(mask, cloud):
-        if not is_obst:
-            continue
-        px, py, cam = int(pt['x']), int(pt['y']), pt['cam']
-        frame_h = frame0.shape[0] if cam == 0 else frame1.shape[0]
-        if py < top_cutoff_pixels or py > (frame_h - bottom_cutoff_pixels):
-            continue
-        red_xs_all.append(px)
-        if zone_left <= px <= zone_right:
-            red_xs_in_zone.append(px)
+    if mask.any():
+        obstacles = cloud[mask]
+        if obstacles.size:
+            cam_indices = obstacles['cam']
+            py_vals = obstacles['y'].astype(np.int32)
+            px_vals = obstacles['x'].astype(np.int32)
+            heights = np.where(cam_indices == 0, frame0.shape[0], frame1.shape[0])
+            valid = (py_vals >= top_cutoff_pixels) & (py_vals <= (heights - bottom_cutoff_pixels))
+            if np.any(valid):
+                px_filtered = px_vals[valid]
+                red_xs_all = np.unique(px_filtered).tolist()
+                in_zone = (px_filtered >= zone_left) & (px_filtered <= zone_right)
+                red_xs_in_zone = np.unique(px_filtered[in_zone]).tolist()
 
     # Deduplicate & sort to simplify gap computation
     red_xs_all = sorted(set(red_xs_all))
