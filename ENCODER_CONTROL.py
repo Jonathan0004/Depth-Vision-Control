@@ -89,7 +89,7 @@ motor_speed_pct = 40.0            # Max motor speed
 motor_accel_pct_per_s = 80.0     # Larger number = slower acceleration
 reverse_switch_threshold_pct = 20.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
-simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
+simulated_step_norm = 0.02        # arrow-key increment when in simulated encoder mode
 
 
 # ---------------------------------------------------------------------------
