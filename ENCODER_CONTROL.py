@@ -81,6 +81,8 @@ motor_predictive_slowdown_px = 130.0  # distance (in px) over which speed ramps 
 # Motor startup boost configuration
 motor_startup_boost_pct = 2.5            # subtle extra duty applied when starting
 motor_startup_boost_speed_pct = 24.0     # only apply boost below this duty level
+# Extra nudge when close to target but not settled
+motor_near_target_ramp_pct_per_s = 12.0  # added duty per second when within ~2× deadband
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
@@ -387,6 +389,17 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
             target_speed_pct = min(
                 motor_speed_pct,
                 target_speed_pct + motor_startup_boost_pct,
+            )
+
+        if (
+            motor_near_target_ramp_pct_per_s > 0.0
+            and remaining_px is not None
+            and remaining_px > encoder_deadband_px
+            and remaining_px <= max(encoder_deadband_px * 2.0, encoder_deadband_px + 1)
+        ):
+            target_speed_pct = min(
+                motor_speed_pct,
+                target_speed_pct + motor_near_target_ramp_pct_per_s * dt,
             )
 
     if base_target_pct > 0.0 and target_speed_pct >= kick_pct and current_motor_duty_pct < kick_pct:
