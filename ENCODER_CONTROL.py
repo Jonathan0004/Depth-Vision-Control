@@ -75,6 +75,7 @@ hud_text_thickness = 1
 # Motor control configuration
 motor_pin_left = 29        # physical pin for left turn enable
 motor_pin_right = 31       # physical pin for right turn enable
+motor_brake_pct = 60.0     # duty cycle applied for active braking (0 disables)
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
@@ -162,18 +163,25 @@ def initialise_motor_outputs():
     return period_ns
 
 
-def _apply_motor_output(direction, duty_pct, period_ns):
+def _apply_motor_output(direction, duty_pct, period_ns, brake_duty_pct=0.0):
     duty_pct = max(0.0, min(100.0, duty_pct))
-    if direction > 0:
+    brake_duty_pct = max(0.0, min(100.0, brake_duty_pct))
+
+    if brake_duty_pct > 0.0:
         GPIO.output(motor_pin_right, GPIO.HIGH)
-        GPIO.output(motor_pin_left, GPIO.LOW)
-    elif direction < 0:
-        GPIO.output(motor_pin_right, GPIO.LOW)
         GPIO.output(motor_pin_left, GPIO.HIGH)
+        duty_ns = _pwm_ns_duty(period_ns, brake_duty_pct)
     else:
-        GPIO.output(motor_pin_right, GPIO.LOW)
-        GPIO.output(motor_pin_left, GPIO.LOW)
-    duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
+        if direction > 0:
+            GPIO.output(motor_pin_right, GPIO.HIGH)
+            GPIO.output(motor_pin_left, GPIO.LOW)
+        elif direction < 0:
+            GPIO.output(motor_pin_right, GPIO.LOW)
+            GPIO.output(motor_pin_left, GPIO.HIGH)
+        else:
+            GPIO.output(motor_pin_right, GPIO.LOW)
+            GPIO.output(motor_pin_left, GPIO.LOW)
+        duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
     _pwm_wr(f"{pwm_channel_path}/duty_cycle", duty_ns)
 
 
@@ -314,6 +322,12 @@ def get_encoder_norm():
 def update_motor_control(target_px, actual_px, dt, period_ns):
     global current_motor_direction, current_motor_duty_pct
 
+    if calibration_active:
+        current_motor_direction = 0
+        current_motor_duty_pct = 0.0
+        _apply_motor_output(0, 0.0, period_ns)
+        return
+
     if actual_px is None or target_px is None:
         required_direction = 0
     else:
@@ -353,8 +367,25 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
     else:
         current_motor_duty_pct = max(target_speed_pct, current_motor_duty_pct - max_delta)
 
+    braking = False
+    if motor_brake_pct > 0.0:
+        stopping = required_direction == 0 and current_motor_direction != 0 and current_motor_duty_pct > 0.0
+        reversing = (
+            required_direction != 0
+            and current_motor_direction != 0
+            and current_motor_direction != required_direction
+            and current_motor_duty_pct > 0.0
+        )
+        braking = stopping or reversing
+
+    if braking:
+        new_direction = 0
+
     current_motor_direction = new_direction
-    _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
+    if braking:
+        _apply_motor_output(0, 0.0, period_ns, brake_duty_pct=motor_brake_pct)
+    else:
+        _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
 
 
 def start_calibration():
