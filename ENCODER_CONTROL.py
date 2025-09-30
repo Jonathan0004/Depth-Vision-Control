@@ -76,6 +76,7 @@ hud_text_thickness = 1
 motor_pin_left = 29        # physical pin for left turn enable
 motor_pin_right = 31       # physical pin for right turn enable
 motor_brake_pct = 60.0     # duty cycle applied for active braking (0 disables)
+motor_predictive_slowdown_px = 80.0  # distance (in px) over which speed ramps down
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
@@ -328,38 +329,50 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
         _apply_motor_output(0, 0.0, period_ns)
         return
 
+    remaining_px = None
     if actual_px is None or target_px is None:
         required_direction = 0
     else:
         error_px = target_px - actual_px
+        remaining_px = abs(error_px)
         if abs(error_px) <= encoder_deadband_px:
             required_direction = 0
         else:
             required_direction = 1 if error_px > 0 else -1
 
-    target_speed_pct = 0.0
+    def predictive_target(base_pct):
+        if (
+            remaining_px is None
+            or base_pct <= 0.0
+            or motor_predictive_slowdown_px <= 0.0
+        ):
+            return base_pct
+        ratio = remaining_px / motor_predictive_slowdown_px
+        ratio = clamp(ratio, 0.0, 1.0)
+        return base_pct * ratio
+
+    base_target_pct = 0.0
     new_direction = current_motor_direction
     kick_pct = min(reverse_switch_threshold_pct, motor_speed_pct)
 
     if required_direction == 0:
-        target_speed_pct = 0.0
         if current_motor_duty_pct <= kick_pct:
             new_direction = 0
     else:
         if current_motor_direction == 0:
             new_direction = required_direction
-            target_speed_pct = motor_speed_pct
-            current_motor_duty_pct = max(current_motor_duty_pct, kick_pct)
+            base_target_pct = motor_speed_pct
         elif current_motor_direction == required_direction:
-            target_speed_pct = motor_speed_pct
-            if current_motor_duty_pct < kick_pct:
-                current_motor_duty_pct = kick_pct
+            base_target_pct = motor_speed_pct
         else:
-            target_speed_pct = 0.0
             if current_motor_duty_pct <= kick_pct:
                 new_direction = required_direction
-                current_motor_duty_pct = max(current_motor_duty_pct, kick_pct)
-                target_speed_pct = motor_speed_pct
+                base_target_pct = motor_speed_pct
+
+    target_speed_pct = predictive_target(base_target_pct)
+
+    if base_target_pct > 0.0 and target_speed_pct >= kick_pct and current_motor_duty_pct < kick_pct:
+        current_motor_duty_pct = kick_pct
 
     max_delta = motor_accel_pct_per_s * dt
     if target_speed_pct > current_motor_duty_pct:
