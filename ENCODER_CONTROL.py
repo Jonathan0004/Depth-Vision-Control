@@ -88,6 +88,7 @@ encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
 motor_speed_pct = 40.0            # Max motor speed
+motor_min_duty_pct = 18.0         # Minimum duty cycle required to overcome stiction
 motor_accel_pct_per_s = 80.0     # Larger number = slower acceleration
 reverse_switch_threshold_pct = 20.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
@@ -370,6 +371,9 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
                 base_target_pct = motor_speed_pct
 
     target_speed_pct = predictive_target(base_target_pct)
+
+    if base_target_pct > 0.0:
+        target_speed_pct = max(target_speed_pct, min(motor_min_duty_pct, motor_speed_pct))
 
     if base_target_pct > 0.0 and target_speed_pct >= kick_pct and current_motor_duty_pct < kick_pct:
         current_motor_duty_pct = kick_pct
