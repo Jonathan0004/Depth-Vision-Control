@@ -78,6 +78,10 @@ motor_pin_right = 31       # physical pin for right turn enable
 motor_brake_pct = 40.0     # duty cycle applied for active braking (0 disables)
 motor_predictive_slowdown_px = 130.0  # distance (in px) over which speed ramps down
 
+# Motor startup boost configuration
+motor_startup_boost_pct = 2.5            # subtle extra duty applied when starting
+motor_startup_boost_speed_pct = 24.0     # only apply boost below this duty level
+
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
 pwm_channel = "pwm0"
@@ -374,6 +378,16 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
 
     if base_target_pct > 0.0:
         target_speed_pct = max(target_speed_pct, min(motor_min_duty_pct, motor_speed_pct))
+
+        if (
+            motor_startup_boost_pct > 0.0
+            and target_speed_pct <= motor_startup_boost_speed_pct
+            and current_motor_duty_pct <= motor_startup_boost_speed_pct
+        ):
+            target_speed_pct = min(
+                motor_speed_pct,
+                target_speed_pct + motor_startup_boost_pct,
+            )
 
     if base_target_pct > 0.0 and target_speed_pct >= kick_pct and current_motor_duty_pct < kick_pct:
         current_motor_duty_pct = kick_pct
