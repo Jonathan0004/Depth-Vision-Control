@@ -79,8 +79,7 @@ motor_brake_pct = 0.0      # duty cycle applied for active braking (0 disables)
 
 # Motor dynamics (steering smoothness)
 motor_max_duty_pct = 40.0          # absolute cap on PWM duty cycle
-motor_min_active_duty_pct = 0    # min duty
-motor_min_active_ratio = 0.25      # ratio of error range to blend up to min duty
+motor_min_active_ratio = 0.25      # ratio of motor_max_duty_pct reserved as the minimum active duty
 motor_direction_switch_duty_pct = 1.5  # below this we allow reversing direction
 motor_full_speed_error_px = 100    # error (px) required to request max duty
 motor_ease_exponent = 2.5          # shape of the speed curve (higher => gentler near zero)
@@ -339,7 +338,6 @@ def update_motor_control(target_px, actual_px, _dt, period_ns):
 
     desired_direction = 0
     desired_duty_pct = 0.0
-    min_active_duty = min(max(0.0, motor_min_active_duty_pct), motor_max_duty_pct)
 
     if actual_px is not None and target_px is not None:
         error_px = target_px - actual_px
@@ -352,6 +350,7 @@ def update_motor_control(target_px, actual_px, _dt, period_ns):
             eased = pow(ratio, motor_ease_exponent)
             scaled_duty = clamp(motor_max_duty_pct * eased, 0.0, motor_max_duty_pct)
             min_ratio = clamp(motor_min_active_ratio, 1e-6, 1.0)
+            min_active_duty = clamp(motor_max_duty_pct * min_ratio, 0.0, motor_max_duty_pct)
             if ratio < min_ratio:
                 blend = ratio / min_ratio
                 desired_duty_pct = min_active_duty * blend
