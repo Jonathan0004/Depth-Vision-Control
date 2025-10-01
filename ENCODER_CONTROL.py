@@ -78,14 +78,14 @@ motor_pin_right = 31       # physical pin for right turn enable
 motor_brake_pct = 0.0      # duty cycle applied for active braking (0 disables)
 
 # Motor dynamics (steering smoothness)
-motor_max_duty_pct = 35.0          # absolute cap on PWM duty cycle
-motor_min_active_duty_pct = 7.5    # smallest duty that still moves the motor
+motor_max_duty_pct = 40.0          # absolute cap on PWM duty cycle
+motor_min_active_duty_pct = 0    # min duty
 motor_min_active_ratio = 0.25      # ratio of error range to blend up to min duty
 motor_direction_switch_duty_pct = 1.5  # below this we allow reversing direction
-motor_full_speed_error_px = 140    # error (px) required to request max duty
-motor_ease_exponent = 1.4          # shape of the speed curve (higher => gentler near zero)
-motor_accel_pct_per_s = 120.0      # how quickly the duty may ramp up (pct / second)
-motor_decel_pct_per_s = 160.0      # how quickly the duty may ramp down
+motor_full_speed_error_px = 100    # error (px) required to request max duty
+motor_ease_exponent = 2.5          # shape of the speed curve (higher => gentler near zero)
+motor_accel_pct_per_s = 200.0      # how quickly the duty may ramp up (pct / second)
+motor_decel_pct_per_s = 200.0      # how quickly the duty may ramp down
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
@@ -97,7 +97,7 @@ encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
 calibration_file = Path("steering_calibration.json")
-simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
+simulated_step_norm = 0.01        # arrow-key increment when in simulated encoder mode
 
 
 # ---------------------------------------------------------------------------
