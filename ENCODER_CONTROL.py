@@ -76,14 +76,6 @@ hud_text_thickness = 1
 motor_pin_left = 29        # physical pin for left turn enable
 motor_pin_right = 31       # physical pin for right turn enable
 motor_brake_pct = 40.0     # duty cycle applied for active braking (0 disables)
-motor_predictive_slowdown_px = 130.0  # distance (in px) over which speed ramps down
-
-# Kick pulses to help overcome stiction if movement stalls
-motor_kick_pct = 25.0                    # duty cycle applied during a kick pulse
-motor_kick_delay_s = 0.15                # time without progress before a kick fires
-motor_kick_duration_s = 0.05             # length of each kick pulse
-motor_kick_recovery_s = 0.18             # enforced recovery time after a kick
-motor_kick_progress_epsilon_px = 0.6     # required improvement to consider progress
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
@@ -95,8 +87,6 @@ encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
 motor_speed_pct = 25.0            # Max motor speed
-motor_min_duty_pct = 3.0         # Minimum duty cycle required to overcome stiction
-reverse_switch_threshold_pct = 20.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
 
@@ -298,9 +288,6 @@ def encoder_raw_to_norm(raw):
 
 current_motor_direction = 0
 current_motor_duty_pct = 0.0
-motor_stall_timer_s = 0.0
-motor_kick_active_timer_s = 0.0
-motor_last_remaining_px = None
 
 sim_encoder_enabled = False
 sim_encoder_norm = 0.5
@@ -330,10 +317,8 @@ def get_encoder_norm():
     return norm
 
 
-def update_motor_control(target_px, actual_px, dt, period_ns):
+def update_motor_control(target_px, actual_px, _dt, period_ns):
     global current_motor_direction, current_motor_duty_pct
-    global motor_stall_timer_s, motor_kick_active_timer_s
-    global motor_last_remaining_px
 
     if calibration_active:
         current_motor_direction = 0
@@ -341,107 +326,36 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
         _apply_motor_output(0, 0.0, period_ns)
         return
 
-    remaining_px = None
     if actual_px is None or target_px is None:
         required_direction = 0
     else:
         error_px = target_px - actual_px
-        remaining_px = abs(error_px)
         if abs(error_px) <= encoder_deadband_px:
             required_direction = 0
         else:
             required_direction = 1 if error_px > 0 else -1
 
-    # Track whether we are making progress toward the target to decide on kick pulses
-    progress_made = False
-    if remaining_px is None or required_direction == 0:
-        motor_stall_timer_s = 0.0
-        motor_last_remaining_px = remaining_px
-    else:
-        if motor_last_remaining_px is not None:
-            if (motor_last_remaining_px - remaining_px) > motor_kick_progress_epsilon_px:
-                progress_made = True
-        if progress_made:
-            motor_stall_timer_s = 0.0
-        else:
-            motor_stall_timer_s += dt
-        motor_last_remaining_px = remaining_px
-
-    if motor_kick_active_timer_s > 0.0:
-        motor_kick_active_timer_s = max(0.0, motor_kick_active_timer_s - dt)
-
-    def predictive_target(base_pct):
-        if (
-            remaining_px is None
-            or base_pct <= 0.0
-            or motor_predictive_slowdown_px <= 0.0
-        ):
-            return base_pct
-        ratio = remaining_px / motor_predictive_slowdown_px
-        ratio = clamp(ratio, 0.0, 1.0)
-        return base_pct * ratio
-
-    base_target_pct = 0.0
     new_direction = current_motor_direction
-    kick_pct = min(reverse_switch_threshold_pct, motor_speed_pct)
+    new_duty_pct = current_motor_duty_pct
+    braking = False
 
     if required_direction == 0:
-        if current_motor_duty_pct <= kick_pct:
-            new_direction = 0
-        motor_kick_active_timer_s = 0.0
-        motor_stall_timer_s = 0.0
-    else:
-        if current_motor_direction == 0:
-            new_direction = required_direction
-            base_target_pct = motor_speed_pct
-        elif current_motor_direction == required_direction:
-            base_target_pct = motor_speed_pct
-        else:
-            if current_motor_duty_pct <= kick_pct:
-                new_direction = required_direction
-                base_target_pct = motor_speed_pct
-
-    if (
-        motor_kick_active_timer_s <= 0.0
-        and base_target_pct > 0.0
-        and motor_stall_timer_s >= motor_kick_delay_s
-    ):
-        motor_kick_active_timer_s = motor_kick_duration_s
-        motor_stall_timer_s = -motor_kick_recovery_s
-
-    target_speed_pct = predictive_target(base_target_pct)
-
-    if base_target_pct > 0.0:
-        target_speed_pct = max(target_speed_pct, min(motor_min_duty_pct, motor_speed_pct))
-    else:
-        target_speed_pct = 0.0
-
-    if motor_kick_active_timer_s > 0.0:
-        applied_duty = max(target_speed_pct, motor_kick_pct)
-        current_motor_duty_pct = clamp(applied_duty, 0.0, motor_speed_pct)
-        if required_direction != 0:
-            new_direction = required_direction
-    else:
-        if target_speed_pct >= kick_pct and current_motor_duty_pct < kick_pct:
-            current_motor_duty_pct = kick_pct
-        else:
-            current_motor_duty_pct = target_speed_pct
-
-    braking = False
-    if motor_brake_pct > 0.0:
-        stopping = required_direction == 0 and current_motor_direction != 0 and current_motor_duty_pct > 0.0
-        reversing = (
-            required_direction != 0
-            and current_motor_direction != 0
-            and current_motor_direction != required_direction
-            and current_motor_duty_pct > 0.0
-        )
-        braking = stopping or reversing
-
-    if braking:
         new_direction = 0
+        new_duty_pct = 0.0
+        if motor_brake_pct > 0.0 and current_motor_direction != 0:
+            braking = True
+    else:
+        if motor_brake_pct > 0.0 and current_motor_direction != 0 and current_motor_direction != required_direction:
+            braking = True
+            new_direction = 0
+            new_duty_pct = 0.0
+        else:
+            new_direction = required_direction
+            new_duty_pct = motor_speed_pct
 
     current_motor_direction = new_direction
+    current_motor_duty_pct = new_duty_pct
+
     if braking:
         _apply_motor_output(0, 0.0, period_ns, brake_duty_pct=motor_brake_pct)
     else:
