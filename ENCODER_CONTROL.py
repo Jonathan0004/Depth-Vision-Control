@@ -64,7 +64,7 @@ pull_influence_radius_px = 120   # half-width of the pull zone around centre
 pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left)
 
 # Smoothing factor for the steering cue (1 → frozen, 0 → instant response)
-blue_x_smoothness = 0.5
+blue_x_smoothness = 0.7
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -77,8 +77,8 @@ motor_pin_left = 29        # physical pin for left turn enable
 motor_pin_right = 31       # physical pin for right turn enable
 
 # Motor dynamics — duty cycle ramps linearly with steering error
-motor_max_duty_pct = 40.0          # absolute cap on PWM duty cycle
-motor_full_speed_error_px = 100    # error (px) required to request max duty
+motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
+motor_full_speed_error_px = 200    # error (px) required to request max duty
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
