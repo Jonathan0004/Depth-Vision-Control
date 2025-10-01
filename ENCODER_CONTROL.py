@@ -78,15 +78,12 @@ motor_pin_right = 31       # physical pin for right turn enable
 motor_brake_pct = 40.0     # duty cycle applied for active braking (0 disables)
 motor_predictive_slowdown_px = 130.0  # distance (in px) over which speed ramps down
 
-# Motor startup boost configuration
-motor_startup_boost_pct = 2.5            # subtle extra duty applied when starting
-motor_startup_boost_speed_pct = 15.0     # only apply boost below this duty level
 # Kick pulses to help overcome stiction if movement stalls
-motor_kick_high_pct = 45.0               # duty cycle applied during a kick pulse
-motor_kick_delay_s = 0.6                 # wait this long without progress before kicking
-motor_kick_duration_s = 0.12             # length of each kick pulse
-motor_kick_cooldown_s = 0.5              # minimum time between kicks
-motor_kick_progress_epsilon_px = 1.0     # required improvement to consider progress
+motor_kick_pct = 25.0                    # duty cycle applied during a kick pulse
+motor_kick_delay_s = 0.15                # time without progress before a kick fires
+motor_kick_duration_s = 0.05             # length of each kick pulse
+motor_kick_recovery_s = 0.18             # enforced recovery time after a kick
+motor_kick_progress_epsilon_px = 0.6     # required improvement to consider progress
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
@@ -302,7 +299,6 @@ def encoder_raw_to_norm(raw):
 current_motor_direction = 0
 current_motor_duty_pct = 0.0
 motor_stall_timer_s = 0.0
-motor_kick_cooldown_timer_s = 0.0
 motor_kick_active_timer_s = 0.0
 motor_last_remaining_px = None
 
@@ -336,7 +332,7 @@ def get_encoder_norm():
 
 def update_motor_control(target_px, actual_px, dt, period_ns):
     global current_motor_direction, current_motor_duty_pct
-    global motor_stall_timer_s, motor_kick_cooldown_timer_s, motor_kick_active_timer_s
+    global motor_stall_timer_s, motor_kick_active_timer_s
     global motor_last_remaining_px
 
     if calibration_active:
@@ -371,8 +367,6 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
             motor_stall_timer_s += dt
         motor_last_remaining_px = remaining_px
 
-    if motor_kick_cooldown_timer_s > 0.0:
-        motor_kick_cooldown_timer_s = max(0.0, motor_kick_cooldown_timer_s - dt)
     if motor_kick_active_timer_s > 0.0:
         motor_kick_active_timer_s = max(0.0, motor_kick_active_timer_s - dt)
 
@@ -407,39 +401,24 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
                 new_direction = required_direction
                 base_target_pct = motor_speed_pct
 
+    if (
+        motor_kick_active_timer_s <= 0.0
+        and base_target_pct > 0.0
+        and motor_stall_timer_s >= motor_kick_delay_s
+    ):
+        motor_kick_active_timer_s = motor_kick_duration_s
+        motor_stall_timer_s = -motor_kick_recovery_s
+
     target_speed_pct = predictive_target(base_target_pct)
 
     if base_target_pct > 0.0:
         target_speed_pct = max(target_speed_pct, min(motor_min_duty_pct, motor_speed_pct))
-
-        if (
-            motor_startup_boost_pct > 0.0
-            and target_speed_pct <= motor_startup_boost_speed_pct
-            and current_motor_duty_pct <= motor_startup_boost_speed_pct
-        ):
-            target_speed_pct = min(
-                motor_speed_pct,
-                target_speed_pct + motor_startup_boost_pct,
-            )
     else:
         target_speed_pct = 0.0
 
-    # Decide whether to trigger a high-duty kick pulse
-    kick_triggered = False
-    if (
-        base_target_pct > 0.0
-        and motor_kick_active_timer_s <= 0.0
-        and motor_stall_timer_s >= motor_kick_delay_s
-        and motor_kick_cooldown_timer_s <= 0.0
-    ):
-        motor_kick_active_timer_s = motor_kick_duration_s
-        motor_kick_cooldown_timer_s = motor_kick_cooldown_s
-        motor_stall_timer_s = 0.0
-        kick_triggered = True
-
-    if motor_kick_active_timer_s > 0.0 or kick_triggered:
-        applied_duty = clamp(motor_kick_high_pct, 0.0, 100.0)
-        current_motor_duty_pct = applied_duty
+    if motor_kick_active_timer_s > 0.0:
+        applied_duty = max(target_speed_pct, motor_kick_pct)
+        current_motor_duty_pct = clamp(applied_duty, 0.0, motor_speed_pct)
         if required_direction != 0:
             new_direction = required_direction
     else:
