@@ -81,8 +81,12 @@ motor_predictive_slowdown_px = 130.0  # distance (in px) over which speed ramps 
 # Motor startup boost configuration
 motor_startup_boost_pct = 2.5            # subtle extra duty applied when starting
 motor_startup_boost_speed_pct = 15.0     # only apply boost below this duty level
-# Extra nudge when close to target but not settled
-motor_near_target_ramp_pct_per_s = 1  # added duty per second when within ~2× deadband
+# Kick pulses to help overcome stiction if movement stalls
+motor_kick_high_pct = 45.0               # duty cycle applied during a kick pulse
+motor_kick_delay_s = 0.6                 # wait this long without progress before kicking
+motor_kick_duration_s = 0.12             # length of each kick pulse
+motor_kick_cooldown_s = 0.5              # minimum time between kicks
+motor_kick_progress_epsilon_px = 1.0     # required improvement to consider progress
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
 pwm_chip_path = "/sys/class/pwm/pwmchip3"
@@ -95,7 +99,6 @@ encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
 motor_speed_pct = 25.0            # Max motor speed
 motor_min_duty_pct = 3.0         # Minimum duty cycle required to overcome stiction
-motor_accel_pct_per_s = 120.0     # Larger number = slower acceleration
 reverse_switch_threshold_pct = 20.0  # switch direction min duty
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.04        # arrow-key increment when in simulated encoder mode
@@ -298,6 +301,10 @@ def encoder_raw_to_norm(raw):
 
 current_motor_direction = 0
 current_motor_duty_pct = 0.0
+motor_stall_timer_s = 0.0
+motor_kick_cooldown_timer_s = 0.0
+motor_kick_active_timer_s = 0.0
+motor_last_remaining_px = None
 
 sim_encoder_enabled = False
 sim_encoder_norm = 0.5
@@ -329,6 +336,8 @@ def get_encoder_norm():
 
 def update_motor_control(target_px, actual_px, dt, period_ns):
     global current_motor_direction, current_motor_duty_pct
+    global motor_stall_timer_s, motor_kick_cooldown_timer_s, motor_kick_active_timer_s
+    global motor_last_remaining_px
 
     if calibration_active:
         current_motor_direction = 0
@@ -346,6 +355,26 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
             required_direction = 0
         else:
             required_direction = 1 if error_px > 0 else -1
+
+    # Track whether we are making progress toward the target to decide on kick pulses
+    progress_made = False
+    if remaining_px is None or required_direction == 0:
+        motor_stall_timer_s = 0.0
+        motor_last_remaining_px = remaining_px
+    else:
+        if motor_last_remaining_px is not None:
+            if (motor_last_remaining_px - remaining_px) > motor_kick_progress_epsilon_px:
+                progress_made = True
+        if progress_made:
+            motor_stall_timer_s = 0.0
+        else:
+            motor_stall_timer_s += dt
+        motor_last_remaining_px = remaining_px
+
+    if motor_kick_cooldown_timer_s > 0.0:
+        motor_kick_cooldown_timer_s = max(0.0, motor_kick_cooldown_timer_s - dt)
+    if motor_kick_active_timer_s > 0.0:
+        motor_kick_active_timer_s = max(0.0, motor_kick_active_timer_s - dt)
 
     def predictive_target(base_pct):
         if (
@@ -365,6 +394,8 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
     if required_direction == 0:
         if current_motor_duty_pct <= kick_pct:
             new_direction = 0
+        motor_kick_active_timer_s = 0.0
+        motor_stall_timer_s = 0.0
     else:
         if current_motor_direction == 0:
             new_direction = required_direction
@@ -390,26 +421,32 @@ def update_motor_control(target_px, actual_px, dt, period_ns):
                 motor_speed_pct,
                 target_speed_pct + motor_startup_boost_pct,
             )
-
-        if (
-            motor_near_target_ramp_pct_per_s > 0.0
-            and remaining_px is not None
-            and remaining_px > encoder_deadband_px
-            and remaining_px <= max(encoder_deadband_px * 2.0, encoder_deadband_px + 1)
-        ):
-            target_speed_pct = min(
-                motor_speed_pct,
-                target_speed_pct + motor_near_target_ramp_pct_per_s * dt,
-            )
-
-    if base_target_pct > 0.0 and target_speed_pct >= kick_pct and current_motor_duty_pct < kick_pct:
-        current_motor_duty_pct = kick_pct
-
-    max_delta = motor_accel_pct_per_s * dt
-    if target_speed_pct > current_motor_duty_pct:
-        current_motor_duty_pct = min(target_speed_pct, current_motor_duty_pct + max_delta)
     else:
-        current_motor_duty_pct = max(target_speed_pct, current_motor_duty_pct - max_delta)
+        target_speed_pct = 0.0
+
+    # Decide whether to trigger a high-duty kick pulse
+    kick_triggered = False
+    if (
+        base_target_pct > 0.0
+        and motor_kick_active_timer_s <= 0.0
+        and motor_stall_timer_s >= motor_kick_delay_s
+        and motor_kick_cooldown_timer_s <= 0.0
+    ):
+        motor_kick_active_timer_s = motor_kick_duration_s
+        motor_kick_cooldown_timer_s = motor_kick_cooldown_s
+        motor_stall_timer_s = 0.0
+        kick_triggered = True
+
+    if motor_kick_active_timer_s > 0.0 or kick_triggered:
+        applied_duty = clamp(motor_kick_high_pct, 0.0, 100.0)
+        current_motor_duty_pct = applied_duty
+        if required_direction != 0:
+            new_direction = required_direction
+    else:
+        if target_speed_pct >= kick_pct and current_motor_duty_pct < kick_pct:
+            current_motor_duty_pct = kick_pct
+        else:
+            current_motor_duty_pct = target_speed_pct
 
     braking = False
     if motor_brake_pct > 0.0:
