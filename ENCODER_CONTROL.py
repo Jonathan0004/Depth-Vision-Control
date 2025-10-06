@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import time
+import warnings
 from pathlib import Path
 from threading import Thread
 
@@ -131,6 +132,7 @@ def _pwm_ns_duty(period_ns, pct):
 
 pwm_channel_paths = {}
 pwm_selected_chip = None
+motor_simulation_enabled = False
 
 
 def _sorted_pwm_chips(base_path: Path):
@@ -176,11 +178,12 @@ def _candidate_pwm_channels(required_channels: int):
 
 def initialise_motor_outputs():
     pwm_channel_paths.clear()
-    global pwm_selected_chip
+    global pwm_selected_chip, motor_simulation_enabled
     period_ns = _pwm_ns_period(pwm_frequency_hz)
 
     required_channels = len(pwm_output_names)
     last_error = None
+    motor_simulation_enabled = False
 
     for chip_path, indices in _candidate_pwm_channels(required_channels):
         try:
@@ -215,16 +218,27 @@ def initialise_motor_outputs():
             pwm_channel_paths.clear()
             continue
 
+    motor_simulation_enabled = True
+    pwm_selected_chip = None
+    message = (
+        "PWM hardware not found; running motor outputs in simulation-only mode."
+    )
     if last_error is None:
-        raise FileNotFoundError(
-            "Unable to locate a PWM chip exposing "
-            f"at least {required_channels} channels under /sys/class/pwm"
+        warnings.warn(
+            message
+            + " Unable to locate a PWM chip exposing "
+            + f"at least {required_channels} channels under /sys/class/pwm."
         )
-    raise last_error
+    else:
+        warnings.warn(f"{message} Last error: {last_error}")
+    return period_ns
 
 
 def _apply_motor_output(direction, duty_pct, period_ns):
     duty_pct = max(0.0, min(100.0, duty_pct))
+
+    if motor_simulation_enabled:
+        return
 
     active_channel = None
     if direction > 0:
@@ -239,6 +253,8 @@ def _apply_motor_output(direction, duty_pct, period_ns):
 
 
 def shutdown_motor_outputs():
+    if motor_simulation_enabled:
+        return
     try:
         for channel_path in pwm_channel_paths.values():
             _pwm_wr(f"{channel_path}/duty_cycle", 0)
