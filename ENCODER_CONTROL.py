@@ -14,7 +14,6 @@ from pathlib import Path
 from threading import Thread
 
 import cv2
-import Jetson.GPIO as GPIO
 import numpy as np
 import torch
 from PIL import Image
@@ -72,17 +71,15 @@ hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
 
-# Motor control configuration
-motor_pin_left = 29        # physical pin for left turn enable
-motor_pin_right = 31       # physical pin for right turn enable
-
 # Motor dynamics — duty cycle ramps linearly with steering error
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
 
-# PWM configuration (pin 32 routed via pwmchip sysfs)
-pwm_chip_path = "/sys/class/pwm/pwmchip3"
-pwm_channel = "pwm0"
+# PWM configuration for dual-direction control (pins 32 and 33)
+pwm_outputs_config = {
+    "left": {"chip_path": "/sys/class/pwm/pwmchip3", "index": 0},   # Pin 32
+    "right": {"chip_path": "/sys/class/pwm/pwmchip3", "index": 1},  # Pin 33
+}
 pwm_frequency_hz = 8000
 
 # Encoder + steering control configuration
@@ -131,63 +128,64 @@ def _pwm_ns_duty(period_ns, pct):
     return int(period_ns * (pct / 100.0))
 
 
-pwm_channel_path = f"{pwm_chip_path}/{pwm_channel}"
+pwm_channel_paths = {}
 
 
 def initialise_motor_outputs():
-    GPIO.setmode(GPIO.BOARD)
-    GPIO.setwarnings(False)
-    GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
-
-    if not os.path.isdir(pwm_channel_path):
-        if not os.path.isdir(pwm_chip_path):
-            raise FileNotFoundError(f"{pwm_chip_path} does not exist. Check PWM configuration.")
-        _pwm_wr(f"{pwm_chip_path}/export", "0")
-        for _ in range(200):
-            if os.path.isdir(pwm_channel_path):
-                break
-            time.sleep(0.01)
-        else:
-            raise TimeoutError("PWM channel did not appear after export")
-
-    try:
-        _pwm_wr(f"{pwm_channel_path}/enable", "0")
-    except OSError:
-        pass
-
+    pwm_channel_paths.clear()
     period_ns = _pwm_ns_period(pwm_frequency_hz)
-    _pwm_wr(f"{pwm_channel_path}/period", period_ns)
-    _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
-    _pwm_wr(f"{pwm_channel_path}/enable", "1")
+    for name, cfg in pwm_outputs_config.items():
+        chip_path = cfg["chip_path"]
+        index = int(cfg["index"])
+        channel_path = f"{chip_path}/pwm{index}"
+
+        if not os.path.isdir(channel_path):
+            if not os.path.isdir(chip_path):
+                raise FileNotFoundError(
+                    f"{chip_path} does not exist. Check PWM configuration for {name}."
+                )
+            _pwm_wr(f"{chip_path}/export", str(index))
+            for _ in range(200):
+                if os.path.isdir(channel_path):
+                    break
+                time.sleep(0.01)
+            else:
+                raise TimeoutError(f"PWM channel {channel_path} did not appear after export")
+
+        try:
+            _pwm_wr(f"{channel_path}/enable", "0")
+        except OSError:
+            pass
+
+        _pwm_wr(f"{channel_path}/period", period_ns)
+        _pwm_wr(f"{channel_path}/duty_cycle", 0)
+        _pwm_wr(f"{channel_path}/enable", "1")
+        pwm_channel_paths[name] = channel_path
     return period_ns
 
 
 def _apply_motor_output(direction, duty_pct, period_ns):
     duty_pct = max(0.0, min(100.0, duty_pct))
 
+    active_channel = None
     if direction > 0:
-        GPIO.output(motor_pin_right, GPIO.HIGH)
-        GPIO.output(motor_pin_left, GPIO.LOW)
+        active_channel = "right"
     elif direction < 0:
-        GPIO.output(motor_pin_right, GPIO.LOW)
-        GPIO.output(motor_pin_left, GPIO.HIGH)
-    else:
-        GPIO.output(motor_pin_right, GPIO.LOW)
-        GPIO.output(motor_pin_left, GPIO.LOW)
+        active_channel = "left"
 
-    duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
-    _pwm_wr(f"{pwm_channel_path}/duty_cycle", duty_ns)
+    for name, channel_path in pwm_channel_paths.items():
+        channel_pct = duty_pct if name == active_channel else 0.0
+        duty_ns = _pwm_ns_duty(period_ns, channel_pct)
+        _pwm_wr(f"{channel_path}/duty_cycle", duty_ns)
 
 
 def shutdown_motor_outputs():
     try:
-        _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
-        _pwm_wr(f"{pwm_channel_path}/enable", "0")
+        for channel_path in pwm_channel_paths.values():
+            _pwm_wr(f"{channel_path}/duty_cycle", 0)
+            _pwm_wr(f"{channel_path}/enable", "0")
     except OSError:
         pass
-    finally:
-        GPIO.cleanup()
 
 
 # ---------------------------------------------------------------------------
