@@ -6,6 +6,7 @@ bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
 """
 
+import errno
 import json
 import os
 import queue
@@ -76,10 +77,10 @@ motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
 
 # PWM configuration for dual-direction control (pins 32 and 33)
-pwm_outputs_config = {
-    "left": {"chip_path": "/sys/class/pwm/pwmchip3", "index": 0},   # Pin 32
-    "right": {"chip_path": "/sys/class/pwm/pwmchip3", "index": 1},  # Pin 33
-}
+# The program auto-discovers which pwmchipN exposes at least two channels.
+pwm_output_names = ["left", "right"]
+# Optional environment override for the pwmchip path if you know it ahead of time.
+pwm_chip_hint = os.environ.get("PWM_CHIP_PATH")
 pwm_frequency_hz = 8000
 
 # Encoder + steering control configuration
@@ -129,39 +130,97 @@ def _pwm_ns_duty(period_ns, pct):
 
 
 pwm_channel_paths = {}
+pwm_selected_chip = None
+
+
+def _sorted_pwm_chips(base_path: Path):
+    chips = []
+    for path in base_path.glob("pwmchip*"):
+        suffix = path.name[7:]
+        try:
+            chips.append((0, int(suffix), path))
+        except ValueError:
+            chips.append((1, suffix, path))
+    chips.sort()
+    return [path for *_rest, path in chips]
+
+
+def _read_npwm(chip_path: Path):
+    try:
+        return int((chip_path / "npwm").read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _candidate_pwm_channels(required_channels: int):
+    search_roots = []
+    if pwm_chip_hint:
+        search_roots.append(Path(pwm_chip_hint))
+    base_path = Path("/sys/class/pwm")
+    search_roots.extend(_sorted_pwm_chips(base_path))
+
+    seen = set()
+    for chip_path in search_roots:
+        if chip_path in seen:
+            continue
+        seen.add(chip_path)
+        if not chip_path.exists():
+            continue
+        npwm = _read_npwm(chip_path)
+        if npwm is None or npwm < required_channels:
+            continue
+        indices = list(range(npwm))
+        if len(indices) >= required_channels:
+            yield chip_path, indices[:required_channels]
 
 
 def initialise_motor_outputs():
     pwm_channel_paths.clear()
+    global pwm_selected_chip
     period_ns = _pwm_ns_period(pwm_frequency_hz)
-    for name, cfg in pwm_outputs_config.items():
-        chip_path = cfg["chip_path"]
-        index = int(cfg["index"])
-        channel_path = f"{chip_path}/pwm{index}"
 
-        if not os.path.isdir(channel_path):
-            if not os.path.isdir(chip_path):
-                raise FileNotFoundError(
-                    f"{chip_path} does not exist. Check PWM configuration for {name}."
-                )
-            _pwm_wr(f"{chip_path}/export", str(index))
-            for _ in range(200):
-                if os.path.isdir(channel_path):
-                    break
-                time.sleep(0.01)
-            else:
-                raise TimeoutError(f"PWM channel {channel_path} did not appear after export")
+    required_channels = len(pwm_output_names)
+    last_error = None
 
+    for chip_path, indices in _candidate_pwm_channels(required_channels):
         try:
-            _pwm_wr(f"{channel_path}/enable", "0")
-        except OSError:
-            pass
+            for name, index in zip(pwm_output_names, indices):
+                channel_path = chip_path / f"pwm{index}"
 
-        _pwm_wr(f"{channel_path}/period", period_ns)
-        _pwm_wr(f"{channel_path}/duty_cycle", 0)
-        _pwm_wr(f"{channel_path}/enable", "1")
-        pwm_channel_paths[name] = channel_path
-    return period_ns
+                if not channel_path.is_dir():
+                    _pwm_wr(chip_path / "export", index)
+                    for _ in range(200):
+                        if channel_path.is_dir():
+                            break
+                        time.sleep(0.01)
+                    else:
+                        raise TimeoutError(
+                            f"PWM channel {channel_path} did not appear after export"
+                        )
+
+                try:
+                    _pwm_wr(channel_path / "enable", "0")
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                        raise
+
+                _pwm_wr(channel_path / "period", period_ns)
+                _pwm_wr(channel_path / "duty_cycle", 0)
+                _pwm_wr(channel_path / "enable", "1")
+                pwm_channel_paths[name] = str(channel_path)
+            pwm_selected_chip = str(chip_path)
+            return period_ns
+        except (OSError, TimeoutError) as exc:
+            last_error = exc
+            pwm_channel_paths.clear()
+            continue
+
+    if last_error is None:
+        raise FileNotFoundError(
+            "Unable to locate a PWM chip exposing "
+            f"at least {required_channels} channels under /sys/class/pwm"
+        )
+    raise last_error
 
 
 def _apply_motor_output(direction, duty_pct, period_ns):
