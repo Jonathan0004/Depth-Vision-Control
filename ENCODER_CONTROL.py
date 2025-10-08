@@ -79,7 +79,7 @@ hud_text_thickness = 1
 # Motor dynamics — duty cycle ramps linearly with steering error
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
-motor_duty_ramp_rate_pct_per_s = 220.0  # accel/decel rate for duty ramping
+motor_duty_ramp_rate_pct_per_s = 100.0  # accel/decel rate for duty ramping
 
 # PWM configuration — two outputs used to control motor direction (pins 32 & 33)
 motor_pwm_outputs = {
