@@ -20,11 +20,6 @@ from PIL import Image
 from transformers import pipeline
 
 try:
-    import Jetson.GPIO as GPIO  # type: ignore
-except ImportError:  # pragma: no cover - hardware dependency
-    GPIO = None
-
-try:
     from smbus2 import SMBus
 except ImportError:  # pragma: no cover - hardware dependency
     try:
@@ -79,7 +74,6 @@ hud_text_thickness = 1
 # Motor dynamics — duty cycle ramps linearly with steering error
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
-motor_enable_gpio_pin = 29         # Jetson board pin that reflects motor demand
 
 # PWM configuration — two outputs used to control motor direction (pins 32 & 33)
 motor_pwm_outputs = {
@@ -158,40 +152,6 @@ def _ensure_pwm_channel(chip_path, channel_idx):
 
 
 motor_pwm_channel_paths = {}
-motor_gpio_initialised = False
-
-
-def _initialise_motor_gpio():
-    """Configure the optional GPIO pin that mirrors motor activity."""
-    global motor_gpio_initialised
-    if motor_gpio_initialised:
-        return
-    if GPIO is None:
-        motor_gpio_initialised = False
-        return
-    try:
-        GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(motor_enable_gpio_pin, GPIO.OUT, initial=GPIO.LOW)
-        motor_gpio_initialised = True
-    except RuntimeError:
-        motor_gpio_initialised = False
-
-
-def _set_motor_gpio(active):
-    if GPIO is None or not motor_gpio_initialised:
-        return
-    GPIO.output(motor_enable_gpio_pin, GPIO.HIGH if active else GPIO.LOW)
-
-
-def _shutdown_motor_gpio():
-    global motor_gpio_initialised
-    if GPIO is None or not motor_gpio_initialised:
-        return
-    try:
-        GPIO.output(motor_enable_gpio_pin, GPIO.LOW)
-        GPIO.cleanup(motor_enable_gpio_pin)
-    finally:
-        motor_gpio_initialised = False
 
 
 def initialise_motor_outputs():
@@ -211,8 +171,6 @@ def initialise_motor_outputs():
         _pwm_wr(f"{ch_path}/duty_cycle", 0)
         _pwm_wr(f"{ch_path}/enable", "1")
         motor_pwm_channel_paths[name] = ch_path
-
-    _initialise_motor_gpio()
 
     return period_ns
 
@@ -246,7 +204,6 @@ def shutdown_motor_outputs():
             _pwm_wr(f"{ch_path}/enable", "0")
         except OSError:
             pass
-    _shutdown_motor_gpio()
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +301,6 @@ def encoder_raw_to_norm(raw):
 
 current_motor_direction = 0
 current_motor_duty_pct = 0.0
-motor_move_required = False
 
 sim_encoder_enabled = False
 sim_encoder_norm = 0.5
@@ -374,21 +330,19 @@ def get_encoder_norm():
     return norm
 
 
-def update_motor_control(target_px, actual_px, _dt, period_ns, motor_allowed=True):
-    global current_motor_direction, current_motor_duty_pct, motor_move_required
+def update_motor_control(target_px, actual_px, _dt, period_ns):
+    global current_motor_direction, current_motor_duty_pct
+
+    if calibration_active:
+        current_motor_direction = 0
+        current_motor_duty_pct = 0.0
+        _apply_motor_output(0, 0.0, period_ns)
+        return
 
     desired_direction = 0
     desired_duty_pct = 0.0
 
-    if (
-        calibration_active
-        or not motor_allowed
-        or target_px is None
-        or actual_px is None
-    ):
-        motor_move_required = False
-    else:
-        motor_move_required = False
+    if actual_px is not None and target_px is not None:
         error_px = target_px - actual_px
         abs_error = abs(error_px)
         if abs_error > encoder_deadband_px:
@@ -398,12 +352,9 @@ def update_motor_control(target_px, actual_px, _dt, period_ns, motor_allowed=Tru
             ratio = clamp(ratio, 0.0, 1.0)
             desired_duty_pct = clamp(motor_max_duty_pct * ratio, 0.0, motor_max_duty_pct)
 
-        motor_move_required = desired_direction != 0 and desired_duty_pct > 0.0
-
     current_motor_direction = desired_direction
     current_motor_duty_pct = desired_duty_pct if desired_direction != 0 else 0.0
 
-    _set_motor_gpio(motor_move_required)
     _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
 
 
@@ -661,8 +612,7 @@ while True:
     # Gating:
     # - No in-zone obstacles -> ignore outside, keep center
     # - Any in-zone obstacles -> plan using ALL obstacles
-    obstacle_in_zone = len(red_xs_in_zone) > 0
-    if not obstacle_in_zone:
+    if len(red_xs_in_zone) == 0:
         gap_cx = center_x
     else:
         gap_cx = widest_gap_center(blockers_all, preferred_x=center_x)
@@ -693,8 +643,7 @@ while True:
             1,
         )
 
-    motor_target_px = draw_x if obstacle_in_zone else None
-    update_motor_control(motor_target_px, encoder_px, dt, motor_period_ns, motor_allowed=obstacle_in_zone)
+    update_motor_control(draw_x, encoder_px, dt, motor_period_ns)
 
 
 
