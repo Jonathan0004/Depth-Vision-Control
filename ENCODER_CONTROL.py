@@ -95,6 +95,7 @@ motor_activity_gpio_pin = 29
 encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
+encoder_limit_guard_norm = 0.02  # stop drive commands when within this norm range of limits
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.01        # arrow-key increment when in simulated encoder mode
 
@@ -401,6 +402,15 @@ def update_motor_control(target_px, actual_px, _dt, period_ns, motor_enabled):
             ratio = (abs_error - encoder_deadband_px) / span
             ratio = clamp(ratio, 0.0, 1.0)
             desired_duty_pct = clamp(motor_max_duty_pct * ratio, 0.0, motor_max_duty_pct)
+
+    guard_norm = encoder_limit_guard_norm
+    if guard_norm > 0.0 and latest_encoder_norm is not None:
+        if desired_direction > 0 and latest_encoder_norm >= (1.0 - guard_norm):
+            desired_direction = 0
+            desired_duty_pct = 0.0
+        elif desired_direction < 0 and latest_encoder_norm <= guard_norm:
+            desired_direction = 0
+            desired_duty_pct = 0.0
 
     prev_direction = current_motor_direction
     prev_duty = current_motor_duty_pct
