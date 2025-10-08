@@ -20,6 +20,11 @@ from PIL import Image
 from transformers import pipeline
 
 try:
+    import Jetson.GPIO as GPIO
+except ImportError:  # pragma: no cover - hardware dependency
+    GPIO = None
+
+try:
     from smbus2 import SMBus
 except ImportError:  # pragma: no cover - hardware dependency
     try:
@@ -81,6 +86,9 @@ motor_pwm_outputs = {
     "left": {"chip": "/sys/class/pwm/pwmchip2", "channel": 0},   # pin 33
 }
 pwm_frequency_hz = 8000
+
+# GPIO output that signals when the motor is actively driving (Jetson physical pin 29)
+motor_activity_gpio_pin = 29
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -204,6 +212,46 @@ def shutdown_motor_outputs():
             _pwm_wr(f"{ch_path}/enable", "0")
         except OSError:
             pass
+
+
+motor_activity_gpio_initialized = False
+
+
+def initialise_motor_activity_gpio():
+    global motor_activity_gpio_initialized
+    motor_activity_gpio_initialized = False
+    if GPIO is None:
+        return
+    try:
+        mode = GPIO.getmode()
+        if mode != GPIO.BOARD:
+            GPIO.setmode(GPIO.BOARD)
+        GPIO.setup(motor_activity_gpio_pin, GPIO.OUT, initial=GPIO.LOW)
+        motor_activity_gpio_initialized = True
+    except (RuntimeError, ValueError):
+        motor_activity_gpio_initialized = False
+
+
+def set_motor_activity_gpio(active):
+    if not motor_activity_gpio_initialized:
+        return
+    try:
+        GPIO.output(motor_activity_gpio_pin, GPIO.HIGH if active else GPIO.LOW)
+    except (RuntimeError, ValueError):
+        pass
+
+
+def shutdown_motor_activity_gpio():
+    global motor_activity_gpio_initialized
+    if not motor_activity_gpio_initialized:
+        return
+    try:
+        GPIO.output(motor_activity_gpio_pin, GPIO.LOW)
+        GPIO.cleanup(motor_activity_gpio_pin)
+    except (RuntimeError, ValueError):
+        pass
+    finally:
+        motor_activity_gpio_initialized = False
 
 
 # ---------------------------------------------------------------------------
@@ -330,12 +378,13 @@ def get_encoder_norm():
     return norm
 
 
-def update_motor_control(target_px, actual_px, _dt, period_ns):
+def update_motor_control(target_px, actual_px, _dt, period_ns, motor_enabled):
     global current_motor_direction, current_motor_duty_pct
 
-    if calibration_active:
+    if calibration_active or not motor_enabled:
         current_motor_direction = 0
         current_motor_duty_pct = 0.0
+        set_motor_activity_gpio(False)
         _apply_motor_output(0, 0.0, period_ns)
         return
 
@@ -354,6 +403,8 @@ def update_motor_control(target_px, actual_px, _dt, period_ns):
 
     current_motor_direction = desired_direction
     current_motor_duty_pct = desired_duty_pct if desired_direction != 0 else 0.0
+
+    set_motor_activity_gpio(current_motor_direction != 0 and current_motor_duty_pct > 0.0)
 
     _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
 
@@ -485,6 +536,7 @@ Thread(target=infer, daemon=True).start()
 
 # Initialise motor outputs and PWM once
 motor_period_ns = initialise_motor_outputs()
+initialise_motor_activity_gpio()
 load_calibration()
 initialise_encoder()
 last_loop_time = time.perf_counter()
@@ -612,7 +664,9 @@ while True:
     # Gating:
     # - No in-zone obstacles -> ignore outside, keep center
     # - Any in-zone obstacles -> plan using ALL obstacles
-    if len(red_xs_in_zone) == 0:
+    obstacle_in_pull_zone = len(red_xs_in_zone) > 0
+
+    if not obstacle_in_pull_zone:
         gap_cx = center_x
     else:
         gap_cx = widest_gap_center(blockers_all, preferred_x=center_x)
@@ -643,7 +697,7 @@ while True:
             1,
         )
 
-    update_motor_control(draw_x, encoder_px, dt, motor_period_ns)
+    update_motor_control(draw_x, encoder_px, dt, motor_period_ns, obstacle_in_pull_zone)
 
 
 
@@ -785,6 +839,7 @@ cap1.release()
 cv2.destroyAllWindows()
 shutdown_motor_outputs()
 shutdown_encoder()
+shutdown_motor_activity_gpio()
 
 
 
