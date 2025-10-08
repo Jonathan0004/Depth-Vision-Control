@@ -79,6 +79,7 @@ hud_text_thickness = 1
 # Motor dynamics — duty cycle ramps linearly with steering error
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
+motor_duty_ramp_rate_pct_per_s = 220.0  # accel/decel rate for duty ramping
 
 # PWM configuration — two outputs used to control motor direction (pins 32 & 33)
 motor_pwm_outputs = {
@@ -401,8 +402,35 @@ def update_motor_control(target_px, actual_px, _dt, period_ns, motor_enabled):
             ratio = clamp(ratio, 0.0, 1.0)
             desired_duty_pct = clamp(motor_max_duty_pct * ratio, 0.0, motor_max_duty_pct)
 
-    current_motor_direction = desired_direction
-    current_motor_duty_pct = desired_duty_pct if desired_direction != 0 else 0.0
+    prev_direction = current_motor_direction
+    prev_duty = current_motor_duty_pct
+
+    ramp_step = max(0.0, float(_dt)) * motor_duty_ramp_rate_pct_per_s
+
+    new_direction = prev_direction
+    new_duty = prev_duty
+
+    if desired_direction == 0:
+        # No movement requested — smoothly decelerate to zero
+        new_duty = max(prev_duty - ramp_step, 0.0)
+        if new_duty == 0.0:
+            new_direction = 0
+    else:
+        if prev_direction == desired_direction or prev_duty == 0.0:
+            # Either already moving the correct way or stopped — ramp toward target duty
+            new_direction = desired_direction
+            if prev_duty < desired_duty_pct:
+                new_duty = min(prev_duty + ramp_step, desired_duty_pct)
+            else:
+                new_duty = max(prev_duty - ramp_step, desired_duty_pct)
+        else:
+            # Direction change — bleed off speed before reversing
+            new_duty = max(prev_duty - ramp_step, 0.0)
+            if new_duty == 0.0:
+                new_direction = desired_direction
+
+    current_motor_direction = new_direction
+    current_motor_duty_pct = new_duty if new_direction != 0 else 0.0
 
     set_motor_activity_gpio(current_motor_direction != 0 and current_motor_duty_pct > 0.0)
 
