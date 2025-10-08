@@ -79,7 +79,7 @@ hud_text_thickness = 1
 # Motor dynamics — duty cycle ramps linearly with steering error
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
-motor_duty_ramp_rate_pct_per_s = 100.0  # accel/decel rate for duty ramping
+motor_duty_ramp_rate_pct_per_s = 200.0  # accel/decel rate for duty ramping
 
 # PWM configuration — two outputs used to control motor direction (pins 32 & 33)
 motor_pwm_outputs = {
@@ -95,7 +95,6 @@ motor_activity_gpio_pin = 29
 encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 encoder_deadband_px = 5          # stop when within this many screen pixels of target
-encoder_limit_guard_norm = 0.02  # stop drive commands when within this norm range of limits
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.01        # arrow-key increment when in simulated encoder mode
 
@@ -124,9 +123,35 @@ def clamp(val, minn, maxn):
 # Motor + PWM helpers
 # ---------------------------------------------------------------------------
 
-def _pwm_wr(path, val):
-    with open(path, "w") as f:
-        f.write(str(val))
+import errno
+
+def _pwm_wr(path, val, retries=40, delay_s=0.05):
+    """
+    Robust write for /sys/class/pwm attributes.
+    Retries briefly to tolerate udev applying perms after export,
+    and the common 'Invalid argument'/'busy' races if the driver
+    isn’t ready yet or enable hasn't settled to 0.
+    """
+    s = str(val)
+    last_err = None
+    for _ in range(retries):
+        try:
+            with open(path, "w") as f:
+                f.write(s)
+            return
+        except PermissionError as e:
+            last_err = e
+        except OSError as e:
+            # EINVAL (22) => timing/order issue (e.g., trying to set period too early)
+            # EBUSY  (16) => attribute busy while driver flips state
+            # EACCES/EPERM => perms not applied yet
+            if e.errno not in (errno.EINVAL, errno.EBUSY, errno.EACCES, errno.EPERM):
+                raise
+            last_err = e
+        time.sleep(delay_s)
+    # Surface the last error if we never succeeded
+    raise last_err if last_err is not None else RuntimeError(f"Failed to write {path}")
+
 
 
 def _pwm_ns_period(freq_hz):
@@ -173,14 +198,31 @@ def initialise_motor_outputs():
         chip_path = cfg["chip"]
         channel_idx = cfg["channel"]
         ch_path = _ensure_pwm_channel(chip_path, channel_idx)
+
+        # Always disable first (ignore if already 0), then force duty=0
         try:
-            _pwm_wr(f"{ch_path}/enable", "0")
+            _pwm_wr(f"{ch_path}/enable", 0)
         except OSError:
             pass
+        try:
+            _pwm_wr(f"{ch_path}/duty_cycle", 0)
+        except OSError:
+            pass
+
+        # Small settle; some drivers need a moment after disable before period change
+        time.sleep(0.02)
+
+        # Now set the target period (duty is guaranteed <= period)
         _pwm_wr(f"{ch_path}/period", period_ns)
+
+        # Redundant but harmless: ensure duty is 0 before enabling
         _pwm_wr(f"{ch_path}/duty_cycle", 0)
-        _pwm_wr(f"{ch_path}/enable", "1")
+
+        # Enable output
+        _pwm_wr(f"{ch_path}/enable", 1)
+
         motor_pwm_channel_paths[name] = ch_path
+
 
     return period_ns
 
@@ -403,15 +445,6 @@ def update_motor_control(target_px, actual_px, _dt, period_ns, motor_enabled):
             ratio = clamp(ratio, 0.0, 1.0)
             desired_duty_pct = clamp(motor_max_duty_pct * ratio, 0.0, motor_max_duty_pct)
 
-    guard_norm = encoder_limit_guard_norm
-    if guard_norm > 0.0 and latest_encoder_norm is not None:
-        if desired_direction > 0 and latest_encoder_norm >= (1.0 - guard_norm):
-            desired_direction = 0
-            desired_duty_pct = 0.0
-        elif desired_direction < 0 and latest_encoder_norm <= guard_norm:
-            desired_direction = 0
-            desired_duty_pct = 0.0
-
     prev_direction = current_motor_direction
     prev_duty = current_motor_duty_pct
 
@@ -493,7 +526,7 @@ def capture_calibration_point():
 # Initialise the depth estimation model once (heavy call, so keep global)
 depth_pipe = pipeline(
     task="depth-estimation",
-    model="depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+    model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
     device=0
 )
 
