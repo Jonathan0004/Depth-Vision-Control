@@ -56,6 +56,9 @@ cutoff_line_thickness = 1
 obstacle_dot_radius_px = 5
 obstacle_dot_color = (0, 0, 255)
 
+# Rendering toggle — set to False to run everything headless without UI
+enable_visualization = True
+
 # Blue steering cue (circle) rendered on the combined frame
 blue_circle_radius_px = 12
 blue_circle_color = (255, 0, 0)
@@ -632,21 +635,23 @@ while True:
     thresh = max(depth_diff_threshold, std_multiplier * std_z)
     mask = (mean_z - zs) > thresh
 
-    # Convert depth arrays into coloured heatmaps for easier interpretation
-    norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
-    norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
+    combined = None
+    if enable_visualization:
+        # Convert depth arrays into coloured heatmaps for easier interpretation
+        norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
+        norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
 
-    # Draw cutoff lines on each camera to mark the active sensing band
-    for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
-        top_y = top_cutoff_pixels
-        bottom_y = h - bottom_cutoff_pixels
-        cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
-        cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
+        # Draw cutoff lines on each camera to mark the active sensing band
+        for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
+            top_y = top_cutoff_pixels
+            bottom_y = h - bottom_cutoff_pixels
+            cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
+            cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
 
-    # Show combined view
-    combined = np.hstack((cmap0, cmap1))
+        # Show combined view
+        combined = np.hstack((cmap0, cmap1))
 
     
     
@@ -736,13 +741,14 @@ while True:
         scale = max(1, w_combined - 1)
         encoder_px = int(round(encoder_norm * scale))
         encoder_px = int(clamp(encoder_px, 0, w_combined - 1))
-        cv2.line(
-            combined,
-            (encoder_px, 0),
-            (encoder_px, h_combined),
-            (0, 255, 255),
-            1,
-        )
+        if enable_visualization and combined is not None:
+            cv2.line(
+                combined,
+                (encoder_px, 0),
+                (encoder_px, h_combined),
+                (0, 255, 255),
+                1,
+            )
 
     update_motor_control(draw_x, encoder_px, dt, motor_period_ns, obstacle_in_pull_zone)
 
@@ -750,109 +756,112 @@ while True:
 
 
 
-    # Draw the guidance circle
-    blue_pos = (draw_x, line_y)
-    cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
+    if enable_visualization and combined is not None:
+        # Draw the guidance circle
+        blue_pos = (draw_x, line_y)
+        cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
 
-    # Display "Steer Control" on the left frame
-    cv2.putText(
-        combined,
-        f"Steer Control: {steer_control_x}",
-        hud_text_position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        cv2.LINE_AA
-    )
+        # Display "Steer Control" on the left frame
+        cv2.putText(
+            combined,
+            f"Steer Control: {steer_control_x}",
+            hud_text_position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_color,
+            hud_text_thickness,
+            cv2.LINE_AA
+        )
 
-    encoder_text = "Encoder: --"
-    if encoder_px is not None:
-        encoder_text = f"Encoder: {encoder_px} px"
-    elif sim_encoder_enabled:
-        encoder_text = "Encoder: simulated"
-    cv2.putText(
-        combined,
-        encoder_text,
-        (hud_text_position[0], hud_text_position[1] + 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        cv2.LINE_AA
-    )
+        encoder_text = "Encoder: --"
+        if encoder_px is not None:
+            encoder_text = f"Encoder: {encoder_px} px"
+        elif sim_encoder_enabled:
+            encoder_text = "Encoder: simulated"
+        cv2.putText(
+            combined,
+            encoder_text,
+            (hud_text_position[0], hud_text_position[1] + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_color,
+            hud_text_thickness,
+            cv2.LINE_AA
+        )
 
-    motor_text = f"Motor duty: {current_motor_duty_pct:.1f}%"
-    cv2.putText(
-        combined,
-        motor_text,
-        (hud_text_position[0], hud_text_position[1] + 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        cv2.LINE_AA
-    )
+        motor_text = f"Motor duty: {current_motor_duty_pct:.1f}%"
+        cv2.putText(
+            combined,
+            motor_text,
+            (hud_text_position[0], hud_text_position[1] + 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_color,
+            hud_text_thickness,
+            cv2.LINE_AA
+        )
 
-    # Visualize the pull zone boundaries (blue vertical lines)
-    cv2.line(
-        combined,
-        (int(zone_left), 0),
-        (int(zone_left), h_combined),
-        pull_zone_line_color,
-        pull_zone_line_thickness,
-    )
-    cv2.line(
-        combined,
-        (int(zone_right), 0),
-        (int(zone_right), h_combined),
-        pull_zone_line_color,
-        pull_zone_line_thickness,
-    )
-    # ────────────────────────────────────────────────────────────────────
-
-    if sim_encoder_enabled:
-        slider_left = 20
-        slider_right = w_combined - 20
-        slider_y = h_combined - 30
+        # Visualize the pull zone boundaries (blue vertical lines)
         cv2.line(
             combined,
-            (slider_left, slider_y),
-            (slider_right, slider_y),
-            (200, 200, 200),
-            2,
+            (int(zone_left), 0),
+            (int(zone_left), h_combined),
+            pull_zone_line_color,
+            pull_zone_line_thickness,
         )
-        slider_x = int(round(slider_left + sim_encoder_norm * (slider_right - slider_left)))
-        cv2.circle(combined, (slider_x, slider_y), 8, (0, 200, 255), -1)
-        cv2.putText(
+        cv2.line(
             combined,
-            "Sim encoder: arrow keys to jog, 's' to exit",
-            (20, h_combined - 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
+            (int(zone_right), 0),
+            (int(zone_right), h_combined),
+            pull_zone_line_color,
+            pull_zone_line_thickness,
         )
+        # ────────────────────────────────────────────────────────────────────
 
-    message_to_show = calibration_status_text
-    if not message_to_show and encoder_span() is None:
-        message_to_show = "Press 'c' to calibrate steering range"
-    if message_to_show:
-        cv2.putText(
-            combined,
-            message_to_show,
-            (20, h_combined - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
+        if sim_encoder_enabled:
+            slider_left = 20
+            slider_right = w_combined - 20
+            slider_y = h_combined - 30
+            cv2.line(
+                combined,
+                (slider_left, slider_y),
+                (slider_right, slider_y),
+                (200, 200, 200),
+                2,
+            )
+            slider_x = int(round(slider_left + sim_encoder_norm * (slider_right - slider_left)))
+            cv2.circle(combined, (slider_x, slider_y), 8, (0, 200, 255), -1)
+            cv2.putText(
+                combined,
+                "Sim encoder: arrow keys to jog, 's' to exit",
+                (20, h_combined - 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
-    # Present the final annotated view
-    cv2.imshow("Depth: Camera 0 | Camera 1", combined)
-    key = cv2.waitKey(1) & 0xFF
+        message_to_show = calibration_status_text
+        if not message_to_show and encoder_span() is None:
+            message_to_show = "Press 'c' to calibrate steering range"
+        if message_to_show:
+            cv2.putText(
+                combined,
+                message_to_show,
+                (20, h_combined - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+        # Present the final annotated view
+        cv2.imshow("Depth: Camera 0 | Camera 1", combined)
+        key = cv2.waitKey(1) & 0xFF
+    else:
+        key = -1
 
     # Handle keys — currently only ESC to exit
     if key == 27:
