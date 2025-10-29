@@ -266,25 +266,64 @@ motor_activity_gpio_initialized = False
 motor_direction_gpio_initialized = False
 
 
+def _ensure_board_gpio_mode():
+    """Configure Jetson.GPIO to use physical pin numbering."""
+    if GPIO is None:
+        return False
+    try:
+        if hasattr(GPIO, "setwarnings"):
+            GPIO.setwarnings(False)
+        mode = GPIO.getmode()
+        if mode != GPIO.BOARD:
+            GPIO.setmode(GPIO.BOARD)
+        return True
+    except (RuntimeError, ValueError):
+        return False
+
+
+def _setup_gpio_output(pin):
+    """Ensure a pin is exported as a push-pull GPIO output."""
+    if GPIO is None:
+        return False
+    try:
+        needs_config = True
+        if hasattr(GPIO, "gpio_function"):
+            try:
+                needs_config = GPIO.gpio_function(pin) != GPIO.OUT
+            except (RuntimeError, ValueError):
+                needs_config = True
+        if needs_config:
+            try:
+                GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+            except (RuntimeError, ValueError):
+                GPIO.cleanup(pin)
+                GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+        else:
+            GPIO.output(pin, GPIO.LOW)
+        return True
+    except (RuntimeError, ValueError):
+        return False
+
+
 def initialise_motor_direction_gpio():
     global motor_direction_gpio_initialized
     motor_direction_gpio_initialized = False
     if GPIO is None:
         return
-    try:
-        mode = GPIO.getmode()
-        if mode != GPIO.BOARD:
-            GPIO.setmode(GPIO.BOARD)
-        for pin in motor_direction_gpio_pins.values():
-            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
-        motor_direction_gpio_initialized = True
-    except (RuntimeError, ValueError):
-        motor_direction_gpio_initialized = False
+    if not _ensure_board_gpio_mode():
+        return
+    success = True
+    for pin in motor_direction_gpio_pins.values():
+        if not _setup_gpio_output(pin):
+            success = False
+    motor_direction_gpio_initialized = success
 
 
 def set_motor_direction_gpio(direction):
     if not motor_direction_gpio_initialized:
-        return
+        initialise_motor_direction_gpio()
+        if not motor_direction_gpio_initialized:
+            return
     left_pin = motor_direction_gpio_pins["left"]
     right_pin = motor_direction_gpio_pins["right"]
     try:
@@ -320,19 +359,17 @@ def initialise_motor_activity_gpio():
     motor_activity_gpio_initialized = False
     if GPIO is None:
         return
-    try:
-        mode = GPIO.getmode()
-        if mode != GPIO.BOARD:
-            GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(motor_activity_gpio_pin, GPIO.OUT, initial=GPIO.LOW)
+    if not _ensure_board_gpio_mode():
+        return
+    if _setup_gpio_output(motor_activity_gpio_pin):
         motor_activity_gpio_initialized = True
-    except (RuntimeError, ValueError):
-        motor_activity_gpio_initialized = False
 
 
 def set_motor_activity_gpio(active):
     if not motor_activity_gpio_initialized:
-        return
+        initialise_motor_activity_gpio()
+        if not motor_activity_gpio_initialized:
+            return
     try:
         GPIO.output(motor_activity_gpio_pin, GPIO.HIGH if active else GPIO.LOW)
     except (RuntimeError, ValueError):
