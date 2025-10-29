@@ -83,15 +83,15 @@ hud_text_thickness = 1
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
 
-# PWM configuration — two outputs used to control motor direction (pins 32 & 33)
-motor_pwm_outputs = {
-    "right": {"chip": "/sys/class/pwm/pwmchip3", "channel": 0},  # pin 32
-    "left": {"chip": "/sys/class/pwm/pwmchip2", "channel": 0},   # pin 33
-}
+# PWM configuration — single output on pin 32 for motor speed control
+motor_pwm_output = {"chip": "/sys/class/pwm/pwmchip3", "channel": 0}
 pwm_frequency_hz = 8000
 
 # GPIO output that signals when the motor is actively driving (Jetson physical pin 29)
 motor_activity_gpio_pin = 29
+
+# Direction control GPIO pins (Jetson physical pins)
+direction_gpio_pins = {"left": 18, "right": 22}
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -189,6 +189,7 @@ def _ensure_pwm_channel(chip_path, channel_idx):
 
 
 motor_pwm_channel_paths = {}
+direction_gpio_initialized = False
 
 
 def initialise_motor_outputs():
@@ -196,34 +197,33 @@ def initialise_motor_outputs():
 
     period_ns = _pwm_ns_period(pwm_frequency_hz)
 
-    for name, cfg in motor_pwm_outputs.items():
-        chip_path = cfg["chip"]
-        channel_idx = cfg["channel"]
-        ch_path = _ensure_pwm_channel(chip_path, channel_idx)
+    chip_path = motor_pwm_output["chip"]
+    channel_idx = motor_pwm_output["channel"]
+    ch_path = _ensure_pwm_channel(chip_path, channel_idx)
 
-        # Always disable first (ignore if already 0), then force duty=0
-        try:
-            _pwm_wr(f"{ch_path}/enable", 0)
-        except OSError:
-            pass
-        try:
-            _pwm_wr(f"{ch_path}/duty_cycle", 0)
-        except OSError:
-            pass
-
-        # Small settle; some drivers need a moment after disable before period change
-        time.sleep(0.02)
-
-        # Now set the target period (duty is guaranteed <= period)
-        _pwm_wr(f"{ch_path}/period", period_ns)
-
-        # Redundant but harmless: ensure duty is 0 before enabling
+    # Always disable first (ignore if already 0), then force duty=0
+    try:
+        _pwm_wr(f"{ch_path}/enable", 0)
+    except OSError:
+        pass
+    try:
         _pwm_wr(f"{ch_path}/duty_cycle", 0)
+    except OSError:
+        pass
 
-        # Enable output
-        _pwm_wr(f"{ch_path}/enable", 1)
+    # Small settle; some drivers need a moment after disable before period change
+    time.sleep(0.02)
 
-        motor_pwm_channel_paths[name] = ch_path
+    # Now set the target period (duty is guaranteed <= period)
+    _pwm_wr(f"{ch_path}/period", period_ns)
+
+    # Redundant but harmless: ensure duty is 0 before enabling
+    _pwm_wr(f"{ch_path}/duty_cycle", 0)
+
+    # Enable output
+    _pwm_wr(f"{ch_path}/enable", 1)
+
+    motor_pwm_channel_paths["speed"] = ch_path
 
 
     return period_ns
@@ -233,22 +233,64 @@ def _apply_motor_output(direction, duty_pct, period_ns):
     duty_pct = max(0.0, min(100.0, duty_pct))
 
     duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
+    speed_path = motor_pwm_channel_paths.get("speed")
 
-    right_path = motor_pwm_channel_paths.get("right")
-    left_path = motor_pwm_channel_paths.get("left")
+    if speed_path is None:
+        raise RuntimeError("Motor PWM channel has not been initialised.")
 
-    if right_path is None or left_path is None:
-        raise RuntimeError("Motor PWM channels have not been initialised.")
+    _pwm_wr(f"{speed_path}/duty_cycle", duty_ns)
+    _set_direction_outputs(direction)
 
-    if direction > 0:
-        _pwm_wr(f"{right_path}/duty_cycle", duty_ns)
-        _pwm_wr(f"{left_path}/duty_cycle", 0)
-    elif direction < 0:
-        _pwm_wr(f"{right_path}/duty_cycle", 0)
-        _pwm_wr(f"{left_path}/duty_cycle", duty_ns)
-    else:
-        _pwm_wr(f"{right_path}/duty_cycle", 0)
-        _pwm_wr(f"{left_path}/duty_cycle", 0)
+
+def initialise_direction_gpio():
+    global direction_gpio_initialized
+    direction_gpio_initialized = False
+    if GPIO is None:
+        return
+    try:
+        mode = GPIO.getmode()
+        if mode != GPIO.BOARD:
+            GPIO.setmode(GPIO.BOARD)
+        for pin in direction_gpio_pins.values():
+            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+        direction_gpio_initialized = True
+    except (RuntimeError, ValueError):
+        direction_gpio_initialized = False
+
+
+def _set_direction_outputs(direction):
+    if not direction_gpio_initialized or GPIO is None:
+        return
+    try:
+        if direction > 0:
+            GPIO.output(direction_gpio_pins["right"], GPIO.HIGH)
+            GPIO.output(direction_gpio_pins["left"], GPIO.LOW)
+        elif direction < 0:
+            GPIO.output(direction_gpio_pins["left"], GPIO.HIGH)
+            GPIO.output(direction_gpio_pins["right"], GPIO.LOW)
+        else:
+            for pin in direction_gpio_pins.values():
+                GPIO.output(pin, GPIO.LOW)
+    except (RuntimeError, ValueError):
+        pass
+
+
+def shutdown_direction_gpio():
+    global direction_gpio_initialized
+    if not direction_gpio_initialized or GPIO is None:
+        return
+    try:
+        for pin in direction_gpio_pins.values():
+            try:
+                GPIO.output(pin, GPIO.LOW)
+            except (RuntimeError, ValueError):
+                pass
+            try:
+                GPIO.cleanup(pin)
+            except (RuntimeError, ValueError):
+                pass
+    finally:
+        direction_gpio_initialized = False
 
 
 def shutdown_motor_outputs():
@@ -258,6 +300,7 @@ def shutdown_motor_outputs():
             _pwm_wr(f"{ch_path}/enable", "0")
         except OSError:
             pass
+    _set_direction_outputs(0)
 
 
 motor_activity_gpio_initialized = False
@@ -586,6 +629,7 @@ Thread(target=infer, daemon=True).start()
 
 # Initialise motor outputs and PWM once
 motor_period_ns = initialise_motor_outputs()
+initialise_direction_gpio()
 initialise_motor_activity_gpio()
 load_calibration()
 initialise_encoder()
@@ -896,6 +940,7 @@ cv2.destroyAllWindows()
 shutdown_motor_outputs()
 shutdown_encoder()
 shutdown_motor_activity_gpio()
+shutdown_direction_gpio()
 
 
 
