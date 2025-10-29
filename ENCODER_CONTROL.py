@@ -57,7 +57,7 @@ obstacle_dot_radius_px = 5
 obstacle_dot_color = (0, 0, 255)
 
 # Rendering toggle — set to False to run everything headless without UI
-enable_visualization = False
+enable_visualization = True
 
 # Blue steering cue (circle) rendered on the combined frame
 blue_circle_radius_px = 12
