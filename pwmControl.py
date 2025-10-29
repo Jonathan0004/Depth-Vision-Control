@@ -18,7 +18,7 @@ PWM_OUTPUTS = (
 PIN_HOLD_HIGH = 31      # physical BOARD pin kept high for entire runtime
 
 FREQ_HZ = 5000          # PWM frequency (e.g., 5000 for 5 kHz)
-TARGET_DUTY_PCT = 100.0   # final duty cycle in percent (e.g., 10.0 for 10%)
+TARGET_DUTY_PCT = 40.0   # final duty cycle in percent (e.g., 10.0 for 10%)
 SOFT_START_S = 2.0       # time to ramp from 0% up to TARGET_DUTY_PCT (seconds)
 RAMP_STEPS = 2          # number of steps in the soft-start ramp
 
