@@ -252,7 +252,14 @@ def initialise_direction_gpio():
         if mode != GPIO.BOARD:
             GPIO.setmode(GPIO.BOARD)
         for pin in direction_gpio_pins.values():
-            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+            try:
+                current_fn = GPIO.gpio_function(pin)
+            except (AttributeError, RuntimeError, ValueError):
+                current_fn = None
+            if current_fn != GPIO.OUT:
+                GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+            else:
+                GPIO.output(pin, GPIO.LOW)
         direction_gpio_initialized = True
     except (RuntimeError, ValueError):
         direction_gpio_initialized = False
