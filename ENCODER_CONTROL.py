@@ -6,6 +6,7 @@ bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
 """
 
+import errno
 import json
 import os
 import queue
@@ -81,9 +82,24 @@ motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
 
 # PWM configuration (pin 32 routed via pwmchip sysfs)
-pwm_chip_path = "/sys/class/pwm/pwmchip3"
-pwm_channel = "pwm0"
 pwm_frequency_hz = 8000
+pwm_channels = [
+    {
+        "name": "motor",
+        "chip_path": "/sys/class/pwm/pwmchip3",
+        "channel": 0,
+        "frequency_hz": pwm_frequency_hz,
+        "required": True,
+    },
+    {
+        "name": "aux",
+        "chip_path": "/sys/class/pwm/pwmchip3",
+        "channel": 1,
+        "frequency_hz": pwm_frequency_hz,
+        "required": False,
+    },
+]
+motor_pwm_name = "motor"
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -117,9 +133,26 @@ def clamp(val, minn, maxn):
 # Motor + PWM helpers
 # ---------------------------------------------------------------------------
 
-def _pwm_wr(path, val):
-    with open(path, "w") as f:
-        f.write(str(val))
+def _ensure_root():
+    if os.geteuid() != 0:
+        raise SystemExit(
+            "ERROR: PWM access requires root privileges. Re-run with sudo or as root."
+        )
+
+
+def _pwm_wr(path, val, *, ignore_errors=()):
+    try:
+        with open(os.fspath(path), "w") as f:
+            f.write(str(val))
+    except OSError as e:
+        if e.errno in ignore_errors:
+            return
+        if e.errno in (errno.EPERM, errno.EACCES):
+            raise SystemExit(
+                f"ERROR: Permission denied writing to {path}. "
+                "Run the script with sudo or adjust permissions."
+            ) from e
+        raise RuntimeError(f"Failed to write '{val}' to {path}: {e.strerror}") from e
 
 
 def _pwm_ns_period(freq_hz):
@@ -131,36 +164,119 @@ def _pwm_ns_duty(period_ns, pct):
     return int(period_ns * (pct / 100.0))
 
 
-pwm_channel_path = f"{pwm_chip_path}/{pwm_channel}"
+pwm_runtime = {}
+motor_pwm_state = None
+
+
+def _normalise_pwm_config(cfg):
+    chip_path = Path(cfg["chip_path"])
+    channel = cfg["channel"]
+    if isinstance(channel, str):
+        channel = channel.strip()
+        if channel.startswith("pwm"):
+            channel = channel[3:]
+        channel = int(channel)
+    channel = int(channel)
+    frequency_hz = int(cfg.get("frequency_hz", pwm_frequency_hz))
+    required = bool(cfg.get("required", True))
+    return chip_path, channel, frequency_hz, required
+
+
+def _configure_pwm_channel(name, cfg):
+    chip_path, channel_idx, freq_hz, required = _normalise_pwm_config(cfg)
+    channel_name = f"pwm{channel_idx}"
+    channel_dir = chip_path / channel_name
+
+    if not chip_path.is_dir():
+        raise FileNotFoundError(
+            f"PWM chip directory {chip_path} for '{name}' does not exist."
+        )
+
+    if not channel_dir.is_dir():
+        export_path = chip_path / "export"
+        _pwm_wr(export_path, channel_idx, ignore_errors=(errno.EBUSY, errno.EINVAL))
+        for _ in range(200):
+            if channel_dir.is_dir():
+                break
+            time.sleep(0.01)
+        else:
+            raise TimeoutError(
+                f"PWM channel '{name}' at {channel_dir} did not appear after export."
+            )
+
+    required_nodes = ["enable", "period", "duty_cycle"]
+    missing = [n for n in required_nodes if not (channel_dir / n).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"PWM channel '{name}' is missing sysfs nodes {missing} under {channel_dir}."
+        )
+
+    enable_path = channel_dir / "enable"
+    period_path = channel_dir / "period"
+    duty_path = channel_dir / "duty_cycle"
+
+    try:
+        _pwm_wr(enable_path, 0, ignore_errors=(errno.EINVAL,))
+    except RuntimeError:
+        pass
+
+    period_ns = _pwm_ns_period(freq_hz)
+    try:
+        _pwm_wr(period_path, period_ns)
+        _pwm_wr(duty_path, 0)
+        _pwm_wr(enable_path, 1)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to program PWM '{name}' at {channel_dir}: {exc}"
+        ) from exc
+
+    return {
+        "name": name,
+        "channel": channel_name,
+        "chip_path": chip_path,
+        "frequency_hz": freq_hz,
+        "period_ns": period_ns,
+        "paths": {
+            "base": channel_dir,
+            "enable": enable_path,
+            "period": period_path,
+            "duty_cycle": duty_path,
+        },
+        "required": required,
+    }
 
 
 def initialise_motor_outputs():
+    global pwm_runtime, motor_pwm_state
+
+    _ensure_root()
+
     GPIO.setmode(GPIO.BOARD)
     GPIO.setwarnings(False)
     GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
     GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
 
-    if not os.path.isdir(pwm_channel_path):
-        if not os.path.isdir(pwm_chip_path):
-            raise FileNotFoundError(f"{pwm_chip_path} does not exist. Check PWM configuration.")
-        _pwm_wr(f"{pwm_chip_path}/export", "0")
-        for _ in range(200):
-            if os.path.isdir(pwm_channel_path):
-                break
-            time.sleep(0.01)
-        else:
-            raise TimeoutError("PWM channel did not appear after export")
+    pwm_runtime = {}
+    for cfg in pwm_channels:
+        name = cfg["name"]
+        try:
+            state = _configure_pwm_channel(name, cfg)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            if cfg.get("required", True):
+                raise RuntimeError(f"Failed to initialise PWM '{name}': {exc}") from exc
+            print(f"Warning: skipping optional PWM '{name}': {exc}")
+            continue
+        pwm_runtime[name] = state
 
-    try:
-        _pwm_wr(f"{pwm_channel_path}/enable", "0")
-    except OSError:
-        pass
+    if motor_pwm_name not in pwm_runtime:
+        raise RuntimeError(
+            f"PWM channel '{motor_pwm_name}' is required for motor control but was not initialised."
+        )
 
-    period_ns = _pwm_ns_period(pwm_frequency_hz)
-    _pwm_wr(f"{pwm_channel_path}/period", period_ns)
-    _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
-    _pwm_wr(f"{pwm_channel_path}/enable", "1")
-    return period_ns
+    motor_pwm_state = pwm_runtime[motor_pwm_name]
+    return motor_pwm_state["period_ns"]
 
 
 def _apply_motor_output(direction, duty_pct, period_ns):
@@ -176,17 +292,29 @@ def _apply_motor_output(direction, duty_pct, period_ns):
         GPIO.output(motor_pin_right, GPIO.LOW)
         GPIO.output(motor_pin_left, GPIO.LOW)
 
+    if motor_pwm_state is None:
+        raise RuntimeError("Motor PWM channel has not been initialised.")
+
+    channel_period_ns = motor_pwm_state["period_ns"]
+    if period_ns != channel_period_ns:
+        period_ns = channel_period_ns
+
     duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
-    _pwm_wr(f"{pwm_channel_path}/duty_cycle", duty_ns)
+    _pwm_wr(motor_pwm_state["paths"]["duty_cycle"], duty_ns)
 
 
 def shutdown_motor_outputs():
+    global pwm_runtime, motor_pwm_state
     try:
-        _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
-        _pwm_wr(f"{pwm_channel_path}/enable", "0")
-    except OSError:
-        pass
+        for state in pwm_runtime.values():
+            try:
+                _pwm_wr(state["paths"]["duty_cycle"], 0)
+                _pwm_wr(state["paths"]["enable"], 0)
+            except RuntimeError:
+                pass
     finally:
+        motor_pwm_state = None
+        pwm_runtime.clear()
         GPIO.cleanup()
 
 
