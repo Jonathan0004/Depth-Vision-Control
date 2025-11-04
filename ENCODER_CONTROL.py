@@ -14,15 +14,11 @@ from pathlib import Path
 from threading import Thread
 
 import cv2
+import Jetson.GPIO as GPIO
 import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
-
-try:
-    import Jetson.GPIO as GPIO
-except ImportError:  # pragma: no cover - hardware dependency
-    GPIO = None
 
 try:
     from smbus2 import SMBus
@@ -56,9 +52,6 @@ cutoff_line_thickness = 1
 obstacle_dot_radius_px = 5
 obstacle_dot_color = (0, 0, 255)
 
-# Rendering toggle — set to False to run everything headless without UI
-enable_visualization = True
-
 # Blue steering cue (circle) rendered on the combined frame
 blue_circle_radius_px = 12
 blue_circle_color = (255, 0, 0)
@@ -79,19 +72,18 @@ hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
 
+# Motor control configuration
+motor_pin_left = 29        # physical pin for left turn enable
+motor_pin_right = 31       # physical pin for right turn enable
+
 # Motor dynamics — duty cycle ramps linearly with steering error
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 200    # error (px) required to request max duty
 
-# PWM configuration — single output on pin 32 for motor speed control
-motor_pwm_output = {"chip": "/sys/class/pwm/pwmchip3", "channel": 0}
+# PWM configuration (pin 32 routed via pwmchip sysfs)
+pwm_chip_path = "/sys/class/pwm/pwmchip3"
+pwm_channel = "pwm0"
 pwm_frequency_hz = 8000
-
-# GPIO output that signals when the motor is actively driving (Jetson physical pin 29)
-motor_activity_gpio_pin = 29
-
-# Direction control GPIO pins (Jetson physical pins)
-direction_gpio_pins = {"left": 18, "right": 22}
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -125,35 +117,9 @@ def clamp(val, minn, maxn):
 # Motor + PWM helpers
 # ---------------------------------------------------------------------------
 
-import errno
-
-def _pwm_wr(path, val, retries=40, delay_s=0.05):
-    """
-    Robust write for /sys/class/pwm attributes.
-    Retries briefly to tolerate udev applying perms after export,
-    and the common 'Invalid argument'/'busy' races if the driver
-    isn’t ready yet or enable hasn't settled to 0.
-    """
-    s = str(val)
-    last_err = None
-    for _ in range(retries):
-        try:
-            with open(path, "w") as f:
-                f.write(s)
-            return
-        except PermissionError as e:
-            last_err = e
-        except OSError as e:
-            # EINVAL (22) => timing/order issue (e.g., trying to set period too early)
-            # EBUSY  (16) => attribute busy while driver flips state
-            # EACCES/EPERM => perms not applied yet
-            if e.errno not in (errno.EINVAL, errno.EBUSY, errno.EACCES, errno.EPERM):
-                raise
-            last_err = e
-        time.sleep(delay_s)
-    # Surface the last error if we never succeeded
-    raise last_err if last_err is not None else RuntimeError(f"Failed to write {path}")
-
+def _pwm_wr(path, val):
+    with open(path, "w") as f:
+        f.write(str(val))
 
 
 def _pwm_ns_period(freq_hz):
@@ -165,182 +131,63 @@ def _pwm_ns_duty(period_ns, pct):
     return int(period_ns * (pct / 100.0))
 
 
-def _pwm_channel_path(chip_path, channel_idx):
-    return f"{chip_path}/pwm{channel_idx}"
-
-
-def _ensure_pwm_channel(chip_path, channel_idx):
-    ch_path = _pwm_channel_path(chip_path, channel_idx)
-    if os.path.isdir(ch_path):
-        return ch_path
-
-    if not os.path.isdir(chip_path):
-        raise FileNotFoundError(f"{chip_path} does not exist. Check PWM configuration.")
-
-    _pwm_wr(f"{chip_path}/export", str(channel_idx))
-    for _ in range(200):
-        if os.path.isdir(ch_path):
-            break
-        time.sleep(0.01)
-    else:
-        raise TimeoutError(f"PWM channel pwm{channel_idx} did not appear after export")
-
-    return ch_path
-
-
-motor_pwm_channel_paths = {}
-direction_gpio_initialized = False
+pwm_channel_path = f"{pwm_chip_path}/{pwm_channel}"
 
 
 def initialise_motor_outputs():
-    motor_pwm_channel_paths.clear()
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setwarnings(False)
+    GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
+
+    if not os.path.isdir(pwm_channel_path):
+        if not os.path.isdir(pwm_chip_path):
+            raise FileNotFoundError(f"{pwm_chip_path} does not exist. Check PWM configuration.")
+        _pwm_wr(f"{pwm_chip_path}/export", "0")
+        for _ in range(200):
+            if os.path.isdir(pwm_channel_path):
+                break
+            time.sleep(0.01)
+        else:
+            raise TimeoutError("PWM channel did not appear after export")
+
+    try:
+        _pwm_wr(f"{pwm_channel_path}/enable", "0")
+    except OSError:
+        pass
 
     period_ns = _pwm_ns_period(pwm_frequency_hz)
-
-    chip_path = motor_pwm_output["chip"]
-    channel_idx = motor_pwm_output["channel"]
-    ch_path = _ensure_pwm_channel(chip_path, channel_idx)
-
-    # Always disable first (ignore if already 0), then force duty=0
-    try:
-        _pwm_wr(f"{ch_path}/enable", 0)
-    except OSError:
-        pass
-    try:
-        _pwm_wr(f"{ch_path}/duty_cycle", 0)
-    except OSError:
-        pass
-
-    # Small settle; some drivers need a moment after disable before period change
-    time.sleep(0.02)
-
-    # Now set the target period (duty is guaranteed <= period)
-    _pwm_wr(f"{ch_path}/period", period_ns)
-
-    # Redundant but harmless: ensure duty is 0 before enabling
-    _pwm_wr(f"{ch_path}/duty_cycle", 0)
-
-    # Enable output
-    _pwm_wr(f"{ch_path}/enable", 1)
-
-    motor_pwm_channel_paths["speed"] = ch_path
-
-
+    _pwm_wr(f"{pwm_channel_path}/period", period_ns)
+    _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
+    _pwm_wr(f"{pwm_channel_path}/enable", "1")
     return period_ns
 
 
 def _apply_motor_output(direction, duty_pct, period_ns):
     duty_pct = max(0.0, min(100.0, duty_pct))
 
+    if direction > 0:
+        GPIO.output(motor_pin_right, GPIO.HIGH)
+        GPIO.output(motor_pin_left, GPIO.LOW)
+    elif direction < 0:
+        GPIO.output(motor_pin_right, GPIO.LOW)
+        GPIO.output(motor_pin_left, GPIO.HIGH)
+    else:
+        GPIO.output(motor_pin_right, GPIO.LOW)
+        GPIO.output(motor_pin_left, GPIO.LOW)
+
     duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
-    speed_path = motor_pwm_channel_paths.get("speed")
-
-    if speed_path is None:
-        raise RuntimeError("Motor PWM channel has not been initialised.")
-
-    _pwm_wr(f"{speed_path}/duty_cycle", duty_ns)
-    _set_direction_outputs(direction)
-
-
-def initialise_direction_gpio():
-    global direction_gpio_initialized
-    direction_gpio_initialized = False
-    if GPIO is None:
-        return
-    try:
-        mode = GPIO.getmode()
-        if mode != GPIO.BOARD:
-            GPIO.setmode(GPIO.BOARD)
-        for pin in direction_gpio_pins.values():
-            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
-        direction_gpio_initialized = True
-    except (RuntimeError, ValueError):
-        direction_gpio_initialized = False
-
-
-def _set_direction_outputs(direction):
-    if not direction_gpio_initialized or GPIO is None:
-        return
-    try:
-        if direction > 0:
-            GPIO.output(direction_gpio_pins["right"], GPIO.HIGH)
-            GPIO.output(direction_gpio_pins["left"], GPIO.LOW)
-        elif direction < 0:
-            GPIO.output(direction_gpio_pins["left"], GPIO.HIGH)
-            GPIO.output(direction_gpio_pins["right"], GPIO.LOW)
-        else:
-            for pin in direction_gpio_pins.values():
-                GPIO.output(pin, GPIO.LOW)
-    except (RuntimeError, ValueError):
-        pass
-
-
-def shutdown_direction_gpio():
-    global direction_gpio_initialized
-    if not direction_gpio_initialized or GPIO is None:
-        return
-    try:
-        for pin in direction_gpio_pins.values():
-            try:
-                GPIO.output(pin, GPIO.LOW)
-            except (RuntimeError, ValueError):
-                pass
-            try:
-                GPIO.cleanup(pin)
-            except (RuntimeError, ValueError):
-                pass
-    finally:
-        direction_gpio_initialized = False
+    _pwm_wr(f"{pwm_channel_path}/duty_cycle", duty_ns)
 
 
 def shutdown_motor_outputs():
-    for ch_path in motor_pwm_channel_paths.values():
-        try:
-            _pwm_wr(f"{ch_path}/duty_cycle", 0)
-            _pwm_wr(f"{ch_path}/enable", "0")
-        except OSError:
-            pass
-    _set_direction_outputs(0)
-
-
-motor_activity_gpio_initialized = False
-
-
-def initialise_motor_activity_gpio():
-    global motor_activity_gpio_initialized
-    motor_activity_gpio_initialized = False
-    if GPIO is None:
-        return
     try:
-        mode = GPIO.getmode()
-        if mode != GPIO.BOARD:
-            GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(motor_activity_gpio_pin, GPIO.OUT, initial=GPIO.LOW)
-        motor_activity_gpio_initialized = True
-    except (RuntimeError, ValueError):
-        motor_activity_gpio_initialized = False
-
-
-def set_motor_activity_gpio(active):
-    if not motor_activity_gpio_initialized:
-        return
-    try:
-        GPIO.output(motor_activity_gpio_pin, GPIO.HIGH if active else GPIO.LOW)
-    except (RuntimeError, ValueError):
-        pass
-
-
-def shutdown_motor_activity_gpio():
-    global motor_activity_gpio_initialized
-    if not motor_activity_gpio_initialized:
-        return
-    try:
-        GPIO.output(motor_activity_gpio_pin, GPIO.LOW)
-        GPIO.cleanup(motor_activity_gpio_pin)
-    except (RuntimeError, ValueError):
+        _pwm_wr(f"{pwm_channel_path}/duty_cycle", 0)
+        _pwm_wr(f"{pwm_channel_path}/enable", "0")
+    except OSError:
         pass
     finally:
-        motor_activity_gpio_initialized = False
+        GPIO.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -467,13 +314,12 @@ def get_encoder_norm():
     return norm
 
 
-def update_motor_control(target_px, actual_px, _dt, period_ns, motor_enabled):
+def update_motor_control(target_px, actual_px, _dt, period_ns):
     global current_motor_direction, current_motor_duty_pct
 
-    if calibration_active or not motor_enabled:
+    if calibration_active:
         current_motor_direction = 0
         current_motor_duty_pct = 0.0
-        set_motor_activity_gpio(False)
         _apply_motor_output(0, 0.0, period_ns)
         return
 
@@ -490,14 +336,8 @@ def update_motor_control(target_px, actual_px, _dt, period_ns, motor_enabled):
             ratio = clamp(ratio, 0.0, 1.0)
             desired_duty_pct = clamp(motor_max_duty_pct * ratio, 0.0, motor_max_duty_pct)
 
-    if desired_direction == 0:
-        current_motor_direction = 0
-        current_motor_duty_pct = 0.0
-    else:
-        current_motor_direction = desired_direction
-        current_motor_duty_pct = desired_duty_pct
-
-    set_motor_activity_gpio(current_motor_direction != 0 and current_motor_duty_pct > 0.0)
+    current_motor_direction = desired_direction
+    current_motor_duty_pct = desired_duty_pct if desired_direction != 0 else 0.0
 
     _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
 
@@ -548,7 +388,7 @@ def capture_calibration_point():
 # Initialise the depth estimation model once (heavy call, so keep global)
 depth_pipe = pipeline(
     task="depth-estimation",
-    model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
+    model="depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
     device=0
 )
 
@@ -629,8 +469,6 @@ Thread(target=infer, daemon=True).start()
 
 # Initialise motor outputs and PWM once
 motor_period_ns = initialise_motor_outputs()
-initialise_direction_gpio()
-initialise_motor_activity_gpio()
 load_calibration()
 initialise_encoder()
 last_loop_time = time.perf_counter()
@@ -679,23 +517,21 @@ while True:
     thresh = max(depth_diff_threshold, std_multiplier * std_z)
     mask = (mean_z - zs) > thresh
 
-    combined = None
-    if enable_visualization:
-        # Convert depth arrays into coloured heatmaps for easier interpretation
-        norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
-        norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
+    # Convert depth arrays into coloured heatmaps for easier interpretation
+    norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
+    norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
 
-        # Draw cutoff lines on each camera to mark the active sensing band
-        for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
-            top_y = top_cutoff_pixels
-            bottom_y = h - bottom_cutoff_pixels
-            cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
-            cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
+    # Draw cutoff lines on each camera to mark the active sensing band
+    for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
+        top_y = top_cutoff_pixels
+        bottom_y = h - bottom_cutoff_pixels
+        cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
+        cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
 
-        # Show combined view
-        combined = np.hstack((cmap0, cmap1))
+    # Show combined view
+    combined = np.hstack((cmap0, cmap1))
 
     
     
@@ -760,9 +596,7 @@ while True:
     # Gating:
     # - No in-zone obstacles -> ignore outside, keep center
     # - Any in-zone obstacles -> plan using ALL obstacles
-    obstacle_in_pull_zone = len(red_xs_in_zone) > 0
-
-    if not obstacle_in_pull_zone:
+    if len(red_xs_in_zone) == 0:
         gap_cx = center_x
     else:
         gap_cx = widest_gap_center(blockers_all, preferred_x=center_x)
@@ -785,127 +619,123 @@ while True:
         scale = max(1, w_combined - 1)
         encoder_px = int(round(encoder_norm * scale))
         encoder_px = int(clamp(encoder_px, 0, w_combined - 1))
-        if enable_visualization and combined is not None:
-            cv2.line(
-                combined,
-                (encoder_px, 0),
-                (encoder_px, h_combined),
-                (0, 255, 255),
-                1,
-            )
-
-    update_motor_control(draw_x, encoder_px, dt, motor_period_ns, obstacle_in_pull_zone)
-
-
-
-
-
-    if enable_visualization and combined is not None:
-        # Draw the guidance circle
-        blue_pos = (draw_x, line_y)
-        cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
-
-        # Display "Steer Control" on the left frame
-        cv2.putText(
-            combined,
-            f"Steer Control: {steer_control_x}",
-            hud_text_position,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            cv2.LINE_AA
-        )
-
-        encoder_text = "Encoder: --"
-        if encoder_px is not None:
-            encoder_text = f"Encoder: {encoder_px} px"
-        elif sim_encoder_enabled:
-            encoder_text = "Encoder: simulated"
-        cv2.putText(
-            combined,
-            encoder_text,
-            (hud_text_position[0], hud_text_position[1] + 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            cv2.LINE_AA
-        )
-
-        motor_text = f"Motor duty: {current_motor_duty_pct:.1f}%"
-        cv2.putText(
-            combined,
-            motor_text,
-            (hud_text_position[0], hud_text_position[1] + 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            cv2.LINE_AA
-        )
-
-        # Visualize the pull zone boundaries (blue vertical lines)
         cv2.line(
             combined,
-            (int(zone_left), 0),
-            (int(zone_left), h_combined),
-            pull_zone_line_color,
-            pull_zone_line_thickness,
+            (encoder_px, 0),
+            (encoder_px, h_combined),
+            (0, 255, 255),
+            1,
         )
+
+    update_motor_control(draw_x, encoder_px, dt, motor_period_ns)
+
+
+
+
+
+    # Draw the guidance circle
+    blue_pos = (draw_x, line_y)
+    cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
+
+    # Display "Steer Control" on the left frame
+    cv2.putText(
+        combined,
+        f"Steer Control: {steer_control_x}",
+        hud_text_position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA
+    )
+
+    encoder_text = "Encoder: --"
+    if encoder_px is not None:
+        encoder_text = f"Encoder: {encoder_px} px"
+    elif sim_encoder_enabled:
+        encoder_text = "Encoder: simulated"
+    cv2.putText(
+        combined,
+        encoder_text,
+        (hud_text_position[0], hud_text_position[1] + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA
+    )
+
+    motor_text = f"Motor duty: {current_motor_duty_pct:.1f}%"
+    cv2.putText(
+        combined,
+        motor_text,
+        (hud_text_position[0], hud_text_position[1] + 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA
+    )
+
+    # Visualize the pull zone boundaries (blue vertical lines)
+    cv2.line(
+        combined,
+        (int(zone_left), 0),
+        (int(zone_left), h_combined),
+        pull_zone_line_color,
+        pull_zone_line_thickness,
+    )
+    cv2.line(
+        combined,
+        (int(zone_right), 0),
+        (int(zone_right), h_combined),
+        pull_zone_line_color,
+        pull_zone_line_thickness,
+    )
+    # ────────────────────────────────────────────────────────────────────
+
+    if sim_encoder_enabled:
+        slider_left = 20
+        slider_right = w_combined - 20
+        slider_y = h_combined - 30
         cv2.line(
             combined,
-            (int(zone_right), 0),
-            (int(zone_right), h_combined),
-            pull_zone_line_color,
-            pull_zone_line_thickness,
+            (slider_left, slider_y),
+            (slider_right, slider_y),
+            (200, 200, 200),
+            2,
         )
-        # ────────────────────────────────────────────────────────────────────
+        slider_x = int(round(slider_left + sim_encoder_norm * (slider_right - slider_left)))
+        cv2.circle(combined, (slider_x, slider_y), 8, (0, 200, 255), -1)
+        cv2.putText(
+            combined,
+            "Sim encoder: arrow keys to jog, 's' to exit",
+            (20, h_combined - 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
-        if sim_encoder_enabled:
-            slider_left = 20
-            slider_right = w_combined - 20
-            slider_y = h_combined - 30
-            cv2.line(
-                combined,
-                (slider_left, slider_y),
-                (slider_right, slider_y),
-                (200, 200, 200),
-                2,
-            )
-            slider_x = int(round(slider_left + sim_encoder_norm * (slider_right - slider_left)))
-            cv2.circle(combined, (slider_x, slider_y), 8, (0, 200, 255), -1)
-            cv2.putText(
-                combined,
-                "Sim encoder: arrow keys to jog, 's' to exit",
-                (20, h_combined - 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+    message_to_show = calibration_status_text
+    if not message_to_show and encoder_span() is None:
+        message_to_show = "Press 'c' to calibrate steering range"
+    if message_to_show:
+        cv2.putText(
+            combined,
+            message_to_show,
+            (20, h_combined - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
 
-        message_to_show = calibration_status_text
-        if not message_to_show and encoder_span() is None:
-            message_to_show = "Press 'c' to calibrate steering range"
-        if message_to_show:
-            cv2.putText(
-                combined,
-                message_to_show,
-                (20, h_combined - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-
-        # Present the final annotated view
-        cv2.imshow("Depth: Camera 0 | Camera 1", combined)
-        key = cv2.waitKey(1) & 0xFF
-    else:
-        key = -1
+    # Present the final annotated view
+    cv2.imshow("Depth: Camera 0 | Camera 1", combined)
+    key = cv2.waitKey(1) & 0xFF
 
     # Handle keys — currently only ESC to exit
     if key == 27:
@@ -939,8 +769,6 @@ cap1.release()
 cv2.destroyAllWindows()
 shutdown_motor_outputs()
 shutdown_encoder()
-shutdown_motor_activity_gpio()
-shutdown_direction_gpio()
 
 
 
