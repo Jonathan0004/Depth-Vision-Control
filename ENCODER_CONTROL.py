@@ -6,16 +6,12 @@ bands, and visualises a blue steering cue that points toward the widest gap.
 All tunable parameters live together for quick iteration.
 """
 
-import errno
 import json
-import os
 import queue
-import time
 from pathlib import Path
 from threading import Thread
 
 import cv2
-import Jetson.GPIO as GPIO
 import numpy as np
 import torch
 from PIL import Image
@@ -73,38 +69,9 @@ hud_text_color = (255, 255, 255)
 hud_text_scale = 0.54
 hud_text_thickness = 1
 
-# Motor control configuration
-motor_pin_left = 29        # physical pin for left turn enable
-motor_pin_right = 31       # physical pin for right turn enable
-
-# Motor dynamics — duty cycle ramps linearly with steering error
-motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
-motor_full_speed_error_px = 200    # error (px) required to request max duty
-
-# PWM configuration (pin 32 routed via pwmchip sysfs)
-pwm_frequency_hz = 8000
-pwm_channels = [
-    {
-        "name": "motor",
-        "chip_path": "/sys/class/pwm/pwmchip3",
-        "channel": 0,
-        "frequency_hz": pwm_frequency_hz,
-        "required": True,
-    },
-    {
-        "name": "aux",
-        "chip_path": "/sys/class/pwm/pwmchip3",
-        "channel": 1,
-        "frequency_hz": pwm_frequency_hz,
-        "required": False,
-    },
-]
-motor_pwm_name = "motor"
-
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
-encoder_deadband_px = 5          # stop when within this many screen pixels of target
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.01        # arrow-key increment when in simulated encoder mode
 
@@ -127,195 +94,6 @@ _sample_grid_cache = {}
 # Utility: clamp values between two bounds (used to keep overlays on-screen)
 def clamp(val, minn, maxn):
     return max(min(val, maxn), minn)
-
-
-# ---------------------------------------------------------------------------
-# Motor + PWM helpers
-# ---------------------------------------------------------------------------
-
-def _ensure_root():
-    if os.geteuid() != 0:
-        raise SystemExit(
-            "ERROR: PWM access requires root privileges. Re-run with sudo or as root."
-        )
-
-
-def _pwm_wr(path, val, *, ignore_errors=()):
-    try:
-        with open(os.fspath(path), "w") as f:
-            f.write(str(val))
-    except OSError as e:
-        if e.errno in ignore_errors:
-            return
-        if e.errno in (errno.EPERM, errno.EACCES):
-            raise SystemExit(
-                f"ERROR: Permission denied writing to {path}. "
-                "Run the script with sudo or adjust permissions."
-            ) from e
-        raise RuntimeError(f"Failed to write '{val}' to {path}: {e.strerror}") from e
-
-
-def _pwm_ns_period(freq_hz):
-    return int(round(1e9 / float(freq_hz)))
-
-
-def _pwm_ns_duty(period_ns, pct):
-    pct = max(0.0, min(100.0, float(pct)))
-    return int(period_ns * (pct / 100.0))
-
-
-pwm_runtime = {}
-motor_pwm_state = None
-
-
-def _normalise_pwm_config(cfg):
-    chip_path = Path(cfg["chip_path"])
-    channel = cfg["channel"]
-    if isinstance(channel, str):
-        channel = channel.strip()
-        if channel.startswith("pwm"):
-            channel = channel[3:]
-        channel = int(channel)
-    channel = int(channel)
-    frequency_hz = int(cfg.get("frequency_hz", pwm_frequency_hz))
-    required = bool(cfg.get("required", True))
-    return chip_path, channel, frequency_hz, required
-
-
-def _configure_pwm_channel(name, cfg):
-    chip_path, channel_idx, freq_hz, required = _normalise_pwm_config(cfg)
-    channel_name = f"pwm{channel_idx}"
-    channel_dir = chip_path / channel_name
-
-    if not chip_path.is_dir():
-        raise FileNotFoundError(
-            f"PWM chip directory {chip_path} for '{name}' does not exist."
-        )
-
-    if not channel_dir.is_dir():
-        export_path = chip_path / "export"
-        _pwm_wr(export_path, channel_idx, ignore_errors=(errno.EBUSY, errno.EINVAL))
-        for _ in range(200):
-            if channel_dir.is_dir():
-                break
-            time.sleep(0.01)
-        else:
-            raise TimeoutError(
-                f"PWM channel '{name}' at {channel_dir} did not appear after export."
-            )
-
-    required_nodes = ["enable", "period", "duty_cycle"]
-    missing = [n for n in required_nodes if not (channel_dir / n).exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"PWM channel '{name}' is missing sysfs nodes {missing} under {channel_dir}."
-        )
-
-    enable_path = channel_dir / "enable"
-    period_path = channel_dir / "period"
-    duty_path = channel_dir / "duty_cycle"
-
-    try:
-        _pwm_wr(enable_path, 0, ignore_errors=(errno.EINVAL,))
-    except RuntimeError:
-        pass
-
-    period_ns = _pwm_ns_period(freq_hz)
-    try:
-        _pwm_wr(period_path, period_ns)
-        _pwm_wr(duty_path, 0)
-        _pwm_wr(enable_path, 1)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to program PWM '{name}' at {channel_dir}: {exc}"
-        ) from exc
-
-    return {
-        "name": name,
-        "channel": channel_name,
-        "chip_path": chip_path,
-        "frequency_hz": freq_hz,
-        "period_ns": period_ns,
-        "paths": {
-            "base": channel_dir,
-            "enable": enable_path,
-            "period": period_path,
-            "duty_cycle": duty_path,
-        },
-        "required": required,
-    }
-
-
-def initialise_motor_outputs():
-    global pwm_runtime, motor_pwm_state
-
-    _ensure_root()
-
-    GPIO.setmode(GPIO.BOARD)
-    GPIO.setwarnings(False)
-    GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
-
-    pwm_runtime = {}
-    for cfg in pwm_channels:
-        name = cfg["name"]
-        try:
-            state = _configure_pwm_channel(name, cfg)
-        except SystemExit:
-            raise
-        except Exception as exc:
-            if cfg.get("required", True):
-                raise RuntimeError(f"Failed to initialise PWM '{name}': {exc}") from exc
-            print(f"Warning: skipping optional PWM '{name}': {exc}")
-            continue
-        pwm_runtime[name] = state
-
-    if motor_pwm_name not in pwm_runtime:
-        raise RuntimeError(
-            f"PWM channel '{motor_pwm_name}' is required for motor control but was not initialised."
-        )
-
-    motor_pwm_state = pwm_runtime[motor_pwm_name]
-    return motor_pwm_state["period_ns"]
-
-
-def _apply_motor_output(direction, duty_pct, period_ns):
-    duty_pct = max(0.0, min(100.0, duty_pct))
-
-    if direction > 0:
-        GPIO.output(motor_pin_right, GPIO.HIGH)
-        GPIO.output(motor_pin_left, GPIO.LOW)
-    elif direction < 0:
-        GPIO.output(motor_pin_right, GPIO.LOW)
-        GPIO.output(motor_pin_left, GPIO.HIGH)
-    else:
-        GPIO.output(motor_pin_right, GPIO.LOW)
-        GPIO.output(motor_pin_left, GPIO.LOW)
-
-    if motor_pwm_state is None:
-        raise RuntimeError("Motor PWM channel has not been initialised.")
-
-    channel_period_ns = motor_pwm_state["period_ns"]
-    if period_ns != channel_period_ns:
-        period_ns = channel_period_ns
-
-    duty_ns = _pwm_ns_duty(period_ns, duty_pct if direction != 0 else 0.0)
-    _pwm_wr(motor_pwm_state["paths"]["duty_cycle"], duty_ns)
-
-
-def shutdown_motor_outputs():
-    global pwm_runtime, motor_pwm_state
-    try:
-        for state in pwm_runtime.values():
-            try:
-                _pwm_wr(state["paths"]["duty_cycle"], 0)
-                _pwm_wr(state["paths"]["enable"], 0)
-            except RuntimeError:
-                pass
-    finally:
-        motor_pwm_state = None
-        pwm_runtime.clear()
-        GPIO.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -408,11 +186,8 @@ def encoder_raw_to_norm(raw):
 
 
 # ---------------------------------------------------------------------------
-# Runtime steering state (encoder + simulation + motor ramp)
+# Runtime steering state (encoder + simulation)
 # ---------------------------------------------------------------------------
-
-current_motor_direction = 0
-current_motor_duty_pct = 0.0
 
 sim_encoder_enabled = False
 sim_encoder_norm = 0.5
@@ -440,34 +215,6 @@ def get_encoder_norm():
     norm = encoder_raw_to_norm(raw)
     latest_encoder_norm = norm
     return norm
-
-
-def update_motor_control(target_px, actual_px, _dt, period_ns):
-    global current_motor_direction, current_motor_duty_pct
-
-    if calibration_active:
-        current_motor_direction = 0
-        current_motor_duty_pct = 0.0
-        _apply_motor_output(0, 0.0, period_ns)
-        return
-
-    desired_direction = 0
-    desired_duty_pct = 0.0
-
-    if actual_px is not None and target_px is not None:
-        error_px = target_px - actual_px
-        abs_error = abs(error_px)
-        if abs_error > encoder_deadband_px:
-            desired_direction = 1 if error_px > 0 else -1
-            span = max(1.0, motor_full_speed_error_px - encoder_deadband_px)
-            ratio = (abs_error - encoder_deadband_px) / span
-            ratio = clamp(ratio, 0.0, 1.0)
-            desired_duty_pct = clamp(motor_max_duty_pct * ratio, 0.0, motor_max_duty_pct)
-
-    current_motor_direction = desired_direction
-    current_motor_duty_pct = desired_duty_pct if desired_direction != 0 else 0.0
-
-    _apply_motor_output(current_motor_direction, current_motor_duty_pct, period_ns)
 
 
 def start_calibration():
@@ -595,11 +342,8 @@ def infer():
 
 Thread(target=infer, daemon=True).start()
 
-# Initialise motor outputs and PWM once
-motor_period_ns = initialise_motor_outputs()
 load_calibration()
 initialise_encoder()
-last_loop_time = time.perf_counter()
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -609,10 +353,6 @@ while True:
         frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
     except queue.Empty:
         continue
-
-    now = time.perf_counter()
-    dt = max(1e-4, now - last_loop_time)
-    last_loop_time = now
 
     # Build a sparse point cloud by sampling each depth map on a coarse grid
     h0, w0 = depth0.shape
@@ -755,12 +495,6 @@ while True:
             1,
         )
 
-    update_motor_control(draw_x, encoder_px, dt, motor_period_ns)
-
-
-
-
-
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
     cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
@@ -786,18 +520,6 @@ while True:
         combined,
         encoder_text,
         (hud_text_position[0], hud_text_position[1] + 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        cv2.LINE_AA
-    )
-
-    motor_text = f"Motor duty: {current_motor_duty_pct:.1f}%"
-    cv2.putText(
-        combined,
-        motor_text,
-        (hud_text_position[0], hud_text_position[1] + 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         hud_text_scale,
         hud_text_color,
@@ -895,7 +617,6 @@ running = False
 cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
-shutdown_motor_outputs()
 shutdown_encoder()
 
 
