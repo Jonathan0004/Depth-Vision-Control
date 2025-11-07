@@ -8,6 +8,7 @@ All tunable parameters live together for quick iteration.
 
 import json
 import queue
+import time
 from pathlib import Path
 from threading import Thread
 
@@ -16,6 +17,11 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
+
+try:
+    import Jetson.GPIO as GPIO
+except ImportError:  # pragma: no cover - hardware dependency
+    GPIO = None
 
 try:
     from smbus2 import SMBus
@@ -63,6 +69,16 @@ pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left
 # Smoothing factor for the steering cue (1 → frozen, 0 → instant response)
 blue_x_smoothness = 0.7
 
+# Motor tuning (steering → motor drive)
+motor_pwm_chip = "/sys/class/pwm/pwmchip3"
+motor_pwm_channel = 0
+motor_pwm_frequency_hz = 5000
+motor_direction_pin_right = 29    # goes HIGH when steering error > 0 (turn right)
+motor_direction_pin_left = 31     # goes HIGH when steering error < 0 (turn left)
+motor_dead_zone_px = 20           # |error| below this => motor idle (both LOW, PWM off)
+motor_max_duty_pct = 100.0        # absolute cap on PWM duty cycle
+motor_full_speed_error_px = 200   # error (px) required to request max duty
+
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
 hud_text_color = (255, 255, 255)
@@ -85,6 +101,159 @@ steer_control_x = None     # integer pixel location displayed as HUD text
 
 # Cache for sampling grids so expensive mesh computations run once per shape
 _sample_grid_cache = {}
+
+
+# Motor runtime state
+motor_pwm_path = None
+motor_pwm_period_ns = None
+motor_control_available = GPIO is not None
+motor_gpio_configured = False
+motor_pwm_enabled = False
+motor_current_duty_pct = 0.0
+
+
+def _pwm_ns_period(freq_hz: float) -> int:
+    return int(round(1e9 / float(freq_hz))) if freq_hz > 0 else 0
+
+
+def _pwm_wr(path: str, value) -> None:
+    with open(path, "w") as f:
+        f.write(str(value))
+
+
+def _ensure_pwm_channel(chip: str, channel: int) -> str:
+    ch_path = Path(chip) / f"pwm{channel}"
+    if ch_path.is_dir():
+        return str(ch_path)
+    if not Path(chip).is_dir():
+        raise FileNotFoundError(f"PWM chip {chip} not found")
+    _pwm_wr(Path(chip) / "export", channel)
+    for _ in range(200):
+        if ch_path.is_dir():
+            return str(ch_path)
+        time.sleep(0.01)
+    raise TimeoutError(f"Timed out waiting for PWM channel pwm{channel}")
+
+
+def _set_pwm_duty_pct(pct: float) -> None:
+    global motor_current_duty_pct
+    if not motor_pwm_enabled or motor_pwm_period_ns is None or motor_pwm_path is None:
+        return
+    pct = float(clamp(pct, 0.0, motor_max_duty_pct))
+    duty_ns = int(motor_pwm_period_ns * (pct / 100.0))
+    try:
+        _pwm_wr(Path(motor_pwm_path) / "duty_cycle", duty_ns)
+        motor_current_duty_pct = pct
+    except OSError:
+        pass
+
+
+def _enable_pwm_channel() -> None:
+    if motor_pwm_path is None:
+        return
+    try:
+        _pwm_wr(Path(motor_pwm_path) / "enable", 1)
+    except OSError:
+        pass
+
+
+def _disable_pwm_channel() -> None:
+    global motor_pwm_enabled
+    if motor_pwm_path is None:
+        return
+    try:
+        _pwm_wr(Path(motor_pwm_path) / "enable", 0)
+    except OSError:
+        pass
+    motor_pwm_enabled = False
+
+
+def _set_motor_direction(right_high: bool, left_high: bool) -> None:
+    if not motor_gpio_configured or GPIO is None:
+        return
+    if right_high and left_high:
+        left_high = False
+    GPIO.output(motor_direction_pin_right, GPIO.HIGH if right_high else GPIO.LOW)
+    GPIO.output(motor_direction_pin_left, GPIO.HIGH if left_high else GPIO.LOW)
+
+
+def initialise_motor_control():
+    global motor_pwm_path, motor_pwm_period_ns, motor_control_available
+    global motor_gpio_configured, motor_pwm_enabled
+    if GPIO is None:
+        motor_control_available = False
+        return
+    try:
+        GPIO.setmode(GPIO.BOARD)
+    except RuntimeError:
+        pass
+    GPIO.setwarnings(False)
+    try:
+        GPIO.setup(motor_direction_pin_right, GPIO.OUT, initial=GPIO.LOW)
+        GPIO.setup(motor_direction_pin_left, GPIO.OUT, initial=GPIO.LOW)
+    except RuntimeError:
+        motor_control_available = False
+        motor_gpio_configured = False
+        return
+    motor_gpio_configured = True
+
+    if motor_pwm_frequency_hz <= 0:
+        motor_control_available = False
+        return
+
+    try:
+        motor_pwm_path = _ensure_pwm_channel(motor_pwm_chip, motor_pwm_channel)
+    except (FileNotFoundError, TimeoutError, OSError):
+        motor_pwm_path = None
+        motor_control_available = False
+        return
+
+    motor_pwm_period_ns = _pwm_ns_period(motor_pwm_frequency_hz)
+    try:
+        _pwm_wr(Path(motor_pwm_path) / "period", motor_pwm_period_ns)
+        _pwm_wr(Path(motor_pwm_path) / "duty_cycle", 0)
+        _enable_pwm_channel()
+        motor_pwm_enabled = True
+        motor_control_available = True
+    except OSError:
+        motor_pwm_path = None
+        motor_control_available = False
+        motor_pwm_enabled = False
+
+
+def shutdown_motor_control():
+    global motor_gpio_configured
+    _set_motor_direction(False, False)
+    if motor_pwm_enabled:
+        _set_pwm_duty_pct(0.0)
+        _disable_pwm_channel()
+    if motor_gpio_configured and GPIO is not None:
+        try:
+            GPIO.cleanup((motor_direction_pin_right, motor_direction_pin_left))
+        except TypeError:
+            GPIO.cleanup()
+    motor_gpio_configured = False
+
+
+def update_motor_output(steer_error_px: float) -> None:
+    if not motor_control_available:
+        return
+    abs_error = abs(steer_error_px)
+    if abs_error <= motor_dead_zone_px:
+        _set_motor_direction(False, False)
+        _set_pwm_duty_pct(0.0)
+        return
+
+    direction_right = steer_error_px > 0
+    _set_motor_direction(direction_right, not direction_right)
+
+    if motor_full_speed_error_px > 0:
+        scale = clamp(abs_error / motor_full_speed_error_px, 0.0, 1.0)
+    else:
+        scale = 1.0
+    duty_pct = motor_max_duty_pct * scale
+    update_pct = clamp(duty_pct, 0.0, motor_max_duty_pct)
+    _set_pwm_duty_pct(update_pct)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +513,7 @@ Thread(target=infer, daemon=True).start()
 
 load_calibration()
 initialise_encoder()
+initialise_motor_control()
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -481,6 +651,10 @@ while True:
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
 
+    # blue_x already encodes steering smoothness; feed smoothed error to motor
+    steer_error_px = float(blue_x) - float(center_x)
+    update_motor_output(steer_error_px)
+
     encoder_norm = get_encoder_norm()
     encoder_px = None
     if encoder_norm is not None:
@@ -617,6 +791,7 @@ running = False
 cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
+shutdown_motor_control()
 shutdown_encoder()
 
 
