@@ -8,6 +8,7 @@ All tunable parameters live together for quick iteration.
 
 import json
 import queue
+import time
 from pathlib import Path
 from threading import Thread
 
@@ -16,6 +17,11 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
+
+try:  # pragma: no cover - hardware dependency
+    import Jetson.GPIO as GPIO
+except ImportError:  # pragma: no cover - hardware dependency
+    GPIO = None
 
 try:
     from smbus2 import SMBus
@@ -61,7 +67,22 @@ pull_influence_radius_px = 120   # half-width of the pull zone around centre
 pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left)
 
 # Smoothing factor for the steering cue (1 → frozen, 0 → instant response)
+# The smoothing factor also governs how quickly the motor PWM ramps to match the
+# steering target (higher = slower response, lower = snappier).
 blue_x_smoothness = 0.7
+
+# Motor tuning parameters
+motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
+motor_full_speed_error_px = 200     # error (px) required to request max duty
+motor_dead_zone_px = 5              # +/- range in which motor output is disabled
+
+# Motor hardware configuration (Jetson Nano)
+motor_pwm_chip = "/sys/class/pwm/pwmchip3"
+motor_pwm_channel = 0
+motor_pwm_frequency_hz = 5000
+motor_pwm_pin = 32                  # informational only (physical pin number)
+motor_pin_right = 29                # encoder needs to move right (positive error)
+motor_pin_left = 31                 # encoder needs to move left (negative error)
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -85,6 +106,45 @@ steer_control_x = None     # integer pixel location displayed as HUD text
 
 # Cache for sampling grids so expensive mesh computations run once per shape
 _sample_grid_cache = {}
+
+
+# ---------------------------------------------------------------------------
+# PWM helpers (mirrors PWM_CONTROL.py logic with graceful fallbacks)
+# ---------------------------------------------------------------------------
+
+def _ns_period(freq_hz: float) -> int:
+    return int(round(1e9 / float(freq_hz)))
+
+
+def _ns_duty_from_pct(period_ns: int, pct: float) -> int:
+    pct = max(0.0, min(100.0, pct))
+    return int(round(period_ns * (pct / 100.0)))
+
+
+def _pwm_channel_path(chip: str, channel: int) -> Path:
+    return Path(chip) / f"pwm{channel}"
+
+
+def _pwm_write(path: Path, value) -> None:
+    with path.open("w") as fh:
+        fh.write(str(value))
+
+
+def _ensure_pwm_channel(chip: str, channel: int) -> Path:
+    ch_path = _pwm_channel_path(chip, channel)
+    if ch_path.is_dir():
+        return ch_path
+    chip_path = Path(chip)
+    if not chip_path.is_dir():
+        raise FileNotFoundError(f"{chip} does not exist. Check PWM availability.")
+    _pwm_write(chip_path / "export", channel)
+    for _ in range(200):
+        if ch_path.is_dir():
+            break
+        time.sleep(0.01)
+    else:  # pragma: no cover - hardware timing issue
+        raise TimeoutError(f"pwm{channel} did not appear after export")
+    return ch_path
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +259,120 @@ calibration_active = False
 calibration_stage = None
 calibration_status_text = ""
 calibration_samples = {}
+
+
+# ---------------------------------------------------------------------------
+# Motor control runtime state
+# ---------------------------------------------------------------------------
+
+motor_pwm_period_ns = _ns_period(motor_pwm_frequency_hz)
+motor_pwm_channel_path = None
+motor_control_available = False
+motor_gpio_initialised = False
+motor_last_duty_ns = None
+
+
+def initialise_motor_control():
+    """Prepare GPIO direction pins and PWM channel for motor drive."""
+    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns
+
+    motor_control_available = False
+    if GPIO is None:
+        return
+
+    try:
+        if not motor_gpio_initialised:
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
+            GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
+            motor_gpio_initialised = True
+    except RuntimeError:
+        return
+
+    try:
+        motor_pwm_channel_path = _ensure_pwm_channel(motor_pwm_chip, motor_pwm_channel)
+        _pwm_write(motor_pwm_channel_path / "enable", 0)
+        _pwm_write(motor_pwm_channel_path / "period", motor_pwm_period_ns)
+        _pwm_write(motor_pwm_channel_path / "duty_cycle", 0)
+        _pwm_write(motor_pwm_channel_path / "enable", 1)
+        motor_last_duty_ns = 0
+        motor_control_available = True
+    except (OSError, FileNotFoundError, TimeoutError):  # pragma: no cover - hardware dependency
+        motor_pwm_channel_path = None
+        motor_control_available = False
+
+
+def _set_motor_direction(error: float) -> None:
+    """Update GPIO direction pins based on the steering error."""
+    if GPIO is None or not motor_gpio_initialised:
+        return
+    GPIO.output(motor_pin_right, GPIO.LOW)
+    GPIO.output(motor_pin_left, GPIO.LOW)
+    if error > 0:
+        GPIO.output(motor_pin_right, GPIO.HIGH)
+    elif error < 0:
+        GPIO.output(motor_pin_left, GPIO.HIGH)
+
+
+def _set_motor_pwm_pct(pct: float) -> None:
+    """Write the requested PWM duty cycle percentage to sysfs."""
+    global motor_last_duty_ns
+    if not motor_control_available or motor_pwm_channel_path is None:
+        return
+    duty_ns = _ns_duty_from_pct(motor_pwm_period_ns, pct)
+    if motor_last_duty_ns == duty_ns:
+        return
+    try:
+        _pwm_write(motor_pwm_channel_path / "duty_cycle", duty_ns)
+        motor_last_duty_ns = duty_ns
+    except OSError:  # pragma: no cover - hardware dependency
+        pass
+
+
+def update_motor_control(steer_target_px, encoder_px):
+    """Drive the motor to align the encoder with the steering target."""
+    if steer_target_px is None or encoder_px is None:
+        _set_motor_direction(0)
+        _set_motor_pwm_pct(0.0)
+        return
+
+    error = float(steer_target_px) - float(encoder_px)
+    if abs(error) <= motor_dead_zone_px:
+        _set_motor_direction(0)
+        _set_motor_pwm_pct(0.0)
+        return
+
+    _set_motor_direction(error)
+    denom = float(motor_full_speed_error_px) if motor_full_speed_error_px > 0 else 1.0
+    scaled_pct = (abs(error) / denom) * motor_max_duty_pct
+    duty_pct = max(0.0, min(motor_max_duty_pct, scaled_pct))
+    _set_motor_pwm_pct(duty_pct)
+
+
+def shutdown_motor_control():
+    """Return the motor hardware to a safe idle state."""
+    global motor_control_available, motor_pwm_channel_path, motor_last_duty_ns, motor_gpio_initialised
+
+    _set_motor_direction(0)
+    _set_motor_pwm_pct(0.0)
+
+    if motor_control_available and motor_pwm_channel_path is not None:
+        try:
+            _pwm_write(motor_pwm_channel_path / "enable", 0)
+        except OSError:  # pragma: no cover - hardware dependency
+            pass
+
+    motor_control_available = False
+    motor_pwm_channel_path = None
+    motor_last_duty_ns = None
+
+    if GPIO is not None and motor_gpio_initialised:
+        try:
+            GPIO.cleanup([motor_pin_right, motor_pin_left])
+        except RuntimeError:  # pragma: no cover - hardware dependency
+            pass
+        motor_gpio_initialised = False
 
 
 def get_encoder_norm():
@@ -344,6 +518,7 @@ Thread(target=infer, daemon=True).start()
 
 load_calibration()
 initialise_encoder()
+initialise_motor_control()
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -495,6 +670,8 @@ while True:
             1,
         )
 
+    update_motor_control(blue_x if blue_x is not None else None, encoder_px)
+
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
     cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
@@ -618,6 +795,7 @@ cap0.release()
 cap1.release()
 cv2.destroyAllWindows()
 shutdown_encoder()
+shutdown_motor_control()
 
 
 
