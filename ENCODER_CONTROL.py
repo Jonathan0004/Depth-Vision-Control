@@ -81,8 +81,7 @@ motor_pwm_chip = "/sys/class/pwm/pwmchip3"
 motor_pwm_channel = 0
 motor_pwm_frequency_hz = 5000
 motor_pwm_pin = 32                  # informational only (physical pin number)
-motor_pin_right = 29                # encoder needs to move right (positive error)
-motor_pin_left = 31                 # encoder needs to move left (negative error)
+motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -284,8 +283,7 @@ def initialise_motor_control():
         if not motor_gpio_initialised:
             GPIO.setmode(GPIO.BOARD)
             GPIO.setwarnings(False)
-            GPIO.setup(motor_pin_right, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(motor_pin_left, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(motor_direction_pin, GPIO.OUT, initial=GPIO.LOW)
             motor_gpio_initialised = True
     except RuntimeError:
         return
@@ -304,15 +302,10 @@ def initialise_motor_control():
 
 
 def _set_motor_direction(error: float) -> None:
-    """Update GPIO direction pins based on the steering error."""
+    """Update the GPIO direction pin based on the steering error."""
     if GPIO is None or not motor_gpio_initialised:
         return
-    GPIO.output(motor_pin_right, GPIO.LOW)
-    GPIO.output(motor_pin_left, GPIO.LOW)
-    if error > 0:
-        GPIO.output(motor_pin_right, GPIO.HIGH)
-    elif error < 0:
-        GPIO.output(motor_pin_left, GPIO.HIGH)
+    GPIO.output(motor_direction_pin, GPIO.HIGH if error > 0 else GPIO.LOW)
 
 
 def _set_motor_pwm_pct(pct: float) -> None:
@@ -369,7 +362,7 @@ def shutdown_motor_control():
 
     if GPIO is not None and motor_gpio_initialised:
         try:
-            GPIO.cleanup([motor_pin_right, motor_pin_left])
+            GPIO.cleanup([motor_direction_pin])
         except RuntimeError:  # pragma: no cover - hardware dependency
             pass
         motor_gpio_initialised = False
