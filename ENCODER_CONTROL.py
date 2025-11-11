@@ -325,6 +325,11 @@ def _set_motor_pwm_pct(pct: float) -> None:
 
 def update_motor_control(steer_target_px, encoder_px):
     """Drive the motor to align the encoder with the steering target."""
+    if calibration_active:
+        _set_motor_direction(0)
+        _set_motor_pwm_pct(0.0)
+        return
+
     if steer_target_px is None or encoder_px is None:
         _set_motor_direction(0)
         _set_motor_pwm_pct(0.0)
