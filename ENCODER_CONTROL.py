@@ -269,11 +269,12 @@ motor_pwm_channel_path = None
 motor_control_available = False
 motor_gpio_initialised = False
 motor_last_duty_ns = None
+motor_pwm_enabled = False
 
 
 def initialise_motor_control():
     """Prepare GPIO direction pins and PWM channel for motor drive."""
-    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns
+    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns, motor_pwm_enabled
 
     motor_control_available = False
     if GPIO is None:
@@ -295,6 +296,7 @@ def initialise_motor_control():
         _pwm_write(motor_pwm_channel_path / "duty_cycle", 0)
         _pwm_write(motor_pwm_channel_path / "enable", 1)
         motor_last_duty_ns = 0
+        motor_pwm_enabled = True
         motor_control_available = True
     except (OSError, FileNotFoundError, TimeoutError):  # pragma: no cover - hardware dependency
         motor_pwm_channel_path = None
@@ -311,7 +313,11 @@ def _set_motor_direction(error: float) -> None:
 def _set_motor_pwm_pct(pct: float) -> None:
     """Write the requested PWM duty cycle percentage to sysfs."""
     global motor_last_duty_ns
-    if not motor_control_available or motor_pwm_channel_path is None:
+    if (
+        not motor_control_available
+        or motor_pwm_channel_path is None
+        or not motor_pwm_enabled
+    ):
         return
     duty_ns = _ns_duty_from_pct(motor_pwm_period_ns, pct)
     if motor_last_duty_ns == duty_ns:
@@ -321,6 +327,34 @@ def _set_motor_pwm_pct(pct: float) -> None:
         motor_last_duty_ns = duty_ns
     except OSError:  # pragma: no cover - hardware dependency
         pass
+
+
+def disable_motor_pwm() -> None:
+    """Temporarily disable PWM output while keeping the channel exported."""
+    global motor_pwm_enabled, motor_last_duty_ns
+    if not motor_control_available or motor_pwm_channel_path is None:
+        return
+    _set_motor_pwm_pct(0.0)
+    try:
+        _pwm_write(motor_pwm_channel_path / "enable", 0)
+    except OSError:  # pragma: no cover - hardware dependency
+        return
+    motor_last_duty_ns = 0
+    motor_pwm_enabled = False
+
+
+def enable_motor_pwm() -> None:
+    """Re-enable PWM output after a temporary disable."""
+    global motor_pwm_enabled, motor_last_duty_ns
+    if not motor_control_available or motor_pwm_channel_path is None:
+        return
+    try:
+        _pwm_write(motor_pwm_channel_path / "duty_cycle", 0)
+        _pwm_write(motor_pwm_channel_path / "enable", 1)
+    except OSError:  # pragma: no cover - hardware dependency
+        return
+    motor_last_duty_ns = 0
+    motor_pwm_enabled = True
 
 
 def update_motor_control(steer_target_px, encoder_px):
@@ -345,7 +379,7 @@ def update_motor_control(steer_target_px, encoder_px):
 
 def shutdown_motor_control():
     """Return the motor hardware to a safe idle state."""
-    global motor_control_available, motor_pwm_channel_path, motor_last_duty_ns, motor_gpio_initialised
+    global motor_control_available, motor_pwm_channel_path, motor_last_duty_ns, motor_gpio_initialised, motor_pwm_enabled
 
     _set_motor_direction(0)
     _set_motor_pwm_pct(0.0)
@@ -359,6 +393,7 @@ def shutdown_motor_control():
     motor_control_available = False
     motor_pwm_channel_path = None
     motor_last_duty_ns = None
+    motor_pwm_enabled = False
 
     if GPIO is not None and motor_gpio_initialised:
         try:
@@ -391,6 +426,7 @@ def start_calibration():
         calibration_active = False
         calibration_stage = None
         return
+    disable_motor_pwm()
     calibration_active = True
     calibration_stage = "min"
     calibration_samples = {}
@@ -403,12 +439,14 @@ def capture_calibration_point():
         calibration_status_text = "Calibration failed: encoder interface unavailable"
         calibration_active = False
         calibration_stage = None
+        enable_motor_pwm()
         return
     raw = read_encoder_raw()
     if raw is None:
         calibration_status_text = "Calibration failed: unable to read encoder"
         calibration_active = False
         calibration_stage = None
+        enable_motor_pwm()
         return
     if calibration_stage == "min":
         calibration_samples["min"] = raw
@@ -425,6 +463,7 @@ def capture_calibration_point():
             calibration_status_text = "Calibration saved"
         calibration_active = False
         calibration_stage = None
+        enable_motor_pwm()
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
