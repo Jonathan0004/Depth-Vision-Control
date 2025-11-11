@@ -82,7 +82,6 @@ motor_pwm_channel = 0
 motor_pwm_frequency_hz = 5000
 motor_pwm_pin = 32                  # informational only (physical pin number)
 motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
-motor_hold_high_pin = 31            # kept HIGH to enable the motor driver (None to disable)
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -269,13 +268,12 @@ motor_pwm_period_ns = _ns_period(motor_pwm_frequency_hz)
 motor_pwm_channel_path = None
 motor_control_available = False
 motor_gpio_initialised = False
-motor_gpio_pins = []
 motor_last_duty_ns = None
 
 
 def initialise_motor_control():
     """Prepare GPIO direction pins and PWM channel for motor drive."""
-    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns, motor_gpio_pins
+    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns
 
     motor_control_available = False
     if GPIO is None:
@@ -285,12 +283,7 @@ def initialise_motor_control():
         if not motor_gpio_initialised:
             GPIO.setmode(GPIO.BOARD)
             GPIO.setwarnings(False)
-            configured_pins = [motor_direction_pin]
             GPIO.setup(motor_direction_pin, GPIO.OUT, initial=GPIO.LOW)
-            if motor_hold_high_pin is not None:
-                GPIO.setup(motor_hold_high_pin, GPIO.OUT, initial=GPIO.HIGH)
-                configured_pins.append(motor_hold_high_pin)
-            motor_gpio_pins = configured_pins
             motor_gpio_initialised = True
     except RuntimeError:
         return
@@ -332,11 +325,6 @@ def _set_motor_pwm_pct(pct: float) -> None:
 
 def update_motor_control(steer_target_px, encoder_px):
     """Drive the motor to align the encoder with the steering target."""
-    if calibration_active:
-        _set_motor_direction(0)
-        _set_motor_pwm_pct(0.0)
-        return
-
     if steer_target_px is None or encoder_px is None:
         _set_motor_direction(0)
         _set_motor_pwm_pct(0.0)
@@ -373,17 +361,11 @@ def shutdown_motor_control():
     motor_last_duty_ns = None
 
     if GPIO is not None and motor_gpio_initialised:
-        if motor_hold_high_pin is not None:
-            try:
-                GPIO.output(motor_hold_high_pin, GPIO.LOW)
-            except RuntimeError:  # pragma: no cover - hardware dependency
-                pass
         try:
-            GPIO.cleanup(motor_gpio_pins or [motor_direction_pin])
+            GPIO.cleanup([motor_direction_pin])
         except RuntimeError:  # pragma: no cover - hardware dependency
             pass
         motor_gpio_initialised = False
-        motor_gpio_pins = []
 
 
 def get_encoder_norm():
@@ -409,8 +391,6 @@ def start_calibration():
         calibration_active = False
         calibration_stage = None
         return
-    _set_motor_direction(0)
-    _set_motor_pwm_pct(0.0)
     calibration_active = True
     calibration_stage = "min"
     calibration_samples = {}
