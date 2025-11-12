@@ -359,11 +359,6 @@ def enable_motor_pwm() -> None:
 
 def update_motor_control(steer_target_px, encoder_px):
     """Drive the motor to align the encoder with the steering target."""
-    if calibration_active:
-        _set_motor_direction(0)
-        _set_motor_pwm_pct(0.0)
-        return
-
     if steer_target_px is None or encoder_px is None:
         _set_motor_direction(0)
         _set_motor_pwm_pct(0.0)
@@ -444,12 +439,14 @@ def capture_calibration_point():
         calibration_status_text = "Calibration failed: encoder interface unavailable"
         calibration_active = False
         calibration_stage = None
+        enable_motor_pwm()
         return
     raw = read_encoder_raw()
     if raw is None:
         calibration_status_text = "Calibration failed: unable to read encoder"
         calibration_active = False
         calibration_stage = None
+        enable_motor_pwm()
         return
     if calibration_stage == "min":
         calibration_samples["min"] = raw
@@ -464,9 +461,9 @@ def capture_calibration_point():
         else:
             save_calibration(min_raw, max_raw)
             calibration_status_text = "Calibration saved"
-            enable_motor_pwm()
         calibration_active = False
         calibration_stage = None
+        enable_motor_pwm()
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
