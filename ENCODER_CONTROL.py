@@ -1,11 +1,3 @@
-"""Stereo depth estimation with obstacle detection and steering guidance.
-
-The script streams from two cameras, infers depth using the
-``depth-anything`` model, highlights obstacles inside configurable cutoff
-bands, and visualises a blue steering cue that points toward the widest gap.
-All tunable parameters live together for quick iteration.
-"""
-
 import json
 import queue
 import time
@@ -17,6 +9,18 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import pipeline
+
+import subprocess
+import sys
+import os
+
+
+
+# Run INITIALIZE_PWM.py first
+script_path = os.path.join(os.path.dirname(__file__), "INITIALIZE_PWM.py")
+subprocess.run([sys.executable, script_path])
+
+
 
 try:  # pragma: no cover - hardware dependency
     import Jetson.GPIO as GPIO
