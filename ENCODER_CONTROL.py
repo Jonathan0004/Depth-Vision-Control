@@ -77,12 +77,20 @@ motor_full_speed_error_px = 200     # error (px) required to request max duty
 motor_dead_zone_px = 5              # +/- range in which motor output is disabled
 
 # Motor hardware configuration (Jetson Nano)
-motor_pwm_chip = "/sys/class/pwm/pwmchip3"
+motor_pwm_primary_chip = "/sys/class/pwm/pwmchip3"
 motor_pwm_channel = 0
 motor_pwm_frequency_hz = 5000
 motor_pwm_pin = 32                  # informational only (physical pin number)
 motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
 motor_power_pin = 23                # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
+
+# Some Jetson images expose the steering PWM on pwmchip2 instead of pwmchip3
+# immediately after a cold boot. Mirror the fallback order from PWM_CONTROL.py so
+# initialising this script first after reboot works reliably.
+motor_pwm_candidates = (
+    {"chip": motor_pwm_primary_chip, "channel": motor_pwm_channel, "pin": motor_pwm_pin},
+    {"chip": "/sys/class/pwm/pwmchip2", "channel": 0, "pin": 33},
+)
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -267,6 +275,7 @@ calibration_samples = {}
 
 motor_pwm_period_ns = _ns_period(motor_pwm_frequency_hz)
 motor_pwm_channel_path = None
+motor_pwm_active_cfg = None
 motor_control_available = False
 motor_gpio_initialised = False
 motor_last_duty_ns = None
@@ -275,7 +284,9 @@ motor_pwm_enabled = False
 
 def initialise_motor_control():
     """Prepare GPIO direction/power pins and PWM channel for motor drive."""
-    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns, motor_pwm_enabled
+    global motor_pwm_channel_path, motor_pwm_active_cfg, motor_control_available, \
+        motor_gpio_initialised, motor_last_duty_ns, motor_pwm_enabled, \
+        motor_pwm_channel, motor_pwm_pin
 
     motor_control_available = False
     if GPIO is None:
@@ -291,18 +302,42 @@ def initialise_motor_control():
     except RuntimeError:
         return
 
-    try:
-        motor_pwm_channel_path = _ensure_pwm_channel(motor_pwm_chip, motor_pwm_channel)
-        _pwm_write(motor_pwm_channel_path / "enable", 0)
-        _pwm_write(motor_pwm_channel_path / "period", motor_pwm_period_ns)
-        _pwm_write(motor_pwm_channel_path / "duty_cycle", 0)
-        _pwm_write(motor_pwm_channel_path / "enable", 1)
-        motor_last_duty_ns = 0
-        motor_pwm_enabled = True
-        motor_control_available = True
-    except (OSError, FileNotFoundError, TimeoutError):  # pragma: no cover - hardware dependency
+    chosen_cfg = None
+    chosen_path = None
+    for cfg in motor_pwm_candidates:
+        try:
+            path = _ensure_pwm_channel(cfg["chip"], cfg["channel"])
+        except (OSError, FileNotFoundError, TimeoutError):  # pragma: no cover - hardware dependency
+            continue
+        try:
+            _pwm_write(path / "enable", 0)
+            _pwm_write(path / "period", motor_pwm_period_ns)
+            _pwm_write(path / "duty_cycle", 0)
+            _pwm_write(path / "enable", 1)
+        except OSError:  # pragma: no cover - hardware dependency
+            try:
+                _pwm_write(path / "enable", 0)
+            except OSError:
+                pass
+            continue
+        chosen_cfg = cfg
+        chosen_path = path
+        break
+
+    if chosen_cfg is None or chosen_path is None:
         motor_pwm_channel_path = None
+        motor_pwm_active_cfg = None
         motor_control_available = False
+        motor_pwm_enabled = False
+        return
+
+    motor_pwm_channel_path = chosen_path
+    motor_pwm_active_cfg = chosen_cfg
+    motor_pwm_channel = chosen_cfg["channel"]
+    motor_pwm_pin = chosen_cfg.get("pin", motor_pwm_pin)
+    motor_last_duty_ns = 0
+    motor_pwm_enabled = True
+    motor_control_available = True
 
 
 
@@ -321,7 +356,13 @@ def _set_motor_pwm_pct(pct: float) -> None:
         or motor_pwm_channel_path is None
         or not motor_pwm_enabled
     ):
-        return
+        initialise_motor_control()
+        if (
+            not motor_control_available
+            or motor_pwm_channel_path is None
+            or not motor_pwm_enabled
+        ):
+            return
     duty_ns = _ns_duty_from_pct(motor_pwm_period_ns, pct)
     if motor_last_duty_ns == duty_ns:
         return
@@ -353,6 +394,19 @@ def enable_motor_pwm() -> None:
     """Re-enable PWM output after a temporary disable."""
     global motor_pwm_enabled, motor_last_duty_ns
     if not motor_control_available or motor_pwm_channel_path is None:
+        initialise_motor_control()
+        if not motor_control_available or motor_pwm_channel_path is None:
+            return
+    if not motor_pwm_enabled:
+        try:
+            _pwm_write(motor_pwm_channel_path / "duty_cycle", 0)
+            _pwm_write(motor_pwm_channel_path / "enable", 1)
+        except OSError:  # pragma: no cover - hardware dependency
+            return
+        motor_last_duty_ns = 0
+        motor_pwm_enabled = True
+        if GPIO is not None and motor_gpio_initialised:
+            GPIO.output(motor_power_pin, GPIO.LOW)
         return
     try:
         _pwm_write(motor_pwm_channel_path / "duty_cycle", 0)
@@ -403,7 +457,8 @@ def update_motor_control(steer_target_px, encoder_px):
 
 def shutdown_motor_control():
     """Return the motor hardware to a safe idle state."""
-    global motor_control_available, motor_pwm_channel_path, motor_last_duty_ns, motor_gpio_initialised, motor_pwm_enabled
+    global motor_control_available, motor_pwm_channel_path, motor_pwm_active_cfg, \
+        motor_last_duty_ns, motor_gpio_initialised, motor_pwm_enabled
 
     _set_motor_direction(0)
     _set_motor_pwm_pct(0.0)
@@ -423,6 +478,7 @@ def shutdown_motor_control():
 
     motor_control_available = False
     motor_pwm_channel_path = None
+    motor_pwm_active_cfg = None
     motor_last_duty_ns = None
     motor_pwm_enabled = False
 
