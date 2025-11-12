@@ -346,6 +346,8 @@ def disable_motor_pwm() -> None:
 def enable_motor_pwm() -> None:
     """Re-enable PWM output after a temporary disable."""
     global motor_pwm_enabled, motor_last_duty_ns
+    if calibration_active:
+        return
     if not motor_control_available or motor_pwm_channel_path is None:
         return
     try:
@@ -359,6 +361,11 @@ def enable_motor_pwm() -> None:
 
 def update_motor_control(steer_target_px, encoder_px):
     """Drive the motor to align the encoder with the steering target."""
+    if calibration_active:
+        disable_motor_pwm()
+        _set_motor_direction(0)
+        return
+
     if steer_target_px is None or encoder_px is None:
         _set_motor_direction(0)
         _set_motor_pwm_pct(0.0)
@@ -427,6 +434,7 @@ def start_calibration():
         calibration_stage = None
         return
     disable_motor_pwm()
+    _set_motor_direction(0)
     calibration_active = True
     calibration_stage = "min"
     calibration_samples = {}
