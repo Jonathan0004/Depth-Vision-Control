@@ -290,6 +290,12 @@ def initialise_motor_control():
             GPIO.setup(motor_power_pin, GPIO.OUT, initial=GPIO.LOW)
             motor_power_active = False
             motor_gpio_initialised = True
+        # Ensure the motor driver's enable line (pin 22) is asserted once the
+        # GPIO has been configured.  The PWM duty cycle is still set to 0 below,
+        # so the motor will remain stationary, but keeping the enable pin high
+        # guarantees the motor driver wakes up and can react to subsequent PWM
+        # updates.
+        _set_motor_power(True)
     except RuntimeError:
         return
 
