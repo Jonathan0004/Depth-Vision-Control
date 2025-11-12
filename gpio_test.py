@@ -6,7 +6,7 @@ import time
 GPIO.setmode(GPIO.BOARD)
 
 # Define the pin
-PIN = 29
+PIN = 23
 
 # Set up the pin as an output
 GPIO.setup(PIN, GPIO.OUT)
