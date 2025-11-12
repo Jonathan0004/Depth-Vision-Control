@@ -15,7 +15,7 @@ PWM_OUTPUTS = (
     {"chip": "/sys/class/pwm/pwmchip3", "channel": 0, "pin": 32},
     {"chip": "/sys/class/pwm/pwmchip2", "channel": 0, "pin": 33},
 )
-PIN_HOLD_HIGH = 31      # physical BOARD pin kept high for entire runtime
+PIN_HOLD_HIGH = 23      # physical BOARD pin kept high for entire runtime
 
 FREQ_HZ = 5000          # PWM frequency (e.g., 5000 for 5 kHz)
 TARGET_DUTY_PCT = 40.0   # final duty cycle in percent (e.g., 10.0 for 10%)
