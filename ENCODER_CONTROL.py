@@ -82,7 +82,6 @@ motor_pwm_channel = 0
 motor_pwm_frequency_hz = 5000
 motor_pwm_pin = 32                  # informational only (physical pin number)
 motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
-motor_power_pin = 23                # HIGH = enable motor drive power
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -271,12 +270,11 @@ motor_control_available = False
 motor_gpio_initialised = False
 motor_last_duty_ns = None
 motor_pwm_enabled = False
-motor_power_state = False
 
 
 def initialise_motor_control():
     """Prepare GPIO direction pins and PWM channel for motor drive."""
-    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns, motor_pwm_enabled, motor_power_state
+    global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns, motor_pwm_enabled
 
     motor_control_available = False
     if GPIO is None:
@@ -287,9 +285,7 @@ def initialise_motor_control():
             GPIO.setmode(GPIO.BOARD)
             GPIO.setwarnings(False)
             GPIO.setup(motor_direction_pin, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(motor_power_pin, GPIO.OUT, initial=GPIO.LOW)
             motor_gpio_initialised = True
-            motor_power_state = False
     except RuntimeError:
         return
 
@@ -312,17 +308,6 @@ def _set_motor_direction(error: float) -> None:
     if GPIO is None or not motor_gpio_initialised:
         return
     GPIO.output(motor_direction_pin, GPIO.HIGH if error > 0 else GPIO.LOW)
-
-
-def _set_motor_power(enabled: bool) -> None:
-    """Control the motor power enable GPIO."""
-    global motor_power_state
-    if GPIO is None or not motor_gpio_initialised:
-        return
-    if motor_power_state == enabled:
-        return
-    GPIO.output(motor_power_pin, GPIO.HIGH if enabled else GPIO.LOW)
-    motor_power_state = enabled
 
 
 def _set_motor_pwm_pct(pct: float) -> None:
@@ -350,7 +335,6 @@ def disable_motor_pwm() -> None:
     if not motor_control_available or motor_pwm_channel_path is None:
         return
     _set_motor_pwm_pct(0.0)
-    _set_motor_power(False)
     try:
         _pwm_write(motor_pwm_channel_path / "enable", 0)
     except OSError:  # pragma: no cover - hardware dependency
@@ -375,23 +359,15 @@ def enable_motor_pwm() -> None:
 
 def update_motor_control(steer_target_px, encoder_px):
     """Drive the motor to align the encoder with the steering target."""
-    if calibration_active:
-        _set_motor_direction(0)
-        _set_motor_pwm_pct(0.0)
-        _set_motor_power(False)
-        return
-
     if steer_target_px is None or encoder_px is None:
         _set_motor_direction(0)
         _set_motor_pwm_pct(0.0)
-        _set_motor_power(False)
         return
 
     error = float(steer_target_px) - float(encoder_px)
     if abs(error) <= motor_dead_zone_px:
         _set_motor_direction(0)
         _set_motor_pwm_pct(0.0)
-        _set_motor_power(False)
         return
 
     _set_motor_direction(error)
@@ -399,16 +375,14 @@ def update_motor_control(steer_target_px, encoder_px):
     scaled_pct = (abs(error) / denom) * motor_max_duty_pct
     duty_pct = max(0.0, min(motor_max_duty_pct, scaled_pct))
     _set_motor_pwm_pct(duty_pct)
-    _set_motor_power(duty_pct > 0.0)
 
 
 def shutdown_motor_control():
     """Return the motor hardware to a safe idle state."""
-    global motor_control_available, motor_pwm_channel_path, motor_last_duty_ns, motor_gpio_initialised, motor_pwm_enabled, motor_power_state
+    global motor_control_available, motor_pwm_channel_path, motor_last_duty_ns, motor_gpio_initialised, motor_pwm_enabled
 
     _set_motor_direction(0)
     _set_motor_pwm_pct(0.0)
-    _set_motor_power(False)
 
     if motor_control_available and motor_pwm_channel_path is not None:
         try:
@@ -420,11 +394,10 @@ def shutdown_motor_control():
     motor_pwm_channel_path = None
     motor_last_duty_ns = None
     motor_pwm_enabled = False
-    motor_power_state = False
 
     if GPIO is not None and motor_gpio_initialised:
         try:
-            GPIO.cleanup([motor_direction_pin, motor_power_pin])
+            GPIO.cleanup([motor_direction_pin])
         except RuntimeError:  # pragma: no cover - hardware dependency
             pass
         motor_gpio_initialised = False
