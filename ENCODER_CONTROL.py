@@ -273,6 +273,7 @@ calibration_active = False
 calibration_stage = None
 calibration_status_text = ""
 calibration_samples = {}
+calibration_jog_direction = 0
 
 
 # ---------------------------------------------------------------------------
@@ -488,25 +489,29 @@ def get_encoder_norm():
 
 
 def start_calibration():
-    global calibration_active, calibration_stage, calibration_samples, calibration_status_text
+    global calibration_active, calibration_stage, calibration_samples, calibration_status_text, calibration_jog_direction
     if not encoder_available or encoder_bus is None:
         calibration_status_text = "Cannot start calibration: encoder interface unavailable"
         calibration_active = False
         calibration_stage = None
         return
     disable_motor_pwm()
+    calibration_jog_direction = 0
+    apply_jog_drive(0)
     calibration_active = True
     calibration_stage = "min"
     calibration_samples = {}
-    calibration_status_text = "Calibration: move steering to LEFT limit, press SPACE"
+    calibration_status_text = "Calibration: move LEFT (h/k to jog) then SPACE"
 
 
 def capture_calibration_point():
-    global calibration_active, calibration_stage, calibration_status_text, calibration_samples
+    global calibration_active, calibration_stage, calibration_status_text, calibration_samples, calibration_jog_direction
     if not encoder_available or encoder_bus is None:
         calibration_status_text = "Calibration failed: encoder interface unavailable"
         calibration_active = False
         calibration_stage = None
+        calibration_jog_direction = 0
+        apply_jog_drive(0)
         enable_motor_pwm()
         return
     raw = read_encoder_raw()
@@ -514,12 +519,14 @@ def capture_calibration_point():
         calibration_status_text = "Calibration failed: unable to read encoder"
         calibration_active = False
         calibration_stage = None
+        calibration_jog_direction = 0
+        apply_jog_drive(0)
         enable_motor_pwm()
         return
     if calibration_stage == "min":
         calibration_samples["min"] = raw
         calibration_stage = "max"
-        calibration_status_text = "Calibration: move steering to RIGHT limit, press SPACE"
+        calibration_status_text = "Calibration: move RIGHT (h/k to jog) then SPACE"
     elif calibration_stage == "max":
         calibration_samples["max"] = raw
         min_raw = min(calibration_samples["min"], calibration_samples["max"])
@@ -531,6 +538,8 @@ def capture_calibration_point():
             calibration_status_text = "Calibration saved"
         calibration_active = False
         calibration_stage = None
+        calibration_jog_direction = 0
+        apply_jog_drive(0)
         enable_motor_pwm()
 
 
@@ -775,6 +784,10 @@ while True:
             apply_jog_drive(jog_direction)
         else:
             apply_jog_drive(0)
+    elif calibration_active and calibration_jog_direction != 0:
+        if not motor_pwm_enabled:
+            enable_motor_pwm()
+        apply_jog_drive(calibration_jog_direction)
     else:
         update_motor_control(blue_x if blue_x is not None else None, encoder_px)
 
@@ -907,7 +920,18 @@ while True:
         else:
             calibration_status_text = "Jog mode disabled"
 
-    if jog_mode_enabled and key in (ord('h'), ord('k')):
+    if calibration_active and key in (ord('h'), ord('k')):
+        requested_direction = -1 if key == ord('h') else 1
+        if calibration_jog_direction == requested_direction:
+            calibration_jog_direction = 0
+            apply_jog_drive(0)
+        else:
+            calibration_jog_direction = requested_direction
+            if not motor_pwm_enabled:
+                enable_motor_pwm()
+            apply_jog_drive(calibration_jog_direction)
+
+    elif jog_mode_enabled and key in (ord('h'), ord('k')):
         requested_direction = -1 if key == ord('h') else 1
         if jog_direction == requested_direction:
             jog_direction = 0
