@@ -83,12 +83,16 @@ pull_zone_center_offset_px = 0   # shift pull zone horizontally (+ right, - left
 # steering target (higher = slower response, lower = snappier).
 blue_x_smoothness = 0.7
 
-# Motor tuning parameters
+# Motor tuning parameters ---------------------------------------------------
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
-motor_full_speed_error_px = 50     # error (px) required to request max duty
+motor_full_speed_error_px = 80     # error (px) required to request max duty
+
 motor_dead_zone_px = 5              # +/- range in which motor output is disabled
+
 jog_default_duty_pct = 50.0         # default jog duty percentage when jog mode toggles on
 jog_duty_step_pct = 5.0             # amount to adjust jog duty via arrow keys
+
+# ---------------------------------------------------------------------------
 
 # Motor hardware configuration (Jetson Nano)
 motor_pwm_chip = "/sys/class/pwm/pwmchip3"
