@@ -87,7 +87,7 @@ blue_x_smoothness = 0.7
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 50     # error (px) required to request max duty
 motor_dead_zone_px = 5              # +/- range in which motor output is disabled
-jog_default_duty_pct = 20.0         # default jog duty percentage when jog mode toggles on
+jog_default_duty_pct = 50.0         # default jog duty percentage when jog mode toggles on
 jog_duty_step_pct = 5.0             # amount to adjust jog duty via arrow keys
 
 # Motor hardware configuration (Jetson Nano)
@@ -862,7 +862,7 @@ while True:
         else:
             jog_state = "idle"
         status_messages.append(
-            f"Jog mode ({jog_state}) @ {jog_duty_pct:.0f}% — 'h'/'k' to jog, arrows adjust, 'j' to exit"
+            f"Jog mode ({jog_state}) @ {jog_duty_pct:.0f}% 'h'/'k' to jog"
         )
     message_to_show = " | ".join(status_messages)
     if not message_to_show and encoder_span() is None:
