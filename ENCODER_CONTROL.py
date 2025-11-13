@@ -103,7 +103,7 @@ motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
 motor_power_pin = 23                # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
 
 # Extra steering push (pixels) applied in the commanded direction (+/- from centre)
-divert_boost = 20
+divert_boost = 50
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
