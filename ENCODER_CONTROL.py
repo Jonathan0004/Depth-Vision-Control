@@ -87,6 +87,8 @@ blue_x_smoothness = 0.7
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
 motor_full_speed_error_px = 50     # error (px) required to request max duty
 motor_dead_zone_px = 5              # +/- range in which motor output is disabled
+jog_default_duty_pct = 20.0         # default jog duty percentage when jog mode toggles on
+jog_duty_step_pct = 5.0             # amount to adjust jog duty via arrow keys
 
 # Motor hardware configuration (Jetson Nano)
 motor_pwm_chip = "/sys/class/pwm/pwmchip3"
@@ -283,6 +285,9 @@ motor_control_available = False
 motor_gpio_initialised = False
 motor_last_duty_ns = None
 motor_pwm_enabled = False
+jog_mode_enabled = False
+jog_direction = 0  # -1 left, 0 idle, +1 right
+jog_duty_pct = jog_default_duty_pct
 
 
 def initialise_motor_control():
@@ -411,6 +416,26 @@ def update_motor_control(steer_target_px, encoder_px):
             GPIO.output(motor_power_pin, GPIO.HIGH)  # driving
         else:
             GPIO.output(motor_power_pin, GPIO.LOW)   # idle/off
+
+
+def apply_jog_drive(direction: int) -> None:
+    """Directly drive the steering motor for manual jogging."""
+    if GPIO is not None and motor_gpio_initialised:
+        GPIO.output(motor_power_pin, GPIO.LOW)
+
+    if direction not in (-1, 1):
+        _set_motor_direction(0)
+        _set_motor_pwm_pct(0.0)
+        return
+
+    _set_motor_direction(float(direction))
+    duty = clamp(jog_duty_pct, 0.0, motor_max_duty_pct)
+    _set_motor_pwm_pct(duty)
+    if GPIO is not None and motor_gpio_initialised:
+        if duty > 0.0:
+            GPIO.output(motor_power_pin, GPIO.HIGH)
+        else:
+            GPIO.output(motor_power_pin, GPIO.LOW)
 
 
 def shutdown_motor_control():
@@ -745,7 +770,13 @@ while True:
             1,
         )
 
-    update_motor_control(blue_x if blue_x is not None else None, encoder_px)
+    if jog_mode_enabled:
+        if jog_direction != 0:
+            apply_jog_drive(jog_direction)
+        else:
+            apply_jog_drive(0)
+    else:
+        update_motor_control(blue_x if blue_x is not None else None, encoder_px)
 
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
@@ -820,7 +851,20 @@ while True:
             cv2.LINE_AA,
         )
 
-    message_to_show = calibration_status_text
+    status_messages = []
+    if calibration_status_text:
+        status_messages.append(calibration_status_text)
+    if jog_mode_enabled:
+        if jog_direction < 0:
+            jog_state = "left"
+        elif jog_direction > 0:
+            jog_state = "right"
+        else:
+            jog_state = "idle"
+        status_messages.append(
+            f"Jog mode ({jog_state}) @ {jog_duty_pct:.0f}% — 'h'/'k' to jog, arrows adjust, 'j' to exit"
+        )
+    message_to_show = " | ".join(status_messages)
     if not message_to_show and encoder_span() is None:
         message_to_show = "Press 'c' to calibrate steering range"
     if message_to_show:
@@ -854,9 +898,30 @@ while True:
         else:
             calibration_status_text = "Simulated encoder disabled"
 
+    if key == ord('j'):
+        jog_mode_enabled = not jog_mode_enabled
+        jog_direction = 0
+        apply_jog_drive(0)
+        if jog_mode_enabled:
+            calibration_status_text = "Jog mode enabled"
+        else:
+            calibration_status_text = "Jog mode disabled"
+
+    if jog_mode_enabled and key in (ord('h'), ord('k')):
+        requested_direction = -1 if key == ord('h') else 1
+        if jog_direction == requested_direction:
+            jog_direction = 0
+        else:
+            jog_direction = requested_direction
+        apply_jog_drive(jog_direction)
+
     if sim_encoder_enabled and key in (81, 83):
         delta = -simulated_step_norm if key == 81 else simulated_step_norm
         sim_encoder_norm = clamp(sim_encoder_norm + delta, 0.0, 1.0)
+
+    if jog_mode_enabled and key in (82, 84):
+        delta = jog_duty_step_pct if key == 82 else -jog_duty_step_pct
+        jog_duty_pct = clamp(jog_duty_pct + delta, 0.0, motor_max_duty_pct)
 
     if key == ord('c'):
         start_calibration()
