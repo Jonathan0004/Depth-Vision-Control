@@ -1,3 +1,11 @@
+"""Stereo depth estimation with obstacle detection and steering guidance.
+
+The script streams from two cameras, infers depth using the
+``depth-anything`` model, highlights obstacles inside configurable cutoff
+bands, and visualises a blue steering cue that points toward the widest gap.
+All tunable parameters live together for quick iteration.
+"""
+
 import json
 import queue
 import time
@@ -77,7 +85,7 @@ blue_x_smoothness = 0.7
 
 # Motor tuning parameters
 motor_max_duty_pct = 100.0          # absolute cap on PWM duty cycle
-motor_full_speed_error_px = 200     # error (px) required to request max duty
+motor_full_speed_error_px = 50     # error (px) required to request max duty
 motor_dead_zone_px = 5              # +/- range in which motor output is disabled
 
 # Motor hardware configuration (Jetson Nano)
