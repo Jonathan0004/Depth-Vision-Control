@@ -92,6 +92,9 @@ motor_dead_zone_px = 5              # +/- range in which motor output is disable
 jog_default_duty_pct = 50.0         # default jog duty percentage when jog mode toggles on
 jog_duty_step_pct = 5.0             # amount to adjust jog duty via arrow keys
 
+# Steering bias away from nearby obstacles (pixels)
+divert_distance = 25
+
 # ---------------------------------------------------------------------------
 
 # Motor hardware configuration (Jetson Nano)
@@ -725,20 +728,22 @@ while True:
     # Deduplicate & sort to simplify gap computation
     red_xs_all = sorted(set(red_xs_all))
     red_xs_in_zone = sorted(set(red_xs_in_zone))
+    red_xs_all_set = set(red_xs_all)
 
     # Global blockers across the full width
     blockers_all = [0] + red_xs_all + [w_combined]
 
-    def widest_gap_center(blockers, preferred_x):
+    def widest_gap_details(blockers, preferred_x):
         """
-        Choose the center of the widest gap considering ALL blockers.
+        Choose the widest gap considering ALL blockers.
+        Returns (center_x, left_bound, right_bound) where bounds are blockers.
         Tie-breaker: pick the gap whose center is closest to preferred_x.
         """
         if len(blockers) < 2:
-            return preferred_x
+            return preferred_x, blockers[0], blockers[-1]
         best_width = -1
         best_dist = 1e18
-        best_cx = preferred_x
+        best_triplet = (preferred_x, blockers[0], blockers[-1])
         for left, right in zip(blockers[:-1], blockers[1:]):
             width = right - left
             cx = (left + right) // 2
@@ -746,16 +751,41 @@ while True:
             if (width > best_width) or (width == best_width and dist < best_dist):
                 best_width = width
                 best_dist = dist
-                best_cx = cx
-        return int(best_cx)
+                best_triplet = (int(cx), int(left), int(right))
+        return best_triplet
 
     # Gating:
     # - No in-zone obstacles -> ignore outside, keep center
     # - Any in-zone obstacles -> plan using ALL obstacles
+    gap_left = 0
+    gap_right = w_combined
     if len(red_xs_in_zone) == 0:
         gap_cx = center_x
     else:
-        gap_cx = widest_gap_center(blockers_all, preferred_x=center_x)
+        gap_cx, gap_left, gap_right = widest_gap_details(blockers_all, preferred_x=center_x)
+
+        if divert_distance > 0:
+            left_is_obstacle = gap_left in red_xs_all_set
+            right_is_obstacle = gap_right in red_xs_all_set
+            if left_is_obstacle or right_is_obstacle:
+                if left_is_obstacle and right_is_obstacle:
+                    dist_left = abs(center_x - gap_left)
+                    dist_right = abs(center_x - gap_right)
+                    prominent_side = "left" if dist_left <= dist_right else "right"
+                elif left_is_obstacle:
+                    prominent_side = "left"
+                else:
+                    prominent_side = "right"
+
+                safe_min = gap_left + 1
+                safe_max = gap_right - 1
+                if safe_min <= safe_max:
+                    if prominent_side == "left":
+                        desired = gap_left + divert_distance
+                        gap_cx = int(clamp(desired, safe_min, safe_max))
+                    else:
+                        desired = gap_right - divert_distance
+                        gap_cx = int(clamp(desired, safe_min, safe_max))
 
     # Smooth horizontal motion (keep as FLOAT; don't floor!)
     if blue_x is None:
