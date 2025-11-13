@@ -102,6 +102,9 @@ motor_pwm_pin = 32                  # informational only (physical pin number)
 motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
 motor_power_pin = 23                # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
 
+# Extra steering push (pixels) applied in the commanded direction (+/- from centre)
+divert_boost = 20
+
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
 hud_text_color = (255, 255, 255)
@@ -763,8 +766,16 @@ while True:
     else:
         blue_x = blue_x * blue_x_smoothness + gap_cx * (1 - blue_x_smoothness)
 
+    # Apply divert boost in the direction of travel (left/right) before rendering
+    boosted_blue_x = blue_x
+    if divert_boost and center_x is not None:
+        if blue_x < center_x:
+            boosted_blue_x = max(0.0, blue_x - float(divert_boost))
+        elif blue_x > center_x:
+            boosted_blue_x = min(float(w_combined - 1), blue_x + float(divert_boost))
+
     # Round ONLY for rendering / display to avoid bias
-    draw_x = int(round(blue_x))
+    draw_x = int(round(boosted_blue_x))
 
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
@@ -793,7 +804,7 @@ while True:
             enable_motor_pwm()
         apply_jog_drive(calibration_jog_direction)
     else:
-        update_motor_control(blue_x if blue_x is not None else None, encoder_px)
+        update_motor_control(boosted_blue_x if blue_x is not None else None, encoder_px)
 
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
