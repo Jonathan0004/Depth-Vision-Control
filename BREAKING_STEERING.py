@@ -118,12 +118,14 @@ breakingThresh = None
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
 hud_text_color = (255, 255, 255)
-hud_text_scale = 0.54
+hud_text_scale = 0.5
 hud_text_thickness = 1
 hud_text_outline_color = (0, 0, 0)
-hud_text_outline_thickness = 3
-status_text_scale = 0.6
+hud_text_outline_thickness = 2
+status_text_scale = 0.58
 status_text_padding = 6
+help_text_scale = 0.48
+help_text_line_gap = 18
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -272,6 +274,12 @@ def draw_help_overlay(
             outline_color,
             outline_thickness,
         )
+
+
+def set_status_message(text, duration_s=None):
+    if duration_s is None:
+        return text, 0.0
+    return text, time.time() + duration_s
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +476,7 @@ latest_encoder_norm = None
 calibration_active = False
 calibration_stage = None
 calibration_status_text = ""
+calibration_status_until = 0.0
 calibration_samples = {}
 calibration_jog_direction = 0
 ui_notice_text = ""
@@ -504,6 +513,7 @@ braking_latest_encoder_norm = None
 braking_calibration_active = False
 braking_calibration_stage = None
 braking_calibration_status_text = ""
+braking_calibration_status_until = 0.0
 braking_calibration_samples = {}
 braking_calibration_jog_direction = 0
 braking_target_norm = None
@@ -887,9 +897,13 @@ def start_braking_calibration():
     global braking_calibration_stage
     global braking_calibration_samples
     global braking_calibration_status_text
+    global braking_calibration_status_until
     global braking_calibration_jog_direction
     if not braking_encoder_available or braking_encoder_bus is None:
-        braking_calibration_status_text = "Brake cal unavailable: encoder not detected"
+        braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+            "Brake cal unavailable: encoder not detected",
+            3.0,
+        )
         braking_calibration_active = False
         braking_calibration_stage = None
         return
@@ -899,17 +913,24 @@ def start_braking_calibration():
     braking_calibration_active = True
     braking_calibration_stage = "min"
     braking_calibration_samples = {}
-    braking_calibration_status_text = "Brake cal: jog LEFT (V/N), press SPACE to set min"
+    braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+        "Brake cal: jog LEFT (V/N), press SPACE to set min",
+        None,
+    )
 
 
 def capture_braking_calibration_point():
     global braking_calibration_active
     global braking_calibration_stage
     global braking_calibration_status_text
+    global braking_calibration_status_until
     global braking_calibration_samples
     global braking_calibration_jog_direction
     if not braking_encoder_available or braking_encoder_bus is None:
-        braking_calibration_status_text = "Brake cal failed: encoder not detected"
+        braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+            "Brake cal failed: encoder not detected",
+            3.0,
+        )
         braking_calibration_active = False
         braking_calibration_stage = None
         braking_calibration_jog_direction = 0
@@ -918,7 +939,10 @@ def capture_braking_calibration_point():
         return
     raw = read_braking_encoder_raw()
     if raw is None:
-        braking_calibration_status_text = "Brake cal failed: encoder read error"
+        braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+            "Brake cal failed: encoder read error",
+            3.0,
+        )
         braking_calibration_active = False
         braking_calibration_stage = None
         braking_calibration_jog_direction = 0
@@ -928,16 +952,25 @@ def capture_braking_calibration_point():
     if braking_calibration_stage == "min":
         braking_calibration_samples["min"] = raw
         braking_calibration_stage = "max"
-        braking_calibration_status_text = "Brake cal: jog RIGHT (V/N), press SPACE to set max"
+        braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+            "Brake cal: jog RIGHT (V/N), press SPACE to set max",
+            None,
+        )
     elif braking_calibration_stage == "max":
         braking_calibration_samples["max"] = raw
         min_raw = min(braking_calibration_samples["min"], braking_calibration_samples["max"])
         max_raw = max(braking_calibration_samples["min"], braking_calibration_samples["max"])
         if min_raw == max_raw:
-            braking_calibration_status_text = "Brake cal failed: encoder range is zero"
+            braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+                "Brake cal failed: encoder range is zero",
+                3.0,
+            )
         else:
             save_braking_calibration(min_raw, max_raw)
-            braking_calibration_status_text = "Brake calibration saved"
+            braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+                "Brake calibration saved",
+                3.0,
+            )
         braking_calibration_active = False
         braking_calibration_stage = None
         braking_calibration_jog_direction = 0
@@ -962,9 +995,13 @@ def get_encoder_norm():
 
 
 def start_calibration():
-    global calibration_active, calibration_stage, calibration_samples, calibration_status_text, calibration_jog_direction
+    global calibration_active, calibration_stage, calibration_samples, calibration_status_text, calibration_status_until
+    global calibration_jog_direction
     if not encoder_available or encoder_bus is None:
-        calibration_status_text = "Steer cal unavailable: encoder not detected"
+        calibration_status_text, calibration_status_until = set_status_message(
+            "Steer cal unavailable: encoder not detected",
+            3.0,
+        )
         calibration_active = False
         calibration_stage = None
         return
@@ -974,13 +1011,20 @@ def start_calibration():
     calibration_active = True
     calibration_stage = "min"
     calibration_samples = {}
-    calibration_status_text = "Steer cal: jog LEFT (J/L), press SPACE to set min"
+    calibration_status_text, calibration_status_until = set_status_message(
+        "Steer cal: jog LEFT (J/L), press SPACE to set min",
+        None,
+    )
 
 
 def capture_calibration_point():
-    global calibration_active, calibration_stage, calibration_status_text, calibration_samples, calibration_jog_direction
+    global calibration_active, calibration_stage, calibration_status_text, calibration_status_until
+    global calibration_samples, calibration_jog_direction
     if not encoder_available or encoder_bus is None:
-        calibration_status_text = "Steer cal failed: encoder not detected"
+        calibration_status_text, calibration_status_until = set_status_message(
+            "Steer cal failed: encoder not detected",
+            3.0,
+        )
         calibration_active = False
         calibration_stage = None
         calibration_jog_direction = 0
@@ -989,7 +1033,10 @@ def capture_calibration_point():
         return
     raw = read_encoder_raw()
     if raw is None:
-        calibration_status_text = "Steer cal failed: encoder read error"
+        calibration_status_text, calibration_status_until = set_status_message(
+            "Steer cal failed: encoder read error",
+            3.0,
+        )
         calibration_active = False
         calibration_stage = None
         calibration_jog_direction = 0
@@ -999,16 +1046,25 @@ def capture_calibration_point():
     if calibration_stage == "min":
         calibration_samples["min"] = raw
         calibration_stage = "max"
-        calibration_status_text = "Steer cal: jog RIGHT (J/L), press SPACE to set max"
+        calibration_status_text, calibration_status_until = set_status_message(
+            "Steer cal: jog RIGHT (J/L), press SPACE to set max",
+            None,
+        )
     elif calibration_stage == "max":
         calibration_samples["max"] = raw
         min_raw = min(calibration_samples["min"], calibration_samples["max"])
         max_raw = max(calibration_samples["min"], calibration_samples["max"])
         if min_raw == max_raw:
-            calibration_status_text = "Steer cal failed: encoder range is zero"
+            calibration_status_text, calibration_status_until = set_status_message(
+                "Steer cal failed: encoder range is zero",
+                3.0,
+            )
         else:
             save_calibration(min_raw, max_raw)
-            calibration_status_text = "Steering calibration saved"
+            calibration_status_text, calibration_status_until = set_status_message(
+                "Steering calibration saved",
+                3.0,
+            )
         calibration_active = False
         calibration_stage = None
         calibration_jog_direction = 0
@@ -1310,50 +1366,51 @@ while True:
     blue_pos = (draw_x, line_y)
     cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
 
-    # Display "Steer Control" on the left frame
-    draw_text_with_outline(
-        combined,
-        f"Steer Control: {steer_control_x}",
-        hud_text_position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        hud_text_outline_color,
-        hud_text_outline_thickness,
-    )
+    if not help_overlay_enabled:
+        # Display "Steer Control" on the left frame
+        draw_text_with_outline(
+            combined,
+            f"Steer Control: {steer_control_x}",
+            hud_text_position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_color,
+            hud_text_thickness,
+            hud_text_outline_color,
+            hud_text_outline_thickness,
+        )
 
-    encoder_text = "Steer Encoder: --"
-    if encoder_px is not None:
-        encoder_text = f"Steer Encoder: {encoder_px} px"
-    elif sim_encoder_enabled:
-        encoder_text = "Steer Encoder: simulated"
-    draw_text_with_outline(
-        combined,
-        encoder_text,
-        (hud_text_position[0], hud_text_position[1] + 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        hud_text_outline_color,
-        hud_text_outline_thickness,
-    )
+        encoder_text = "Steer Encoder: --"
+        if encoder_px is not None:
+            encoder_text = f"Steer Encoder: {encoder_px} px"
+        elif sim_encoder_enabled:
+            encoder_text = "Steer Encoder: simulated"
+        draw_text_with_outline(
+            combined,
+            encoder_text,
+            (hud_text_position[0], hud_text_position[1] + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_color,
+            hud_text_thickness,
+            hud_text_outline_color,
+            hud_text_outline_thickness,
+        )
 
-    brake_encoder_text = "Break Encoder: --"
-    if braking_encoder_norm is not None:
-        brake_encoder_text = f"Break Encoder: {braking_encoder_norm:.3f}"
-    draw_text_with_outline(
-        combined,
-        brake_encoder_text,
-        (hud_text_position[0], hud_text_position[1] + 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_color,
-        hud_text_thickness,
-        hud_text_outline_color,
-        hud_text_outline_thickness,
-    )
+        brake_encoder_text = "Break Encoder: --"
+        if braking_encoder_norm is not None:
+            brake_encoder_text = f"Break Encoder: {braking_encoder_norm:.3f}"
+        draw_text_with_outline(
+            combined,
+            brake_encoder_text,
+            (hud_text_position[0], hud_text_position[1] + 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_color,
+            hud_text_thickness,
+            hud_text_outline_color,
+            hud_text_outline_thickness,
+        )
 
     # Visualize the pull zone boundaries (blue vertical lines)
     cv2.line(
@@ -1394,6 +1451,14 @@ while True:
         or calibration_active
         or braking_calibration_active
     )
+    now = time.time()
+    if calibration_status_text and calibration_status_until and now > calibration_status_until:
+        calibration_status_text = ""
+        calibration_status_until = 0.0
+    if braking_calibration_status_text and braking_calibration_status_until and now > braking_calibration_status_until:
+        braking_calibration_status_text = ""
+        braking_calibration_status_until = 0.0
+
     if help_overlay_enabled:
         help_lines = [
             "Help (press H to close)",
@@ -1403,7 +1468,7 @@ while True:
             "\u2190/\u2192: Adjust simulated steer encoder",
             "K: Toggle steer jog mode",
             "J/L: Steer jog left/right",
-            "\u2191/\u2193: Adjust jog speed",
+            "^/v: Adjust jog speed",
             "B: Toggle brake jog mode",
             "V/N: Brake jog left/right",
             "C: Start steer calibration",
@@ -1415,12 +1480,12 @@ while True:
             help_lines,
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
+            help_text_scale,
             hud_text_color,
             hud_text_thickness,
             hud_text_outline_color,
             hud_text_outline_thickness,
-            20,
+            help_text_line_gap,
         )
     else:
         if calibration_status_text:
@@ -1435,7 +1500,7 @@ while True:
             else:
                 jog_state = "idle"
             bottom_lines.append(
-                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (J/L to drive, \u2191/\u2193 speed, K to exit)"
+                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (J/L to drive, ^/v speed, K to exit)"
             )
         if braking_jog_mode_enabled:
             if braking_jog_direction < 0:
@@ -1445,7 +1510,7 @@ while True:
             else:
                 braking_jog_state = "idle"
             bottom_lines.append(
-                f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, \u2191/\u2193 speed, B to exit)"
+                f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, ^/v speed, B to exit)"
             )
         if sim_encoder_enabled:
             bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, S to exit")
