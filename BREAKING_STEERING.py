@@ -931,30 +931,40 @@ def capture_calibration_point():
         enable_motor_pwm()
 
 
-# Initialise the depth estimation model once (heavy call, so keep global)
+# Build the camera-specific GStreamer pipeline string for a Jetson device
+def make_gst(sensor_id, fps=30):
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        f"video/x-raw(memory:NVMM),width=300,height=150,framerate={fps}/1,format=NV12 ! "
+        "nvvidconv flip-method=2 ! video/x-raw,format=BGRx ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "queue max-size-buffers=1 leaky=downstream ! "
+        "appsink sync=false max-buffers=1 drop=true enable-last-sample=0"
+    )
+
+
+# Open both cameras and trim their internal buffers for minimal latency
+cap0 = cv2.VideoCapture(make_gst(0, fps=30), cv2.CAP_GSTREAMER)
+cap1 = cv2.VideoCapture(make_gst(1, fps=30), cv2.CAP_GSTREAMER)
+if not cap0.isOpened() or not cap1.isOpened():
+    raise RuntimeError("Failed to open one or both cameras.")
+
+cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+# Warm up cameras so Argus allocates buffers before CUDA model grabs memory
+for _ in range(30):
+    cap0.read()
+    cap1.read()
+
+# Now load depth model (smaller + FP16 to reduce memory pressure)
 depth_pipe = pipeline(
     task="depth-estimation",
     model="depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
-    device=0
+    device=0,
+    torch_dtype=torch.float16,
 )
 
-# Build the camera-specific GStreamer pipeline string for a Jetson device
-def make_gst(sensor_id):
-    return (
-        f"nvarguscamerasrc sensor-id={sensor_id} ! "
-        "video/x-raw(memory:NVMM),width=300,height=150,framerate=60/1 ! "
-        "nvvidconv flip-method=2 ! video/x-raw,format=BGRx ! "
-        "videoconvert ! video/x-raw,format=BGR ! "
-        "appsink sync=false max-buffers=1 drop=true"
-    )
-
-# Open both cameras and trim their internal buffers for minimal latency
-cap0 = cv2.VideoCapture(make_gst(0), cv2.CAP_GSTREAMER)
-cap1 = cv2.VideoCapture(make_gst(1), cv2.CAP_GSTREAMER)
-if not cap0.isOpened() or not cap1.isOpened():
-    raise RuntimeError("Failed to open one or both cameras.")
-cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 # Thread-safe queues for streaming frames and depth inference results
 frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
@@ -1003,13 +1013,21 @@ def infer():
             f1 = frame_q1.get(timeout=0.01)
         except queue.Empty:
             continue
-        imgs = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in (f0, f1)]
+
+        img0 = Image.fromarray(cv2.cvtColor(f0, cv2.COLOR_BGR2RGB))
+        img1 = Image.fromarray(cv2.cvtColor(f1, cv2.COLOR_BGR2RGB))
+
         with torch.inference_mode():
-            with torch.amp.autocast(device_type="cuda"):
-                outs = depth_pipe(imgs)
-        d0, d1 = [np.array(o['depth']) for o in outs]
-        if result_q.full(): result_q.get_nowait()
+            o0 = depth_pipe(img0)
+            o1 = depth_pipe(img1)
+
+        d0 = np.array(o0["depth"])
+        d1 = np.array(o1["depth"])
+
+        if result_q.full():
+            result_q.get_nowait()
         result_q.put((f0, d0, f1, d1))
+
 
 Thread(target=infer, daemon=True).start()
 
