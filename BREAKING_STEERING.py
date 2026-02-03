@@ -1503,18 +1503,18 @@ while True:
     if help_overlay_enabled:
         help_title = ""
         help_lines = [
-            "ESC: Exit",
-            "H: Toggle this help overlay",
-            "S: Toggle simulated steer encoder",
-            "\u2190/\u2192: Adjust simulated steer encoder",
+            "ESC: End Program",
+            "H: Close help overlay",
+            "S: Toggle sim steer encoder",
+            "LEFT/RIGHT: Adjust sim steer encoder",
             "K: Toggle steer jog mode",
             "J/L: Steer jog left/right",
-            "^/v: Adjust jog speed",
+            "UP/DOWN: Adjust jog speed",
             "B: Toggle brake jog mode",
             "V/N: Brake jog left/right",
             "C: Start steer calibration",
             "X: Start brake calibration",
-            "SPACE: Capture calibration point",
+            "SPACE: Capture calibration",
         ]
         draw_help_overlay(
             combined,
