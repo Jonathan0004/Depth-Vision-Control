@@ -267,19 +267,22 @@ def draw_help_overlay(
     column_gap,
 ):
     x, y = origin
-    draw_text_with_outline(
-        frame,
-        title,
-        (x, y),
-        font,
-        title_scale,
-        color,
-        thickness,
-        outline_color,
-        outline_thickness,
-    )
-    (title_w, title_h), _ = cv2.getTextSize(title, font, title_scale, 1)
-    start_y = y + title_h + line_gap
+    if title:
+        draw_text_with_outline(
+            frame,
+            title,
+            (x, y),
+            font,
+            title_scale,
+            color,
+            thickness,
+            outline_color,
+            outline_thickness,
+        )
+        (_, title_h), _ = cv2.getTextSize(title, font, title_scale, 1)
+        start_y = y + title_h + line_gap
+    else:
+        start_y = y
     split_index = (len(lines) + 1) // 2
     left_lines = lines[:split_index]
     right_lines = lines[split_index:]
@@ -1498,7 +1501,7 @@ while True:
         braking_calibration_status_until = 0.0
 
     if help_overlay_enabled:
-        help_title = "Help (press H to close)"
+        help_title = ""
         help_lines = [
             "ESC: Exit",
             "H: Toggle this help overlay",
@@ -1517,7 +1520,7 @@ while True:
             combined,
             help_title,
             help_lines,
-            (20, 40),
+            (20, 20),
             cv2.FONT_HERSHEY_SIMPLEX,
             help_title_scale,
             help_text_scale,
