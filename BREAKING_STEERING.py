@@ -1450,7 +1450,7 @@ while True:
         if sim_encoder_enabled:
             bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, S to exit")
         if not control_active:
-            bottom_lines.append('Show help: "h" to display all keys used to do all the functions.')
+            bottom_lines.append('Show help: "h"')
         if bottom_lines:
             draw_bottom_lines(
                 combined,
