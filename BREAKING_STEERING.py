@@ -136,7 +136,7 @@ calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.01        # arrow-key increment when in simulated encoder mode
 
 # Encoder + braking control configuration
-braking_encoder_i2c_bus = 0
+braking_encoder_i2c_bus = 1
 braking_encoder_i2c_address = 0x36
 braking_calibration_file = Path("braking_calibration.json")
 
@@ -1544,7 +1544,7 @@ while True:
             else:
                 jog_state = "idle"
             bottom_lines.append(
-                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (J/L to drive, ^/v speed, K to exit)"
+                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (J/L to drive, UP/DOWN for speed, K to exit)"
             )
         if braking_jog_mode_enabled:
             if braking_jog_direction < 0:
@@ -1554,7 +1554,7 @@ while True:
             else:
                 braking_jog_state = "idle"
             bottom_lines.append(
-                f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, ^/v speed, B to exit)"
+                f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, UP/DOWN for speed, B to exit)"
             )
         if sim_encoder_enabled:
             bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, S to exit")
