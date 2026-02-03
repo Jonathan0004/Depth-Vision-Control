@@ -84,6 +84,8 @@ motor_dead_zone_px = 5              # +/- range in which motor output is disable
 jog_default_duty_pct = 50.0         # default jog duty percentage when jog mode toggles on
 jog_duty_step_pct = 5.0             # amount to adjust jog duty via arrow keys
 
+breakingThresh = 0.0
+
 # ---------------------------------------------------------------------------
 
 
@@ -99,6 +101,17 @@ motor_pwm_pin = 32                  # informational only (physical pin number)
 motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
 motor_power_pin = 23                # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
 
+# Brake motor hardware configuration (Jetson Nano)
+brake_motor_pwm_chip = "/sys/class/pwm/pwmchip2"
+brake_motor_pwm_channel = 0
+brake_motor_pwm_frequency_hz = 5000
+brake_motor_pwm_pin = 33            # informational only (physical pin number)
+brake_motor_direction_pin = 37      # HIGH = brake right, LOW = brake left
+brake_motor_power_pin = 22          # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
+brake_motor_max_duty_pct = 100.0
+brake_motor_full_speed_error_norm = 0.25
+brake_motor_dead_zone_norm = 0.01
+
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -111,6 +124,10 @@ encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
 calibration_file = Path("steering_calibration.json")
 simulated_step_norm = 0.01        # arrow-key increment when in simulated encoder mode
+
+brake_encoder_i2c_bus = 0
+brake_encoder_i2c_address = 0x36
+brake_calibration_file = Path("brake_calibration.json")
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +198,11 @@ encoder_available = False
 calibration_data = {"encoder_min_raw": None, "encoder_max_raw": None}
 calibration_loaded = False
 
+brake_encoder_bus = None
+brake_encoder_available = False
+brake_calibration_data = {"encoder_min_raw": None, "encoder_max_raw": None}
+brake_calibration_loaded = False
+
 
 def initialise_encoder():
     global encoder_bus, encoder_available
@@ -204,6 +226,28 @@ def shutdown_encoder():
             encoder_bus = None
 
 
+def initialise_brake_encoder():
+    global brake_encoder_bus, brake_encoder_available
+    if SMBus is None:
+        brake_encoder_available = False
+        return
+    try:
+        brake_encoder_bus = SMBus(brake_encoder_i2c_bus)
+        brake_encoder_available = True
+    except (FileNotFoundError, OSError):
+        brake_encoder_bus = None
+        brake_encoder_available = False
+
+
+def shutdown_brake_encoder():
+    global brake_encoder_bus
+    if brake_encoder_bus is not None:
+        try:
+            brake_encoder_bus.close()
+        finally:
+            brake_encoder_bus = None
+
+
 def load_calibration():
     global calibration_data, calibration_loaded
     if calibration_loaded:
@@ -224,6 +268,26 @@ def load_calibration():
     calibration_loaded = True
 
 
+def load_brake_calibration():
+    global brake_calibration_data, brake_calibration_loaded
+    if brake_calibration_loaded:
+        return
+    if brake_calibration_file.exists():
+        try:
+            data = json.loads(brake_calibration_file.read_text())
+            if {
+                "encoder_min_raw",
+                "encoder_max_raw",
+            } <= data.keys():
+                brake_calibration_data = {
+                    "encoder_min_raw": int(data["encoder_min_raw"]),
+                    "encoder_max_raw": int(data["encoder_max_raw"]),
+                }
+        except (json.JSONDecodeError, ValueError):
+            pass
+    brake_calibration_loaded = True
+
+
 def save_calibration(min_raw, max_raw):
     global calibration_data, calibration_loaded
     calibration_data = {
@@ -234,10 +298,30 @@ def save_calibration(min_raw, max_raw):
     calibration_loaded = True
 
 
+def save_brake_calibration(min_raw, max_raw):
+    global brake_calibration_data, brake_calibration_loaded
+    brake_calibration_data = {
+        "encoder_min_raw": int(min_raw),
+        "encoder_max_raw": int(max_raw),
+    }
+    brake_calibration_file.write_text(json.dumps(brake_calibration_data, indent=2))
+    brake_calibration_loaded = True
+
+
 def encoder_span():
     if calibration_data["encoder_min_raw"] is None or calibration_data["encoder_max_raw"] is None:
         return None
     span = calibration_data["encoder_max_raw"] - calibration_data["encoder_min_raw"]
+    return span if span > 0 else None
+
+
+def brake_encoder_span():
+    if (
+        brake_calibration_data["encoder_min_raw"] is None
+        or brake_calibration_data["encoder_max_raw"] is None
+    ):
+        return None
+    span = brake_calibration_data["encoder_max_raw"] - brake_calibration_data["encoder_min_raw"]
     return span if span > 0 else None
 
 
@@ -253,11 +337,31 @@ def read_encoder_raw():
     return raw
 
 
+def read_brake_encoder_raw():
+    if not brake_encoder_available or brake_encoder_bus is None:
+        return None
+    try:
+        high = brake_encoder_bus.read_byte_data(brake_encoder_i2c_address, 0x0C)
+        low = brake_encoder_bus.read_byte_data(brake_encoder_i2c_address, 0x0D)
+    except OSError:
+        return None
+    raw = ((high & 0x0F) << 8) | low
+    return raw
+
+
 def encoder_raw_to_norm(raw):
     span = encoder_span()
     if span is None:
         return None
     norm = (raw - calibration_data["encoder_min_raw"]) / span
+    return float(clamp(norm, 0.0, 1.0))
+
+
+def brake_encoder_raw_to_norm(raw):
+    span = brake_encoder_span()
+    if span is None:
+        return None
+    norm = (raw - brake_calibration_data["encoder_min_raw"]) / span
     return float(clamp(norm, 0.0, 1.0))
 
 
@@ -277,6 +381,15 @@ calibration_status_text = ""
 calibration_samples = {}
 calibration_jog_direction = 0
 
+latest_brake_encoder_raw = None
+latest_brake_encoder_norm = None
+
+brake_calibration_active = False
+brake_calibration_stage = None
+brake_calibration_status_text = ""
+brake_calibration_samples = {}
+brake_calibration_jog_direction = 0
+
 
 # ---------------------------------------------------------------------------
 # Motor control runtime state
@@ -291,6 +404,16 @@ motor_pwm_enabled = False
 jog_mode_enabled = False
 jog_direction = 0  # -1 left, 0 idle, +1 right
 jog_duty_pct = jog_default_duty_pct
+
+brake_motor_pwm_period_ns = _ns_period(brake_motor_pwm_frequency_hz)
+brake_motor_pwm_channel_path = None
+brake_motor_control_available = False
+brake_motor_gpio_initialised = False
+brake_motor_last_duty_ns = None
+brake_motor_pwm_enabled = False
+brake_jog_mode_enabled = False
+brake_jog_direction = 0  # -1 left, 0 idle, +1 right
+brake_target_norm = None
 
 
 def initialise_motor_control():
@@ -325,6 +448,42 @@ def initialise_motor_control():
         motor_control_available = False
 
 
+def initialise_brake_motor_control():
+    """Prepare GPIO direction/power pins and PWM channel for brake motor drive."""
+    global brake_motor_pwm_channel_path
+    global brake_motor_control_available
+    global brake_motor_gpio_initialised
+    global brake_motor_last_duty_ns
+    global brake_motor_pwm_enabled
+
+    brake_motor_control_available = False
+    if GPIO is None:
+        return
+
+    try:
+        if not brake_motor_gpio_initialised:
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
+            GPIO.setup(brake_motor_direction_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(brake_motor_power_pin, GPIO.OUT, initial=GPIO.LOW)
+            brake_motor_gpio_initialised = True
+    except RuntimeError:
+        return
+
+    try:
+        brake_motor_pwm_channel_path = _ensure_pwm_channel(brake_motor_pwm_chip, brake_motor_pwm_channel)
+        _pwm_write(brake_motor_pwm_channel_path / "enable", 0)
+        _pwm_write(brake_motor_pwm_channel_path / "period", brake_motor_pwm_period_ns)
+        _pwm_write(brake_motor_pwm_channel_path / "duty_cycle", 0)
+        _pwm_write(brake_motor_pwm_channel_path / "enable", 1)
+        brake_motor_last_duty_ns = 0
+        brake_motor_pwm_enabled = True
+        brake_motor_control_available = True
+    except (OSError, FileNotFoundError, TimeoutError):  # pragma: no cover - hardware dependency
+        brake_motor_pwm_channel_path = None
+        brake_motor_control_available = False
+
+
 
 def _set_motor_direction(error: float) -> None:
     """Update the GPIO direction pin based on the steering error."""
@@ -348,6 +507,32 @@ def _set_motor_pwm_pct(pct: float) -> None:
     try:
         _pwm_write(motor_pwm_channel_path / "duty_cycle", duty_ns)
         motor_last_duty_ns = duty_ns
+    except OSError:  # pragma: no cover - hardware dependency
+        pass
+
+
+def _set_brake_motor_direction(error: float) -> None:
+    """Update the GPIO direction pin based on the brake error."""
+    if GPIO is None or not brake_motor_gpio_initialised:
+        return
+    GPIO.output(brake_motor_direction_pin, GPIO.HIGH if error > 0 else GPIO.LOW)
+
+
+def _set_brake_motor_pwm_pct(pct: float) -> None:
+    """Write the requested PWM duty cycle percentage to sysfs."""
+    global brake_motor_last_duty_ns
+    if (
+        not brake_motor_control_available
+        or brake_motor_pwm_channel_path is None
+        or not brake_motor_pwm_enabled
+    ):
+        return
+    duty_ns = _ns_duty_from_pct(brake_motor_pwm_period_ns, pct)
+    if brake_motor_last_duty_ns == duty_ns:
+        return
+    try:
+        _pwm_write(brake_motor_pwm_channel_path / "duty_cycle", duty_ns)
+        brake_motor_last_duty_ns = duty_ns
     except OSError:  # pragma: no cover - hardware dependency
         pass
 
@@ -386,6 +571,38 @@ def enable_motor_pwm() -> None:
         GPIO.output(motor_power_pin, GPIO.LOW)
 
 
+def disable_brake_motor_pwm() -> None:
+    """Temporarily disable PWM output while keeping the channel exported."""
+    global brake_motor_pwm_enabled, brake_motor_last_duty_ns
+    if not brake_motor_control_available or brake_motor_pwm_channel_path is None:
+        return
+    _set_brake_motor_pwm_pct(0.0)
+    try:
+        _pwm_write(brake_motor_pwm_channel_path / "enable", 0)
+    except OSError:  # pragma: no cover - hardware dependency
+        return
+    brake_motor_last_duty_ns = 0
+    brake_motor_pwm_enabled = False
+    if GPIO is not None and brake_motor_gpio_initialised:
+        GPIO.output(brake_motor_power_pin, GPIO.LOW)
+
+
+def enable_brake_motor_pwm() -> None:
+    """Re-enable PWM output after a temporary disable."""
+    global brake_motor_pwm_enabled, brake_motor_last_duty_ns
+    if not brake_motor_control_available or brake_motor_pwm_channel_path is None:
+        return
+    try:
+        _pwm_write(brake_motor_pwm_channel_path / "duty_cycle", 0)
+        _pwm_write(brake_motor_pwm_channel_path / "enable", 1)
+    except OSError:  # pragma: no cover - hardware dependency
+        return
+    brake_motor_last_duty_ns = 0
+    brake_motor_pwm_enabled = True
+    if GPIO is not None and brake_motor_gpio_initialised:
+        GPIO.output(brake_motor_power_pin, GPIO.LOW)
+
+
 def update_motor_control(steer_target_px, encoder_px):
     """Drive the motor to align the encoder with the steering target and assert motor power pin when driving."""
     # If we can't compute a target or we shouldn't drive, force PWM off and power pin LOW
@@ -421,6 +638,37 @@ def update_motor_control(steer_target_px, encoder_px):
             GPIO.output(motor_power_pin, GPIO.LOW)   # idle/off
 
 
+def update_brake_motor_control(target_norm, encoder_norm):
+    """Drive the brake motor to align the encoder with the target norm."""
+    if target_norm is None or encoder_norm is None or brake_calibration_active:
+        _set_brake_motor_direction(0)
+        _set_brake_motor_pwm_pct(0.0)
+        if GPIO is not None and brake_motor_gpio_initialised:
+            GPIO.output(brake_motor_power_pin, GPIO.LOW)
+        return
+
+    error = float(target_norm) - float(encoder_norm)
+    if abs(error) <= brake_motor_dead_zone_norm:
+        _set_brake_motor_direction(0)
+        _set_brake_motor_pwm_pct(0.0)
+        if GPIO is not None and brake_motor_gpio_initialised:
+            GPIO.output(brake_motor_power_pin, GPIO.LOW)
+        return
+
+    _set_brake_motor_direction(error)
+    denom = float(brake_motor_full_speed_error_norm) if brake_motor_full_speed_error_norm > 0 else 1.0
+    scaled_pct = (abs(error) / denom) * brake_motor_max_duty_pct
+    duty_pct = max(0.0, min(brake_motor_max_duty_pct, scaled_pct))
+
+    _set_brake_motor_pwm_pct(duty_pct)
+
+    if GPIO is not None and brake_motor_gpio_initialised:
+        if brake_motor_pwm_enabled and not brake_calibration_active and duty_pct > 0.0:
+            GPIO.output(brake_motor_power_pin, GPIO.HIGH)
+        else:
+            GPIO.output(brake_motor_power_pin, GPIO.LOW)
+
+
 def apply_jog_drive(direction: int) -> None:
     """Directly drive the steering motor for manual jogging."""
     if GPIO is not None and motor_gpio_initialised:
@@ -439,6 +687,26 @@ def apply_jog_drive(direction: int) -> None:
             GPIO.output(motor_power_pin, GPIO.HIGH)
         else:
             GPIO.output(motor_power_pin, GPIO.LOW)
+
+
+def apply_brake_jog_drive(direction: int) -> None:
+    """Directly drive the brake motor for manual jogging."""
+    if GPIO is not None and brake_motor_gpio_initialised:
+        GPIO.output(brake_motor_power_pin, GPIO.LOW)
+
+    if direction not in (-1, 1):
+        _set_brake_motor_direction(0)
+        _set_brake_motor_pwm_pct(0.0)
+        return
+
+    _set_brake_motor_direction(float(direction))
+    duty = clamp(jog_duty_pct, 0.0, brake_motor_max_duty_pct)
+    _set_brake_motor_pwm_pct(duty)
+    if GPIO is not None and brake_motor_gpio_initialised:
+        if duty > 0.0:
+            GPIO.output(brake_motor_power_pin, GPIO.HIGH)
+        else:
+            GPIO.output(brake_motor_power_pin, GPIO.LOW)
 
 
 def shutdown_motor_control():
@@ -474,6 +742,39 @@ def shutdown_motor_control():
         motor_gpio_initialised = False
 
 
+def shutdown_brake_motor_control():
+    """Return the brake motor hardware to a safe idle state."""
+    global brake_motor_control_available, brake_motor_pwm_channel_path, brake_motor_last_duty_ns
+    global brake_motor_gpio_initialised, brake_motor_pwm_enabled
+
+    _set_brake_motor_direction(0)
+    _set_brake_motor_pwm_pct(0.0)
+
+    if GPIO is not None and brake_motor_gpio_initialised:
+        try:
+            GPIO.output(brake_motor_power_pin, GPIO.LOW)
+        except RuntimeError:  # pragma: no cover - hardware dependency
+            pass
+
+    if brake_motor_control_available and brake_motor_pwm_channel_path is not None:
+        try:
+            _pwm_write(brake_motor_pwm_channel_path / "enable", 0)
+        except OSError:  # pragma: no cover - hardware dependency
+            pass
+
+    brake_motor_control_available = False
+    brake_motor_pwm_channel_path = None
+    brake_motor_last_duty_ns = None
+    brake_motor_pwm_enabled = False
+
+    if GPIO is not None and brake_motor_gpio_initialised:
+        try:
+            GPIO.cleanup([brake_motor_direction_pin, brake_motor_power_pin])
+        except RuntimeError:  # pragma: no cover - hardware dependency
+            pass
+        brake_motor_gpio_initialised = False
+
+
 def get_encoder_norm():
     global latest_encoder_raw, latest_encoder_norm
     if sim_encoder_enabled:
@@ -487,6 +788,18 @@ def get_encoder_norm():
         return None
     norm = encoder_raw_to_norm(raw)
     latest_encoder_norm = norm
+    return norm
+
+
+def get_brake_encoder_norm():
+    global latest_brake_encoder_raw, latest_brake_encoder_norm
+    raw = read_brake_encoder_raw()
+    latest_brake_encoder_raw = raw
+    if raw is None:
+        latest_brake_encoder_norm = None
+        return None
+    norm = brake_encoder_raw_to_norm(raw)
+    latest_brake_encoder_norm = norm
     return norm
 
 
@@ -543,6 +856,69 @@ def capture_calibration_point():
         calibration_jog_direction = 0
         apply_jog_drive(0)
         enable_motor_pwm()
+
+
+def start_brake_calibration():
+    global brake_calibration_active
+    global brake_calibration_stage
+    global brake_calibration_samples
+    global brake_calibration_status_text
+    global brake_calibration_jog_direction
+    if not brake_encoder_available or brake_encoder_bus is None:
+        brake_calibration_status_text = "Cannot start brake calibration: encoder interface unavailable"
+        brake_calibration_active = False
+        brake_calibration_stage = None
+        return
+    disable_brake_motor_pwm()
+    brake_calibration_jog_direction = 0
+    apply_brake_jog_drive(0)
+    brake_calibration_active = True
+    brake_calibration_stage = "min"
+    brake_calibration_samples = {}
+    brake_calibration_status_text = "Brake calibration: move LEFT (v/n to jog) then SPACE"
+
+
+def capture_brake_calibration_point():
+    global brake_calibration_active
+    global brake_calibration_stage
+    global brake_calibration_status_text
+    global brake_calibration_samples
+    global brake_calibration_jog_direction
+    if not brake_encoder_available or brake_encoder_bus is None:
+        brake_calibration_status_text = "Brake calibration failed: encoder interface unavailable"
+        brake_calibration_active = False
+        brake_calibration_stage = None
+        brake_calibration_jog_direction = 0
+        apply_brake_jog_drive(0)
+        enable_brake_motor_pwm()
+        return
+    raw = read_brake_encoder_raw()
+    if raw is None:
+        brake_calibration_status_text = "Brake calibration failed: unable to read encoder"
+        brake_calibration_active = False
+        brake_calibration_stage = None
+        brake_calibration_jog_direction = 0
+        apply_brake_jog_drive(0)
+        enable_brake_motor_pwm()
+        return
+    if brake_calibration_stage == "min":
+        brake_calibration_samples["min"] = raw
+        brake_calibration_stage = "max"
+        brake_calibration_status_text = "Brake calibration: move RIGHT (v/n to jog) then SPACE"
+    elif brake_calibration_stage == "max":
+        brake_calibration_samples["max"] = raw
+        min_raw = min(brake_calibration_samples["min"], brake_calibration_samples["max"])
+        max_raw = max(brake_calibration_samples["min"], brake_calibration_samples["max"])
+        if min_raw == max_raw:
+            brake_calibration_status_text = "Brake calibration failed: encoder range is zero"
+        else:
+            save_brake_calibration(min_raw, max_raw)
+            brake_calibration_status_text = "Brake calibration saved"
+        brake_calibration_active = False
+        brake_calibration_stage = None
+        brake_calibration_jog_direction = 0
+        apply_brake_jog_drive(0)
+        enable_brake_motor_pwm()
 
 
 # Initialise the depth estimation model once (heavy call, so keep global)
@@ -628,8 +1004,11 @@ def infer():
 Thread(target=infer, daemon=True).start()
 
 load_calibration()
+load_brake_calibration()
 initialise_encoder()
+initialise_brake_encoder()
 initialise_motor_control()
+initialise_brake_motor_control()
 
 # ---------------------------------------------------------------------------
 # Main processing loop — consume depth results, annotate, and display
@@ -789,6 +1168,8 @@ while True:
             1,
         )
 
+    brake_encoder_norm = get_brake_encoder_norm()
+
     if jog_mode_enabled:
         if jog_direction != 0:
             apply_jog_drive(jog_direction)
@@ -800,6 +1181,18 @@ while True:
         apply_jog_drive(calibration_jog_direction)
     else:
         update_motor_control(boosted_blue_x if blue_x is not None else None, encoder_px)
+
+    if brake_jog_mode_enabled:
+        if brake_jog_direction != 0:
+            apply_brake_jog_drive(brake_jog_direction)
+        else:
+            apply_brake_jog_drive(0)
+    elif brake_calibration_active and brake_calibration_jog_direction != 0:
+        if not brake_motor_pwm_enabled:
+            enable_brake_motor_pwm()
+        apply_brake_jog_drive(brake_calibration_jog_direction)
+    else:
+        update_brake_motor_control(brake_target_norm, brake_encoder_norm)
 
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
@@ -826,6 +1219,20 @@ while True:
         combined,
         encoder_text,
         (hud_text_position[0], hud_text_position[1] + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        cv2.LINE_AA
+    )
+
+    brake_text = "Brake Encoder: --"
+    if brake_encoder_norm is not None:
+        brake_text = f"Brake Encoder: {brake_encoder_norm:.3f}"
+    cv2.putText(
+        combined,
+        brake_text,
+        (hud_text_position[0], hud_text_position[1] + 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         hud_text_scale,
         hud_text_color,
@@ -877,6 +1284,8 @@ while True:
     status_messages = []
     if calibration_status_text:
         status_messages.append(calibration_status_text)
+    if brake_calibration_status_text:
+        status_messages.append(brake_calibration_status_text)
     if jog_mode_enabled:
         if jog_direction < 0:
             jog_state = "left"
@@ -887,9 +1296,24 @@ while True:
         status_messages.append(
             f"Jog mode ({jog_state}) @ {jog_duty_pct:.0f}% 'h'/'k' to jog"
         )
+    if brake_jog_mode_enabled:
+        if brake_jog_direction < 0:
+            brake_jog_state = "left"
+        elif brake_jog_direction > 0:
+            brake_jog_state = "right"
+        else:
+            brake_jog_state = "idle"
+        status_messages.append(
+            f"Brake jog mode ({brake_jog_state}) @ {jog_duty_pct:.0f}% 'v'/'n' to jog"
+        )
     message_to_show = " | ".join(status_messages)
-    if not message_to_show and encoder_span() is None:
-        message_to_show = "Press 'c' to calibrate steering range"
+    if not message_to_show and (encoder_span() is None or brake_encoder_span() is None):
+        prompts = []
+        if encoder_span() is None:
+            prompts.append("Press 'c' to calibrate steering range")
+        if brake_encoder_span() is None:
+            prompts.append("Press 'x' to calibrate brake range")
+        message_to_show = " | ".join(prompts)
     if message_to_show:
         cv2.putText(
             combined,
@@ -930,6 +1354,15 @@ while True:
         else:
             calibration_status_text = "Jog mode disabled"
 
+    if key == ord('b'):
+        brake_jog_mode_enabled = not brake_jog_mode_enabled
+        brake_jog_direction = 0
+        apply_brake_jog_drive(0)
+        if brake_jog_mode_enabled:
+            brake_calibration_status_text = "Brake jog mode enabled"
+        else:
+            brake_calibration_status_text = "Brake jog mode disabled"
+
     if calibration_active and key in (ord('h'), ord('k')):
         requested_direction = -1 if key == ord('h') else 1
         if calibration_jog_direction == requested_direction:
@@ -941,6 +1374,17 @@ while True:
                 enable_motor_pwm()
             apply_jog_drive(calibration_jog_direction)
 
+    if brake_calibration_active and key in (ord('v'), ord('n')):
+        requested_direction = -1 if key == ord('v') else 1
+        if brake_calibration_jog_direction == requested_direction:
+            brake_calibration_jog_direction = 0
+            apply_brake_jog_drive(0)
+        else:
+            brake_calibration_jog_direction = requested_direction
+            if not brake_motor_pwm_enabled:
+                enable_brake_motor_pwm()
+            apply_brake_jog_drive(brake_calibration_jog_direction)
+
     elif jog_mode_enabled and key in (ord('h'), ord('k')):
         requested_direction = -1 if key == ord('h') else 1
         if jog_direction == requested_direction:
@@ -948,6 +1392,14 @@ while True:
         else:
             jog_direction = requested_direction
         apply_jog_drive(jog_direction)
+
+    elif brake_jog_mode_enabled and key in (ord('v'), ord('n')):
+        requested_direction = -1 if key == ord('v') else 1
+        if brake_jog_direction == requested_direction:
+            brake_jog_direction = 0
+        else:
+            brake_jog_direction = requested_direction
+        apply_brake_jog_drive(brake_jog_direction)
 
     if sim_encoder_enabled and key in (81, 83):
         delta = -simulated_step_norm if key == 81 else simulated_step_norm
@@ -960,8 +1412,14 @@ while True:
     if key == ord('c'):
         start_calibration()
 
-    if calibration_active and key == 32:  # space bar
-        capture_calibration_point()
+    if key == ord('x'):
+        start_brake_calibration()
+
+    if key == 32:  # space bar
+        if calibration_active:
+            capture_calibration_point()
+        if brake_calibration_active:
+            capture_brake_calibration_point()
 
 # === Cleanup ===
 running = False
@@ -970,6 +1428,8 @@ cap1.release()
 cv2.destroyAllWindows()
 shutdown_encoder()
 shutdown_motor_control()
+shutdown_brake_encoder()
+shutdown_brake_motor_control()
 
 
 
@@ -986,11 +1446,14 @@ shutdown_motor_control()
 #      • SCL → Jetson Nano I²C SCL (physical pin 5 on I2C bus 1).
 #      • SDA → Jetson Nano I²C SDA (physical pin 3 on I2C bus 1).
 #      • GPO is an optional programmable output; leave unconnected unless used.
-# 3. Keep wiring short and add a 0.1 µF decoupling capacitor close to the sensor
+# 3. Brake encoder (second AS5600):
+#      • SCL → Jetson Nano pin 28 (I²C SCL, bus 0).
+#      • SDA → Jetson Nano pin 27 (I²C SDA, bus 0).
+# 4. Keep wiring short and add a 0.1 µF decoupling capacitor close to the sensor
 #    supply pins for stable readings.
-# 4. Enable the I²C interface on the Jetson Nano via
+# 5. Enable the I²C interface on the Jetson Nano via
 #    `sudo /opt/nvidia/jetson-io/jetson-io.py` (interface configuration) and
-#    reboot afterwards. Once enabled, `/dev/i2c-1` should exist and the script
-#    will be able to talk to the encoder.
-# 5. Mount the AS5600 so the magnet sits centred above the die at the specified
+#    reboot afterwards. Once enabled, `/dev/i2c-1` and `/dev/i2c-0` should exist
+#    and the script will be able to talk to the encoders.
+# 6. Mount the AS5600 so the magnet sits centred above the die at the specified
 #    air gap (≈1–2 mm). Ensure the magnet rotates with the steering shaft.
