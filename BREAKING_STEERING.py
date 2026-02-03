@@ -124,8 +124,10 @@ hud_text_outline_color = (0, 0, 0)
 hud_text_outline_thickness = 2
 status_text_scale = 0.58
 status_text_padding = 6
+help_title_scale = 0.8
 help_text_scale = 0.48
 help_text_line_gap = 18
+help_text_column_gap = 40
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -251,22 +253,58 @@ def draw_bottom_lines(
 
 def draw_help_overlay(
     frame,
+    title,
     lines,
     origin,
     font,
+    title_scale,
     scale,
     color,
     thickness,
     outline_color,
     outline_thickness,
     line_gap,
+    column_gap,
 ):
     x, y = origin
-    for index, line in enumerate(lines):
+    draw_text_with_outline(
+        frame,
+        title,
+        (x, y),
+        font,
+        title_scale,
+        color,
+        thickness,
+        outline_color,
+        outline_thickness,
+    )
+    (title_w, title_h), _ = cv2.getTextSize(title, font, title_scale, 1)
+    start_y = y + title_h + line_gap
+    split_index = (len(lines) + 1) // 2
+    left_lines = lines[:split_index]
+    right_lines = lines[split_index:]
+    left_width = 0
+    for line in left_lines:
+        (line_w, _), _ = cv2.getTextSize(line, font, scale, 1)
+        left_width = max(left_width, line_w)
+    right_x = x + left_width + column_gap
+    for index, line in enumerate(left_lines):
         draw_text_with_outline(
             frame,
             line,
-            (x, y + index * line_gap),
+            (x, start_y + index * line_gap),
+            font,
+            scale,
+            color,
+            thickness,
+            outline_color,
+            outline_thickness,
+        )
+    for index, line in enumerate(right_lines):
+        draw_text_with_outline(
+            frame,
+            line,
+            (right_x, start_y + index * line_gap),
             font,
             scale,
             color,
@@ -1460,8 +1498,8 @@ while True:
         braking_calibration_status_until = 0.0
 
     if help_overlay_enabled:
+        help_title = "Help (press H to close)"
         help_lines = [
-            "Help (press H to close)",
             "ESC: Exit",
             "H: Toggle this help overlay",
             "S: Toggle simulated steer encoder",
@@ -1477,15 +1515,18 @@ while True:
         ]
         draw_help_overlay(
             combined,
+            help_title,
             help_lines,
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
+            help_title_scale,
             help_text_scale,
             hud_text_color,
             hud_text_thickness,
             hud_text_outline_color,
             hud_text_outline_thickness,
             help_text_line_gap,
+            help_text_column_gap,
         )
     else:
         if calibration_status_text:
