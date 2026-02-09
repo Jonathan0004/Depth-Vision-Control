@@ -1379,6 +1379,10 @@ while True:
         )
 
     if jog_mode_enabled:
+        if not motor_pwm_enabled:
+            enable_motor_pwm()
+        if braking_motor_pwm_enabled:
+            disable_braking_motor_pwm()
         if jog_direction != 0:
             apply_jog_drive(jog_direction)
         else:
@@ -1388,10 +1392,16 @@ while True:
             enable_motor_pwm()
         apply_jog_drive(calibration_jog_direction)
     else:
+        if not motor_pwm_enabled and not braking_jog_mode_enabled:
+            enable_motor_pwm()
         update_motor_control(boosted_blue_x if blue_x is not None else None, encoder_px)
 
     braking_encoder_norm = get_braking_encoder_norm()
     if braking_jog_mode_enabled:
+        if not braking_motor_pwm_enabled:
+            enable_braking_motor_pwm()
+        if motor_pwm_enabled:
+            disable_motor_pwm()
         if braking_jog_direction != 0:
             apply_braking_jog_drive(braking_jog_direction)
         else:
@@ -1401,6 +1411,8 @@ while True:
             enable_braking_motor_pwm()
         apply_braking_jog_drive(braking_calibration_jog_direction)
     else:
+        if not braking_motor_pwm_enabled and not jog_mode_enabled:
+            enable_braking_motor_pwm()
         update_braking_motor_control(braking_target_norm, braking_encoder_norm)
 
     # Draw the guidance circle
@@ -1505,10 +1517,10 @@ while True:
         help_lines = [
             "ESC: End Program",
             "H: Close help overlay",
-            "S: Toggle sim steer encoder",
+            "K: Toggle sim steer encoder",
             "LEFT/RIGHT: Adjust sim steer encoder",
-            "K: Toggle steer jog mode",
-            "J/L: Steer jog left/right",
+            "S: Toggle steer jog mode",
+            "A/D: Steer jog left/right",
             "UP/DOWN: Adjust jog speed",
             "B: Toggle brake jog mode",
             "V/N: Brake jog left/right",
@@ -1544,7 +1556,7 @@ while True:
             else:
                 jog_state = "idle"
             bottom_lines.append(
-                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (J/L to drive, UP/DOWN for speed, K to exit)"
+                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (A/D to drive, UP/DOWN for speed, S to exit)"
             )
         if braking_jog_mode_enabled:
             if braking_jog_direction < 0:
@@ -1557,7 +1569,7 @@ while True:
                 f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, UP/DOWN for speed, B to exit)"
             )
         if sim_encoder_enabled:
-            bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, S to exit")
+            bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, K to exit")
         if not control_active:
             bottom_lines.append('Show help: "h"')
         if bottom_lines:
@@ -1585,7 +1597,7 @@ while True:
     if key == ord('h'):
         help_overlay_enabled = not help_overlay_enabled
 
-    if key == ord('s'):
+    if key == ord('k'):
         sim_encoder_enabled = not sim_encoder_enabled
         if sim_encoder_enabled:
             if latest_encoder_norm is not None:
@@ -1598,14 +1610,23 @@ while True:
             ui_notice_text = "Sim encoder disabled"
             ui_notice_until = time.time() + 3.0
 
-    if key == ord('k'):
+    if key == ord('s'):
         jog_mode_enabled = not jog_mode_enabled
         jog_direction = 0
         apply_jog_drive(0)
         if jog_mode_enabled:
+            braking_jog_mode_enabled = False
+            braking_jog_direction = 0
+            apply_braking_jog_drive(0)
+            if braking_motor_pwm_enabled:
+                disable_braking_motor_pwm()
+            if not motor_pwm_enabled:
+                enable_motor_pwm()
             ui_notice_text = "Steer jog enabled"
             ui_notice_until = time.time() + 3.0
         else:
+            if not braking_motor_pwm_enabled:
+                enable_braking_motor_pwm()
             ui_notice_text = "Steer jog disabled"
             ui_notice_until = time.time() + 3.0
 
@@ -1614,9 +1635,18 @@ while True:
         braking_jog_direction = 0
         apply_braking_jog_drive(0)
         if braking_jog_mode_enabled:
+            jog_mode_enabled = False
+            jog_direction = 0
+            apply_jog_drive(0)
+            if motor_pwm_enabled:
+                disable_motor_pwm()
+            if not braking_motor_pwm_enabled:
+                enable_braking_motor_pwm()
             ui_notice_text = "Brake jog enabled"
             ui_notice_until = time.time() + 3.0
         else:
+            if not motor_pwm_enabled:
+                enable_motor_pwm()
             ui_notice_text = "Brake jog disabled"
             ui_notice_until = time.time() + 3.0
 
@@ -1642,8 +1672,8 @@ while True:
                 enable_braking_motor_pwm()
             apply_braking_jog_drive(braking_calibration_jog_direction)
 
-    elif jog_mode_enabled and key in (ord('j'), ord('l')):
-        requested_direction = -1 if key == ord('j') else 1
+    elif jog_mode_enabled and key in (ord('a'), ord('d')):
+        requested_direction = -1 if key == ord('a') else 1
         if jog_direction == requested_direction:
             jog_direction = 0
         else:
