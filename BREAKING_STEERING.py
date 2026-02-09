@@ -113,8 +113,8 @@ braking_motor_dead_zone_norm = 0.01
 braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
-breakingThresh = 0.25  # fraction of valid depth samples that must be obstacles to brake
-braking_auto_max_duty_pct = 55.0  # max PWM duty allowed when auto-braking to press/release
+breakingThresh = 0.50  # fraction of valid depth samples that must be obstacles to brake
+braking_auto_max_duty_pct = 100.0  # max PWM duty allowed when auto-braking to press/release
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
