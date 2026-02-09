@@ -940,6 +940,13 @@ def start_braking_calibration():
     global braking_calibration_status_text
     global braking_calibration_status_until
     global braking_calibration_jog_direction
+    global jog_mode_enabled, braking_jog_mode_enabled
+    if jog_mode_enabled or braking_jog_mode_enabled:
+        braking_calibration_status_text, braking_calibration_status_until = set_status_message(
+            "Brake cal blocked: exit jog mode first",
+            3.0,
+        )
+        return
     if not braking_encoder_available or braking_encoder_bus is None:
         braking_calibration_status_text, braking_calibration_status_until = set_status_message(
             "Brake cal unavailable: encoder not detected",
@@ -955,7 +962,7 @@ def start_braking_calibration():
     braking_calibration_stage = "min"
     braking_calibration_samples = {}
     braking_calibration_status_text, braking_calibration_status_until = set_status_message(
-        "Brake cal: jog LEFT (V/N), press SPACE to set min",
+        "Brake cal: jog LEFT (V/N), UP/DOWN speed, SPACE to set min",
         None,
     )
 
@@ -994,7 +1001,7 @@ def capture_braking_calibration_point():
         braking_calibration_samples["min"] = raw
         braking_calibration_stage = "max"
         braking_calibration_status_text, braking_calibration_status_until = set_status_message(
-            "Brake cal: jog RIGHT (V/N), press SPACE to set max",
+            "Brake cal: jog RIGHT (V/N), UP/DOWN speed, SPACE to set max",
             None,
         )
     elif braking_calibration_stage == "max":
@@ -1038,6 +1045,13 @@ def get_encoder_norm():
 def start_calibration():
     global calibration_active, calibration_stage, calibration_samples, calibration_status_text, calibration_status_until
     global calibration_jog_direction
+    global jog_mode_enabled, braking_jog_mode_enabled
+    if jog_mode_enabled or braking_jog_mode_enabled:
+        calibration_status_text, calibration_status_until = set_status_message(
+            "Steer cal blocked: exit jog mode first",
+            3.0,
+        )
+        return
     if not encoder_available or encoder_bus is None:
         calibration_status_text, calibration_status_until = set_status_message(
             "Steer cal unavailable: encoder not detected",
@@ -1053,7 +1067,7 @@ def start_calibration():
     calibration_stage = "min"
     calibration_samples = {}
     calibration_status_text, calibration_status_until = set_status_message(
-        "Steer cal: jog LEFT (J/L), press SPACE to set min",
+        "Steer cal: jog LEFT (A/D), UP/DOWN speed, SPACE to set min",
         None,
     )
 
@@ -1088,7 +1102,7 @@ def capture_calibration_point():
         calibration_samples["min"] = raw
         calibration_stage = "max"
         calibration_status_text, calibration_status_until = set_status_message(
-            "Steer cal: jog RIGHT (J/L), press SPACE to set max",
+            "Steer cal: jog RIGHT (A/D), UP/DOWN speed, SPACE to set max",
             None,
         )
     elif calibration_stage == "max":
@@ -1650,8 +1664,8 @@ while True:
             ui_notice_text = "Brake jog disabled"
             ui_notice_until = time.time() + 3.0
 
-    if calibration_active and key in (ord('j'), ord('l')):
-        requested_direction = -1 if key == ord('j') else 1
+    if calibration_active and key in (ord('a'), ord('d')):
+        requested_direction = -1 if key == ord('a') else 1
         if calibration_jog_direction == requested_direction:
             calibration_jog_direction = 0
             apply_jog_drive(0)
@@ -1692,10 +1706,10 @@ while True:
         delta = -simulated_step_norm if key == 81 else simulated_step_norm
         sim_encoder_norm = clamp(sim_encoder_norm + delta, 0.0, 1.0)
 
-    if jog_mode_enabled and key in (82, 84):
+    if (jog_mode_enabled or calibration_active) and key in (82, 84):
         delta = jog_duty_step_pct if key == 82 else -jog_duty_step_pct
         jog_duty_pct = clamp(jog_duty_pct + delta, 0.0, motor_max_duty_pct)
-    if braking_jog_mode_enabled and key in (82, 84):
+    if (braking_jog_mode_enabled or braking_calibration_active) and key in (82, 84):
         delta = braking_jog_duty_step_pct if key == 82 else -braking_jog_duty_step_pct
         braking_jog_duty_pct = clamp(delta + braking_jog_duty_pct, 0.0, braking_motor_max_duty_pct)
 
