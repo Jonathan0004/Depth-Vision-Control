@@ -113,13 +113,7 @@ braking_motor_dead_zone_norm = 0.01
 braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
-# Brake activation tuning
-breakingThresh = 0.35  # fraction of sampled points flagged as obstacles to trigger braking
-braking_brake_speed_limit_pct = 60.0  # max duty percentage while braking to limit actuator speed
-
-# Calibrated braking targets (min/max captured during calibration)
-braking_released_norm = 0.0
-braking_pressed_norm = 1.0
+breakingThresh = None
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -839,7 +833,7 @@ def enable_braking_motor_pwm() -> None:
         GPIO.output(braking_motor_power_pin, GPIO.LOW)
 
 
-def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
+def update_braking_motor_control(target_norm, encoder_norm):
     if target_norm is None or encoder_norm is None or braking_calibration_active:
         _set_braking_motor_direction(0)
         _set_braking_motor_pwm_pct(0.0)
@@ -862,10 +856,8 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
         if braking_motor_full_speed_error_norm > 0
         else 1.0
     )
-    if max_duty_pct is None:
-        max_duty_pct = braking_motor_max_duty_pct
-    scaled_pct = (abs(error) / denom) * max_duty_pct
-    duty_pct = max(0.0, min(max_duty_pct, scaled_pct))
+    scaled_pct = (abs(error) / denom) * braking_motor_max_duty_pct
+    duty_pct = max(0.0, min(braking_motor_max_duty_pct, scaled_pct))
 
     _set_braking_motor_pwm_pct(duty_pct)
     if GPIO is not None and braking_motor_gpio_initialised:
@@ -1282,15 +1274,6 @@ while True:
     thresh = max(depth_diff_threshold, std_multiplier * std_z)
     mask = (mean_z - zs) > thresh
 
-    # Braking trigger: count obstacle density across the full view (both cameras).
-    cam_heights = np.where(cloud['cam'] == 0, frame0.shape[0], frame1.shape[0])
-    valid_band = (cloud['y'] >= top_cutoff_pixels) & (cloud['y'] <= (cam_heights - bottom_cutoff_pixels))
-    total_valid = int(np.count_nonzero(valid_band))
-    obstacle_valid = int(np.count_nonzero(mask & valid_band)) if total_valid else 0
-    obstacle_fullness = (obstacle_valid / total_valid) if total_valid else 0.0
-    braking_active = obstacle_fullness >= breakingThresh
-    braking_target_norm = braking_pressed_norm if braking_active else braking_released_norm
-
     # Convert depth arrays into coloured heatmaps for easier interpretation
     norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
@@ -1444,8 +1427,7 @@ while True:
     else:
         if not braking_motor_pwm_enabled and not jog_mode_enabled:
             enable_braking_motor_pwm()
-        braking_max_duty = braking_brake_speed_limit_pct if braking_active else None
-        update_braking_motor_control(braking_target_norm, braking_encoder_norm, braking_max_duty)
+        update_braking_motor_control(braking_target_norm, braking_encoder_norm)
 
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
