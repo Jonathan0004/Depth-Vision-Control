@@ -851,15 +851,10 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
             GPIO.output(braking_motor_power_pin, GPIO.LOW)
         return
 
-    _set_braking_motor_direction(error)
-    denom = (
-        float(braking_motor_full_speed_error_norm)
-        if braking_motor_full_speed_error_norm > 0
-        else 1.0
-    )
-    scaled_pct = (abs(error) / denom) * braking_motor_max_duty_pct
     duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
-    duty_pct = max(0.0, min(duty_cap, scaled_pct))
+    duty_pct = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
+
+    _set_braking_motor_direction(error)
 
     _set_braking_motor_pwm_pct(duty_pct)
     if GPIO is not None and braking_motor_gpio_initialised:
