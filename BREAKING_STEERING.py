@@ -104,7 +104,7 @@ braking_motor_pwm_chip = "/sys/class/pwm/pwmchip2"
 braking_motor_pwm_channel = 0
 braking_motor_pwm_frequency_hz = 5000
 braking_motor_pwm_pin = 33               # informational only (physical pin number)
-braking_motor_direction_pin = 37         # HIGH = jog right, LOW = jog left
+braking_motor_direction_pin = 37         # HIGH = jog Press, LOW = jog Release
 braking_motor_power_pin = 22             # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
 
 braking_motor_max_duty_pct = 100.0
@@ -546,7 +546,7 @@ braking_motor_gpio_initialised = False
 braking_motor_last_duty_ns = None
 braking_motor_pwm_enabled = False
 braking_jog_mode_enabled = False
-braking_jog_direction = 0  # -1 left, 0 idle, +1 right
+braking_jog_direction = 0  # -1 Release, 0 idle, +1 Press
 braking_jog_duty_pct = braking_jog_default_duty_pct
 
 braking_latest_encoder_raw = None
@@ -962,7 +962,7 @@ def start_braking_calibration():
     braking_calibration_stage = "min"
     braking_calibration_samples = {}
     braking_calibration_status_text, braking_calibration_status_until = set_status_message(
-        "Brake cal: jog LEFT (V/N), UP/DOWN speed, SPACE to set min",
+        "Brake cal: jog RELEASE (V/N), UP/DOWN speed, SPACE to set Released",
         None,
     )
 
@@ -1001,7 +1001,7 @@ def capture_braking_calibration_point():
         braking_calibration_samples["min"] = raw
         braking_calibration_stage = "max"
         braking_calibration_status_text, braking_calibration_status_until = set_status_message(
-            "Brake cal: jog RIGHT (V/N), UP/DOWN speed, SPACE to set max",
+            "Brake cal: jog PRESS (V/N), UP/DOWN speed, SPACE to set Pressed",
             None,
         )
     elif braking_calibration_stage == "max":
@@ -1537,7 +1537,7 @@ while True:
             "A/D: Steer jog left/right",
             "UP/DOWN: Adjust jog speed",
             "B: Toggle brake jog mode",
-            "V/N: Brake jog left/right",
+            "V/N: Brake jog Release/Press",
             "C: Start steer calibration",
             "X: Start brake calibration",
             "SPACE: Capture calibration",
@@ -1574,9 +1574,9 @@ while True:
             )
         if braking_jog_mode_enabled:
             if braking_jog_direction < 0:
-                braking_jog_state = "left"
+                braking_jog_state = "Release"
             elif braking_jog_direction > 0:
-                braking_jog_state = "right"
+                braking_jog_state = "Press"
             else:
                 braking_jog_state = "idle"
             bottom_lines.append(
