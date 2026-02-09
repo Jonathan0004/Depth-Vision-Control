@@ -2,7 +2,7 @@ import json
 import queue
 import time
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 
 import cv2
 import numpy as np
@@ -524,6 +524,7 @@ calibration_jog_direction = 0
 ui_notice_text = ""
 ui_notice_until = 0.0
 help_overlay_enabled = False
+jog_state_lock = Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1189,49 @@ Thread(target=grab, args=(cap0, frame_q0), daemon=True).start()
 Thread(target=grab, args=(cap1, frame_q1), daemon=True).start()
 
 
+def _monotonic_now() -> float:
+    return time.monotonic()
+
+
+def _jog_release_watchdog():
+    """Stop jog motion promptly when key-repeat events stop."""
+    global jog_direction
+    global calibration_jog_direction
+    global braking_jog_direction
+    global braking_calibration_jog_direction
+    while running:
+        now = _monotonic_now()
+        with jog_state_lock:
+            if jog_mode_enabled and jog_direction != 0 and now - last_jog_key_time > jog_release_timeout_s:
+                jog_direction = 0
+                apply_jog_drive(0)
+            if (
+                calibration_active
+                and calibration_jog_direction != 0
+                and now - last_calibration_jog_key_time > jog_release_timeout_s
+            ):
+                calibration_jog_direction = 0
+                apply_jog_drive(0)
+            if (
+                braking_jog_mode_enabled
+                and braking_jog_direction != 0
+                and now - last_braking_jog_key_time > jog_release_timeout_s
+            ):
+                braking_jog_direction = 0
+                apply_braking_jog_drive(0)
+            if (
+                braking_calibration_active
+                and braking_calibration_jog_direction != 0
+                and now - last_braking_calibration_jog_key_time > jog_release_timeout_s
+            ):
+                braking_calibration_jog_direction = 0
+                apply_braking_jog_drive(0)
+        time.sleep(0.01)
+
+
+Thread(target=_jog_release_watchdog, daemon=True).start()
+
+
 def _ensure_sample_grid(height, width, x_offset):
     """Build and cache integer pixel coordinates for sparse depth sampling."""
     key = (height, width, x_offset)
@@ -1631,13 +1675,15 @@ while True:
 
     if key == ord('s'):
         jog_mode_enabled = not jog_mode_enabled
-        jog_direction = 0
-        last_jog_key_time = 0.0
+        with jog_state_lock:
+            jog_direction = 0
+            last_jog_key_time = 0.0
         apply_jog_drive(0)
         if jog_mode_enabled:
             braking_jog_mode_enabled = False
-            braking_jog_direction = 0
-            last_braking_jog_key_time = 0.0
+            with jog_state_lock:
+                braking_jog_direction = 0
+                last_braking_jog_key_time = 0.0
             apply_braking_jog_drive(0)
             if braking_motor_pwm_enabled:
                 disable_braking_motor_pwm()
@@ -1653,13 +1699,15 @@ while True:
 
     if key == ord('b'):
         braking_jog_mode_enabled = not braking_jog_mode_enabled
-        braking_jog_direction = 0
-        last_braking_jog_key_time = 0.0
+        with jog_state_lock:
+            braking_jog_direction = 0
+            last_braking_jog_key_time = 0.0
         apply_braking_jog_drive(0)
         if braking_jog_mode_enabled:
             jog_mode_enabled = False
-            jog_direction = 0
-            last_jog_key_time = 0.0
+            with jog_state_lock:
+                jog_direction = 0
+                last_jog_key_time = 0.0
             apply_jog_drive(0)
             if motor_pwm_enabled:
                 disable_motor_pwm()
@@ -1675,30 +1723,34 @@ while True:
 
     if calibration_active and key in (ord('a'), ord('d')):
         requested_direction = -1 if key == ord('a') else 1
-        calibration_jog_direction = requested_direction
-        last_calibration_jog_key_time = time.time()
+        with jog_state_lock:
+            calibration_jog_direction = requested_direction
+            last_calibration_jog_key_time = _monotonic_now()
         if not motor_pwm_enabled:
             enable_motor_pwm()
         apply_jog_drive(calibration_jog_direction)
 
     if braking_calibration_active and key in (ord('v'), ord('n')):
         requested_direction = -1 if key == ord('v') else 1
-        braking_calibration_jog_direction = requested_direction
-        last_braking_calibration_jog_key_time = time.time()
+        with jog_state_lock:
+            braking_calibration_jog_direction = requested_direction
+            last_braking_calibration_jog_key_time = _monotonic_now()
         if not braking_motor_pwm_enabled:
             enable_braking_motor_pwm()
         apply_braking_jog_drive(braking_calibration_jog_direction)
 
     elif jog_mode_enabled and key in (ord('a'), ord('d')):
         requested_direction = -1 if key == ord('a') else 1
-        jog_direction = requested_direction
-        last_jog_key_time = time.time()
+        with jog_state_lock:
+            jog_direction = requested_direction
+            last_jog_key_time = _monotonic_now()
         apply_jog_drive(jog_direction)
 
     elif braking_jog_mode_enabled and key in (ord('v'), ord('n')):
         requested_direction = -1 if key == ord('v') else 1
-        braking_jog_direction = requested_direction
-        last_braking_jog_key_time = time.time()
+        with jog_state_lock:
+            braking_jog_direction = requested_direction
+            last_braking_jog_key_time = _monotonic_now()
         apply_braking_jog_drive(braking_jog_direction)
 
     if sim_encoder_enabled and key in (81, 83):
@@ -1711,24 +1763,6 @@ while True:
     if (braking_jog_mode_enabled or braking_calibration_active) and key in (82, 84):
         delta = braking_jog_duty_step_pct if key == 82 else -braking_jog_duty_step_pct
         braking_jog_duty_pct = clamp(delta + braking_jog_duty_pct, 0.0, braking_motor_max_duty_pct)
-
-    now_release = time.time()
-    if jog_mode_enabled and jog_direction != 0 and now_release - last_jog_key_time > jog_release_timeout_s:
-        jog_direction = 0
-        apply_jog_drive(0)
-    if calibration_active and calibration_jog_direction != 0 and now_release - last_calibration_jog_key_time > jog_release_timeout_s:
-        calibration_jog_direction = 0
-        apply_jog_drive(0)
-    if braking_jog_mode_enabled and braking_jog_direction != 0 and now_release - last_braking_jog_key_time > jog_release_timeout_s:
-        braking_jog_direction = 0
-        apply_braking_jog_drive(0)
-    if (
-        braking_calibration_active
-        and braking_calibration_jog_direction != 0
-        and now_release - last_braking_calibration_jog_key_time > jog_release_timeout_s
-    ):
-        braking_calibration_jog_direction = 0
-        apply_braking_jog_drive(0)
 
     if key == ord('c'):
         start_calibration()
