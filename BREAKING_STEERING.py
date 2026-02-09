@@ -113,7 +113,8 @@ braking_motor_dead_zone_norm = 0.01
 braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
-breakingThresh = None
+breakingThresh = 0.25  # fraction of valid depth samples that must be obstacles to brake
+braking_auto_max_duty_pct = 55.0  # max PWM duty allowed when auto-braking to press/release
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -833,7 +834,7 @@ def enable_braking_motor_pwm() -> None:
         GPIO.output(braking_motor_power_pin, GPIO.LOW)
 
 
-def update_braking_motor_control(target_norm, encoder_norm):
+def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
     if target_norm is None or encoder_norm is None or braking_calibration_active:
         _set_braking_motor_direction(0)
         _set_braking_motor_pwm_pct(0.0)
@@ -857,7 +858,8 @@ def update_braking_motor_control(target_norm, encoder_norm):
         else 1.0
     )
     scaled_pct = (abs(error) / denom) * braking_motor_max_duty_pct
-    duty_pct = max(0.0, min(braking_motor_max_duty_pct, scaled_pct))
+    duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
+    duty_pct = max(0.0, min(duty_cap, scaled_pct))
 
     _set_braking_motor_pwm_pct(duty_pct)
     if GPIO is not None and braking_motor_gpio_initialised:
@@ -1290,8 +1292,16 @@ while True:
     # Show combined view
     combined = np.hstack((cmap0, cmap1))
 
-    
-    
+    cam_indices_all = cloud['cam']
+    heights_all = np.where(cam_indices_all == 0, frame0.shape[0], frame1.shape[0])
+    valid_band = (cloud['y'] >= top_cutoff_pixels) & (cloud['y'] <= (heights_all - bottom_cutoff_pixels))
+    total_valid = int(np.count_nonzero(valid_band))
+    obstacle_valid = int(np.count_nonzero(mask & valid_band)) if total_valid else 0
+    obstacle_fill_ratio = obstacle_valid / total_valid if total_valid else 0.0
+
+    should_brake = obstacle_fill_ratio >= breakingThresh
+    braking_target_norm = 1.0 if should_brake else 0.0
+
     # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
     h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
 
@@ -1427,7 +1437,11 @@ while True:
     else:
         if not braking_motor_pwm_enabled and not jog_mode_enabled:
             enable_braking_motor_pwm()
-        update_braking_motor_control(braking_target_norm, braking_encoder_norm)
+        update_braking_motor_control(
+            braking_target_norm,
+            braking_encoder_norm,
+            max_duty_pct=braking_auto_max_duty_pct,
+        )
 
     # Draw the guidance circle
     blue_pos = (draw_x, line_y)
