@@ -83,6 +83,7 @@ motor_dead_zone_px = 5              # +/- range in which motor output is disable
 
 jog_default_duty_pct = 50.0         # default jog duty percentage when jog mode toggles on
 jog_duty_step_pct = 5.0             # amount to adjust jog duty via arrow keys
+jog_hold_timeout_s = 0.2            # seconds before releasing a held jog key stops motion
 
 # ---------------------------------------------------------------------------
 
@@ -520,6 +521,7 @@ calibration_status_text = ""
 calibration_status_until = 0.0
 calibration_samples = {}
 calibration_jog_direction = 0
+calibration_jog_last_input_time = 0.0
 ui_notice_text = ""
 ui_notice_until = 0.0
 help_overlay_enabled = False
@@ -538,6 +540,7 @@ motor_pwm_enabled = False
 jog_mode_enabled = False
 jog_direction = 0  # -1 left, 0 idle, +1 right
 jog_duty_pct = jog_default_duty_pct
+jog_last_input_time = 0.0
 
 braking_motor_pwm_period_ns = _ns_period(braking_motor_pwm_frequency_hz)
 braking_motor_pwm_channel_path = None
@@ -548,6 +551,7 @@ braking_motor_pwm_enabled = False
 braking_jog_mode_enabled = False
 braking_jog_direction = 0  # -1 left, 0 idle, +1 right
 braking_jog_duty_pct = braking_jog_default_duty_pct
+braking_jog_last_input_time = 0.0
 
 braking_latest_encoder_raw = None
 braking_latest_encoder_norm = None
@@ -557,6 +561,7 @@ braking_calibration_status_text = ""
 braking_calibration_status_until = 0.0
 braking_calibration_samples = {}
 braking_calibration_jog_direction = 0
+braking_calibration_jog_last_input_time = 0.0
 braking_target_norm = None
 
 
@@ -940,6 +945,7 @@ def start_braking_calibration():
     global braking_calibration_status_text
     global braking_calibration_status_until
     global braking_calibration_jog_direction
+    global braking_calibration_jog_last_input_time
     global jog_mode_enabled, braking_jog_mode_enabled
     if jog_mode_enabled or braking_jog_mode_enabled:
         braking_calibration_status_text, braking_calibration_status_until = set_status_message(
@@ -957,6 +963,7 @@ def start_braking_calibration():
         return
     disable_braking_motor_pwm()
     braking_calibration_jog_direction = 0
+    braking_calibration_jog_last_input_time = 0.0
     apply_braking_jog_drive(0)
     braking_calibration_active = True
     braking_calibration_stage = "min"
@@ -974,6 +981,7 @@ def capture_braking_calibration_point():
     global braking_calibration_status_until
     global braking_calibration_samples
     global braking_calibration_jog_direction
+    global braking_calibration_jog_last_input_time
     if not braking_encoder_available or braking_encoder_bus is None:
         braking_calibration_status_text, braking_calibration_status_until = set_status_message(
             "Brake cal failed: encoder not detected",
@@ -982,6 +990,7 @@ def capture_braking_calibration_point():
         braking_calibration_active = False
         braking_calibration_stage = None
         braking_calibration_jog_direction = 0
+        braking_calibration_jog_last_input_time = 0.0
         apply_braking_jog_drive(0)
         enable_braking_motor_pwm()
         return
@@ -994,6 +1003,7 @@ def capture_braking_calibration_point():
         braking_calibration_active = False
         braking_calibration_stage = None
         braking_calibration_jog_direction = 0
+        braking_calibration_jog_last_input_time = 0.0
         apply_braking_jog_drive(0)
         enable_braking_motor_pwm()
         return
@@ -1022,6 +1032,7 @@ def capture_braking_calibration_point():
         braking_calibration_active = False
         braking_calibration_stage = None
         braking_calibration_jog_direction = 0
+        braking_calibration_jog_last_input_time = 0.0
         apply_braking_jog_drive(0)
         enable_braking_motor_pwm()
 
@@ -1045,6 +1056,7 @@ def get_encoder_norm():
 def start_calibration():
     global calibration_active, calibration_stage, calibration_samples, calibration_status_text, calibration_status_until
     global calibration_jog_direction
+    global calibration_jog_last_input_time
     global jog_mode_enabled, braking_jog_mode_enabled
     if jog_mode_enabled or braking_jog_mode_enabled:
         calibration_status_text, calibration_status_until = set_status_message(
@@ -1062,6 +1074,7 @@ def start_calibration():
         return
     disable_motor_pwm()
     calibration_jog_direction = 0
+    calibration_jog_last_input_time = 0.0
     apply_jog_drive(0)
     calibration_active = True
     calibration_stage = "min"
@@ -1075,6 +1088,7 @@ def start_calibration():
 def capture_calibration_point():
     global calibration_active, calibration_stage, calibration_status_text, calibration_status_until
     global calibration_samples, calibration_jog_direction
+    global calibration_jog_last_input_time
     if not encoder_available or encoder_bus is None:
         calibration_status_text, calibration_status_until = set_status_message(
             "Steer cal failed: encoder not detected",
@@ -1083,6 +1097,7 @@ def capture_calibration_point():
         calibration_active = False
         calibration_stage = None
         calibration_jog_direction = 0
+        calibration_jog_last_input_time = 0.0
         apply_jog_drive(0)
         enable_motor_pwm()
         return
@@ -1095,6 +1110,7 @@ def capture_calibration_point():
         calibration_active = False
         calibration_stage = None
         calibration_jog_direction = 0
+        calibration_jog_last_input_time = 0.0
         apply_jog_drive(0)
         enable_motor_pwm()
         return
@@ -1123,6 +1139,7 @@ def capture_calibration_point():
         calibration_active = False
         calibration_stage = None
         calibration_jog_direction = 0
+        calibration_jog_last_input_time = 0.0
         apply_jog_drive(0)
         enable_motor_pwm()
 
@@ -1242,6 +1259,7 @@ while True:
         frame0, depth0, frame1, depth1 = result_q.get(timeout=0.01)
     except queue.Empty:
         continue
+    loop_time = time.time()
 
     # Build a sparse point cloud by sampling each depth map on a coarse grid
     h0, w0 = depth0.shape
@@ -1392,6 +1410,15 @@ while True:
             1,
         )
 
+    if jog_mode_enabled and jog_direction != 0:
+        if loop_time - jog_last_input_time > jog_hold_timeout_s:
+            jog_direction = 0
+            apply_jog_drive(0)
+    if calibration_active and calibration_jog_direction != 0:
+        if loop_time - calibration_jog_last_input_time > jog_hold_timeout_s:
+            calibration_jog_direction = 0
+            apply_jog_drive(0)
+
     if jog_mode_enabled:
         if not motor_pwm_enabled:
             enable_motor_pwm()
@@ -1411,6 +1438,15 @@ while True:
         update_motor_control(boosted_blue_x if blue_x is not None else None, encoder_px)
 
     braking_encoder_norm = get_braking_encoder_norm()
+    if braking_jog_mode_enabled and braking_jog_direction != 0:
+        if loop_time - braking_jog_last_input_time > jog_hold_timeout_s:
+            braking_jog_direction = 0
+            apply_braking_jog_drive(0)
+    if braking_calibration_active and braking_calibration_jog_direction != 0:
+        if loop_time - braking_calibration_jog_last_input_time > jog_hold_timeout_s:
+            braking_calibration_jog_direction = 0
+            apply_braking_jog_drive(0)
+
     if braking_jog_mode_enabled:
         if not braking_motor_pwm_enabled:
             enable_braking_motor_pwm()
@@ -1518,7 +1554,7 @@ while True:
         or calibration_active
         or braking_calibration_active
     )
-    now = time.time()
+    now = loop_time
     if calibration_status_text and calibration_status_until and now > calibration_status_until:
         calibration_status_text = ""
         calibration_status_until = 0.0
@@ -1534,10 +1570,10 @@ while True:
             "K: Toggle sim steer encoder",
             "LEFT/RIGHT: Adjust sim steer encoder",
             "S: Toggle steer jog mode",
-            "A/D: Steer jog left/right",
+            "Hold A/D: Steer jog left/right",
             "UP/DOWN: Adjust jog speed",
             "B: Toggle brake jog mode",
-            "V/N: Brake jog left/right",
+            "Hold V/N: Brake jog left/right",
             "C: Start steer calibration",
             "X: Start brake calibration",
             "SPACE: Capture calibration",
@@ -1570,7 +1606,7 @@ while True:
             else:
                 jog_state = "idle"
             bottom_lines.append(
-                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (A/D to drive, UP/DOWN for speed, S to exit)"
+                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (hold A/D, UP/DOWN for speed, S to exit)"
             )
         if braking_jog_mode_enabled:
             if braking_jog_direction < 0:
@@ -1580,7 +1616,7 @@ while True:
             else:
                 braking_jog_state = "idle"
             bottom_lines.append(
-                f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, UP/DOWN for speed, B to exit)"
+                f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (hold V/N, UP/DOWN for speed, B to exit)"
             )
         if sim_encoder_enabled:
             bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, K to exit")
@@ -1627,10 +1663,12 @@ while True:
     if key == ord('s'):
         jog_mode_enabled = not jog_mode_enabled
         jog_direction = 0
+        jog_last_input_time = 0.0
         apply_jog_drive(0)
         if jog_mode_enabled:
             braking_jog_mode_enabled = False
             braking_jog_direction = 0
+            braking_jog_last_input_time = 0.0
             apply_braking_jog_drive(0)
             if braking_motor_pwm_enabled:
                 disable_braking_motor_pwm()
@@ -1647,10 +1685,12 @@ while True:
     if key == ord('b'):
         braking_jog_mode_enabled = not braking_jog_mode_enabled
         braking_jog_direction = 0
+        braking_jog_last_input_time = 0.0
         apply_braking_jog_drive(0)
         if braking_jog_mode_enabled:
             jog_mode_enabled = False
             jog_direction = 0
+            jog_last_input_time = 0.0
             apply_jog_drive(0)
             if motor_pwm_enabled:
                 disable_motor_pwm()
@@ -1666,40 +1706,30 @@ while True:
 
     if calibration_active and key in (ord('a'), ord('d')):
         requested_direction = -1 if key == ord('a') else 1
-        if calibration_jog_direction == requested_direction:
-            calibration_jog_direction = 0
-            apply_jog_drive(0)
-        else:
-            calibration_jog_direction = requested_direction
-            if not motor_pwm_enabled:
-                enable_motor_pwm()
-            apply_jog_drive(calibration_jog_direction)
+        calibration_jog_direction = requested_direction
+        calibration_jog_last_input_time = time.time()
+        if not motor_pwm_enabled:
+            enable_motor_pwm()
+        apply_jog_drive(calibration_jog_direction)
 
     if braking_calibration_active and key in (ord('v'), ord('n')):
         requested_direction = -1 if key == ord('v') else 1
-        if braking_calibration_jog_direction == requested_direction:
-            braking_calibration_jog_direction = 0
-            apply_braking_jog_drive(0)
-        else:
-            braking_calibration_jog_direction = requested_direction
-            if not braking_motor_pwm_enabled:
-                enable_braking_motor_pwm()
-            apply_braking_jog_drive(braking_calibration_jog_direction)
+        braking_calibration_jog_direction = requested_direction
+        braking_calibration_jog_last_input_time = time.time()
+        if not braking_motor_pwm_enabled:
+            enable_braking_motor_pwm()
+        apply_braking_jog_drive(braking_calibration_jog_direction)
 
     elif jog_mode_enabled and key in (ord('a'), ord('d')):
         requested_direction = -1 if key == ord('a') else 1
-        if jog_direction == requested_direction:
-            jog_direction = 0
-        else:
-            jog_direction = requested_direction
+        jog_direction = requested_direction
+        jog_last_input_time = time.time()
         apply_jog_drive(jog_direction)
 
     elif braking_jog_mode_enabled and key in (ord('v'), ord('n')):
         requested_direction = -1 if key == ord('v') else 1
-        if braking_jog_direction == requested_direction:
-            braking_jog_direction = 0
-        else:
-            braking_jog_direction = requested_direction
+        braking_jog_direction = requested_direction
+        braking_jog_last_input_time = time.time()
         apply_braking_jog_drive(braking_jog_direction)
 
     if sim_encoder_enabled and key in (81, 83):
