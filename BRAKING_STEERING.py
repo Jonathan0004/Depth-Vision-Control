@@ -113,7 +113,7 @@ braking_motor_dead_zone_norm = 0.01
 braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
-breakingThresh = 0.40  # fraction of valid depth samples that must be obstacles to brake
+brakeConf = 0.40  # brake when steerability confidence drops below this threshold
 braking_auto_max_duty_pct = 100.0  # max PWM duty allowed when auto-braking to press/release
 
 # HUD text overlays on the combined frame
@@ -129,7 +129,7 @@ help_title_scale = 0.7
 help_text_scale = 0.48
 help_text_line_gap = 18
 help_text_column_gap = 40
-obstacle_coverage_text_margin = 12
+confidence_text_margin = 12
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -1294,10 +1294,6 @@ while True:
     total_valid = int(np.count_nonzero(valid_band))
     obstacle_valid = int(np.count_nonzero(mask & valid_band)) if total_valid else 0
     obstacle_fill_ratio = obstacle_valid / total_valid if total_valid else 0.0
-    obstacle_coverage_pct = obstacle_fill_ratio * 100.0
-
-    should_brake = obstacle_fill_ratio >= breakingThresh
-    braking_target_norm = 1.0 if should_brake else 0.0
 
     # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
     h_combined, w_combined = frame0.shape[0], frame0.shape[1] + frame1.shape[1]
@@ -1364,6 +1360,71 @@ while True:
         gap_cx = center_x
     else:
         gap_cx = widest_gap_center(blockers_all, preferred_x=center_x)
+
+    # Confidence model for steerability (0.0-1.0):
+    # High confidence means there is a clear, sufficiently large, and reasonably distant
+    # corridor to steer through and the target is stable from frame to frame.
+    in_band_mask = mask & valid_band
+    in_band_obstacles = cloud[in_band_mask]
+
+    if in_band_obstacles.size:
+        obs_x = in_band_obstacles['x']
+        obs_z = in_band_obstacles['z']
+
+        # Penalise scenes with many nearby obstacles (noise/jumpy steering risk)
+        mean_z = float(zs.mean()) if zs.size else 0.0
+        depth_std = float(zs.std()) if zs.size else 0.0
+        near_cutoff = mean_z - max(depth_diff_threshold, 0.5 * depth_std)
+        near_fraction = float(np.mean(obs_z <= near_cutoff)) if obs_z.size else 0.0
+
+        # Determine the largest horizontal open window among obstacle x-positions
+        blockers_conf = np.concatenate(([0.0], np.sort(obs_x.astype(np.float32)), [float(w_combined)]))
+        gap_widths = np.diff(blockers_conf)
+        largest_gap_px = float(gap_widths.max()) if gap_widths.size else float(w_combined)
+
+        # Use obstacle depth around the selected gap to estimate corridor distance
+        gap_left = 0.0
+        gap_right = float(w_combined)
+        for left, right in zip(blockers_conf[:-1], blockers_conf[1:]):
+            cx = 0.5 * (left + right)
+            if int(round(cx)) == int(gap_cx):
+                gap_left, gap_right = float(left), float(right)
+                break
+        near_gap = (obs_x >= max(0.0, gap_left - 30.0)) & (obs_x <= min(float(w_combined), gap_right + 30.0))
+        if np.any(near_gap):
+            gap_depth = float(np.median(obs_z[near_gap]))
+        else:
+            gap_depth = float(np.median(obs_z))
+
+        # Normalised quality terms
+        gap_quality = clamp(largest_gap_px / max(1.0, (0.25 * w_combined)), 0.0, 1.0)
+        distance_quality = clamp((gap_depth - (mean_z - depth_diff_threshold)) / max(1.0, depth_diff_threshold * 2.0), 0.0, 1.0)
+        clutter_penalty = clamp(obstacle_fill_ratio, 0.0, 1.0)
+        near_penalty = clamp(near_fraction, 0.0, 1.0)
+    else:
+        largest_gap_px = float(w_combined)
+        gap_quality = 1.0
+        distance_quality = 1.0
+        clutter_penalty = 0.0
+        near_penalty = 0.0
+
+    # Target stability quality based on how much the plan jumps frame-to-frame.
+    if blue_x is None:
+        stability_quality = 1.0
+    else:
+        jump_px = abs(float(gap_cx) - float(blue_x))
+        stability_quality = 1.0 - clamp(jump_px / max(1.0, 0.35 * w_combined), 0.0, 1.0)
+
+    steering_confidence = (
+        0.42 * gap_quality
+        + 0.24 * distance_quality
+        + 0.20 * stability_quality
+        + 0.14 * (1.0 - clamp(0.65 * clutter_penalty + 0.35 * near_penalty, 0.0, 1.0))
+    )
+    steering_confidence = clamp(float(steering_confidence), 0.0, 1.0)
+
+    should_brake = steering_confidence < brakeConf
+    braking_target_norm = 1.0 if should_brake else 0.0
 
     # Smooth horizontal motion (keep as FLOAT; don't floor!)
     if blue_x is None:
@@ -1506,22 +1567,27 @@ while True:
         pull_zone_line_thickness,
     )
 
-    obstacle_coverage_text = f"Obstacal coverage: {obstacle_coverage_pct:.1f}%"
-    (obstacle_text_w, obstacle_text_h), _ = cv2.getTextSize(
-        obstacle_coverage_text,
+    confidence_text = f"Steering Confidence: {steering_confidence:.2f}"
+    confidence_color = (
+        0,
+        int(round(255.0 * steering_confidence)),
+        int(round(255.0 * (1.0 - steering_confidence))),
+    )
+    (confidence_text_w, confidence_text_h), _ = cv2.getTextSize(
+        confidence_text,
         cv2.FONT_HERSHEY_SIMPLEX,
         hud_text_scale,
         hud_text_thickness,
     )
-    obstacle_text_x = max(obstacle_coverage_text_margin, w_combined - obstacle_text_w - obstacle_coverage_text_margin)
-    obstacle_text_y = obstacle_coverage_text_margin + obstacle_text_h
+    confidence_text_x = max(confidence_text_margin, w_combined - confidence_text_w - confidence_text_margin)
+    confidence_text_y = confidence_text_margin + confidence_text_h
     draw_text_with_outline(
         combined,
-        obstacle_coverage_text,
-        (obstacle_text_x, obstacle_text_y),
+        confidence_text,
+        (confidence_text_x, confidence_text_y),
         cv2.FONT_HERSHEY_SIMPLEX,
         hud_text_scale,
-        hud_text_color,
+        confidence_color,
         hud_text_thickness,
         hud_text_outline_color,
         hud_text_outline_thickness,
