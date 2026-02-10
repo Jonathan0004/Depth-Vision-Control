@@ -113,8 +113,7 @@ braking_motor_dead_zone_norm = 0.01
 braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
-min_steer_window_px = 120  # minimum opening width (px) considered safely steerable
-braking_confidence_threshold = 0.45  # brake when open-window confidence falls below this
+breakingThresh = 0.40  # fraction of valid depth samples that must be obstacles to brake
 braking_auto_max_duty_pct = 100.0  # max PWM duty allowed when auto-braking to press/release
 
 # HUD text overlays on the combined frame
@@ -1292,50 +1291,12 @@ while True:
     cam_indices_all = cloud['cam']
     heights_all = np.where(cam_indices_all == 0, frame0.shape[0], frame1.shape[0])
     valid_band = (cloud['y'] >= top_cutoff_pixels) & (cloud['y'] <= (heights_all - bottom_cutoff_pixels))
+    total_valid = int(np.count_nonzero(valid_band))
+    obstacle_valid = int(np.count_nonzero(mask & valid_band)) if total_valid else 0
+    obstacle_fill_ratio = obstacle_valid / total_valid if total_valid else 0.0
+    obstacle_coverage_pct = obstacle_fill_ratio * 100.0
 
-    # Build a steerability confidence score based on the best available opening.
-    # Confidence increases when a wide window exists and when nearby obstacles are sparse.
-    obstacle_band_mask = mask & valid_band
-    obstacle_xs = cloud['x'][obstacle_band_mask]
-    obstacle_zs = cloud['z'][obstacle_band_mask]
-
-    confidence_frame_width = frame0.shape[1] + frame1.shape[1]
-    blockers_for_confidence = [0, confidence_frame_width]
-    if obstacle_xs.size:
-        blockers_for_confidence.extend(np.unique(obstacle_xs.astype(np.int32)).tolist())
-    blockers_for_confidence = sorted(set(blockers_for_confidence))
-
-    best_window_width = 0.0
-    best_window_distance_score = 0.0
-    for left, right in zip(blockers_for_confidence[:-1], blockers_for_confidence[1:]):
-        window_width = float(right - left)
-        if window_width <= 0:
-            continue
-        if obstacle_xs.size:
-            in_window = (obstacle_xs >= left) & (obstacle_xs <= right)
-            if np.any(in_window):
-                nearest_obstacle = float(np.min(obstacle_zs[in_window]))
-                mean_scene_depth = float(np.mean(cloud['z'][valid_band])) if np.any(valid_band) else float(np.mean(cloud['z']))
-                window_distance_score = np.clip(nearest_obstacle / max(mean_scene_depth, 1e-6), 0.0, 1.0)
-            else:
-                window_distance_score = 1.0
-        else:
-            window_distance_score = 1.0
-
-        width_score = np.clip(window_width / max(float(min_steer_window_px), 1.0), 0.0, 1.0)
-        steer_score = width_score * window_distance_score
-
-        if steer_score > (best_window_width / max(float(min_steer_window_px), 1.0)) * best_window_distance_score:
-            best_window_width = window_width
-            best_window_distance_score = window_distance_score
-
-    if best_window_width <= 0:
-        open_window_confidence = 0.0
-    else:
-        width_score = np.clip(best_window_width / max(float(min_steer_window_px), 1.0), 0.0, 1.0)
-        open_window_confidence = float(np.clip(width_score * best_window_distance_score, 0.0, 1.0))
-
-    should_brake = open_window_confidence < braking_confidence_threshold
+    should_brake = obstacle_fill_ratio >= breakingThresh
     braking_target_norm = 1.0 if should_brake else 0.0
 
     # === 🟦 HORIZONTAL GAP ROUTE PLANNER ────────────────────────────────
@@ -1545,9 +1506,9 @@ while True:
         pull_zone_line_thickness,
     )
 
-    confidence_text = f"Open-window confidence: {open_window_confidence:.2f}"
+    obstacle_coverage_text = f"Obstacal coverage: {obstacle_coverage_pct:.1f}%"
     (obstacle_text_w, obstacle_text_h), _ = cv2.getTextSize(
-        confidence_text,
+        obstacle_coverage_text,
         cv2.FONT_HERSHEY_SIMPLEX,
         hud_text_scale,
         hud_text_thickness,
@@ -1556,7 +1517,7 @@ while True:
     obstacle_text_y = obstacle_coverage_text_margin + obstacle_text_h
     draw_text_with_outline(
         combined,
-        confidence_text,
+        obstacle_coverage_text,
         (obstacle_text_x, obstacle_text_y),
         cv2.FONT_HERSHEY_SIMPLEX,
         hud_text_scale,
