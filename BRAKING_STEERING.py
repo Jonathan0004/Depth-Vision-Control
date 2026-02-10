@@ -114,6 +114,7 @@ braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
 brakeConf = 0.40  # brake when steerability confidence drops below this threshold
+brake_hold_seconds = 5.0  # keep brake fully pressed for this long after confidence-triggered braking
 braking_auto_max_duty_pct = 100.0  # max PWM duty allowed when auto-braking to press/release
 
 # HUD text overlays on the combined frame
@@ -560,6 +561,7 @@ braking_calibration_status_until = 0.0
 braking_calibration_samples = {}
 braking_calibration_jog_direction = 0
 braking_target_norm = None
+brake_hold_until = 0.0
 
 
 def initialise_motor_control():
@@ -1423,7 +1425,10 @@ while True:
     )
     steering_confidence = clamp(float(steering_confidence), 0.0, 1.0)
 
-    should_brake = steering_confidence < brakeConf
+    if steering_confidence < brakeConf:
+        brake_hold_until = time.monotonic() + max(0.0, float(brake_hold_seconds))
+
+    should_brake = time.monotonic() < brake_hold_until
     braking_target_norm = 1.0 if should_brake else 0.0
 
     # Smooth horizontal motion (keep as FLOAT; don't floor!)
