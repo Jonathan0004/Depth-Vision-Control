@@ -129,6 +129,7 @@ help_title_scale = 0.7
 help_text_scale = 0.48
 help_text_line_gap = 18
 help_text_column_gap = 40
+obstacle_coverage_text_margin = 12
 
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
@@ -1293,6 +1294,7 @@ while True:
     total_valid = int(np.count_nonzero(valid_band))
     obstacle_valid = int(np.count_nonzero(mask & valid_band)) if total_valid else 0
     obstacle_fill_ratio = obstacle_valid / total_valid if total_valid else 0.0
+    obstacle_coverage_pct = obstacle_fill_ratio * 100.0
 
     should_brake = obstacle_fill_ratio >= breakingThresh
     braking_target_norm = 1.0 if should_brake else 0.0
@@ -1502,6 +1504,27 @@ while True:
         (int(zone_right), h_combined),
         pull_zone_line_color,
         pull_zone_line_thickness,
+    )
+
+    obstacle_coverage_text = f"Obstacal coverage: {obstacle_coverage_pct:.1f}%"
+    (obstacle_text_w, obstacle_text_h), _ = cv2.getTextSize(
+        obstacle_coverage_text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_thickness,
+    )
+    obstacle_text_x = max(obstacle_coverage_text_margin, w_combined - obstacle_text_w - obstacle_coverage_text_margin)
+    obstacle_text_y = obstacle_coverage_text_margin + obstacle_text_h
+    draw_text_with_outline(
+        combined,
+        obstacle_coverage_text,
+        (obstacle_text_x, obstacle_text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        hud_text_scale,
+        hud_text_color,
+        hud_text_thickness,
+        hud_text_outline_color,
+        hud_text_outline_thickness,
     )
     # ────────────────────────────────────────────────────────────────────
 
