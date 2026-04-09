@@ -1179,11 +1179,14 @@ def open_camera_with_retry(sensor_id, fps=30, warmup_frames=30, retries=3, retry
     """
     last_error = "unknown"
     for attempt in range(1, retries + 1):
+        # Let Argus/GStreamer settle between retries (important after abrupt exits).
+        if attempt > 1:
+            time.sleep(retry_delay_s)
+
         cap = cv2.VideoCapture(make_gst(sensor_id, fps=fps), cv2.CAP_GSTREAMER)
         if not cap.isOpened():
             cap.release()
             last_error = f"open failed (attempt {attempt}/{retries})"
-            time.sleep(retry_delay_s)
             continue
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -1197,23 +1200,18 @@ def open_camera_with_retry(sensor_id, fps=30, warmup_frames=30, retries=3, retry
             return cap
 
         cap.release()
+        # Tear down any lingering GStreamer objects before next retry.
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         last_error = f"no frames during warmup (attempt {attempt}/{retries})"
-        time.sleep(retry_delay_s)
 
     raise RuntimeError(f"Failed to open camera {sensor_id}: {last_error}")
 
 
-cap0 = open_camera_with_retry(0, fps=30)
-cap1 = open_camera_with_retry(1, fps=30)
-
-# Now load depth model (smaller + FP16 to reduce memory pressure)
-depth_pipe = pipeline(
-    task="depth-estimation",
-    model="depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
-    device=0,
-    torch_dtype=torch.float16,
-)
-
+cap0 = None
+cap1 = None
 
 # Thread-safe queues for streaming frames and depth inference results
 frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
@@ -1229,14 +1227,16 @@ def shutdown_runtime():
     _shutdown_done = True
     running = False
 
-    try:
-        cap0.release()
-    except Exception:
-        pass
-    try:
-        cap1.release()
-    except Exception:
-        pass
+    if cap0 is not None:
+        try:
+            cap0.release()
+        except Exception:
+            pass
+    if cap1 is not None:
+        try:
+            cap1.release()
+        except Exception:
+            pass
     try:
         cv2.destroyAllWindows()
     except Exception:
@@ -1256,6 +1256,27 @@ def _signal_shutdown(signum, frame):  # pragma: no cover - signal/hardware path
 signal.signal(signal.SIGINT, _signal_shutdown)
 signal.signal(signal.SIGTERM, _signal_shutdown)
 atexit.register(shutdown_runtime)
+
+
+def init_runtime_resources():
+    """Initialize cameras/model with rollback-safe cleanup on partial failure."""
+    global cap0, cap1, depth_pipe
+    try:
+        cap0 = open_camera_with_retry(0, fps=30)
+        cap1 = open_camera_with_retry(1, fps=30)
+        # Now load depth model (smaller + FP16 to reduce memory pressure)
+        depth_pipe = pipeline(
+            task="depth-estimation",
+            model="depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
+            device=0,
+            torch_dtype=torch.float16,
+        )
+    except Exception:
+        shutdown_runtime()
+        raise
+
+
+init_runtime_resources()
 
 
 # ---------------------------------------------------------------------------
