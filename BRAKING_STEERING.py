@@ -1461,6 +1461,11 @@ while True:
     should_brake = time.monotonic() < brake_hold_until
     braking_target_norm = 1.0 if should_brake else 0.0
 
+    # When confidence-triggered braking is active, immediately re-center steering.
+    if should_brake:
+        gap_cx = center_x
+        blue_x = float(center_x)
+
     # Smooth horizontal motion (keep as FLOAT; don't floor!)
     if blue_x is None:
         blue_x = float(gap_cx)
