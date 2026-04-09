@@ -332,7 +332,7 @@ def set_status_message(text, duration_s=None):
 
 encoder_bus = None
 encoder_available = False
-calibration_data = {"encoder_min_raw": None, "encoder_max_raw": None}
+calibration_data = {"encoder_min_raw": None, "encoder_center_raw": None, "encoder_max_raw": None}
 calibration_loaded = False
 
 
@@ -369,30 +369,42 @@ def load_calibration():
                 "encoder_min_raw",
                 "encoder_max_raw",
             } <= data.keys():
+                min_raw = int(data["encoder_min_raw"])
+                max_raw = int(data["encoder_max_raw"])
+                center_raw = int(data.get("encoder_center_raw", (min_raw + max_raw) // 2))
                 calibration_data = {
-                    "encoder_min_raw": int(data["encoder_min_raw"]),
-                    "encoder_max_raw": int(data["encoder_max_raw"]),
+                    "encoder_min_raw": min_raw,
+                    "encoder_center_raw": center_raw,
+                    "encoder_max_raw": max_raw,
                 }
         except (json.JSONDecodeError, ValueError):
             pass
     calibration_loaded = True
 
 
-def save_calibration(min_raw, max_raw):
+def save_calibration(min_raw, center_raw, max_raw):
     global calibration_data, calibration_loaded
     calibration_data = {
         "encoder_min_raw": int(min_raw),
+        "encoder_center_raw": int(center_raw),
         "encoder_max_raw": int(max_raw),
     }
     calibration_file.write_text(json.dumps(calibration_data, indent=2))
     calibration_loaded = True
 
 
-def encoder_span():
-    if calibration_data["encoder_min_raw"] is None or calibration_data["encoder_max_raw"] is None:
+def encoder_spans():
+    if (
+        calibration_data["encoder_min_raw"] is None
+        or calibration_data["encoder_center_raw"] is None
+        or calibration_data["encoder_max_raw"] is None
+    ):
         return None
-    span = calibration_data["encoder_max_raw"] - calibration_data["encoder_min_raw"]
-    return span if span > 0 else None
+    left_span = calibration_data["encoder_center_raw"] - calibration_data["encoder_min_raw"]
+    right_span = calibration_data["encoder_max_raw"] - calibration_data["encoder_center_raw"]
+    if left_span <= 0 or right_span <= 0:
+        return None
+    return left_span, right_span
 
 
 def read_encoder_raw():
@@ -408,10 +420,15 @@ def read_encoder_raw():
 
 
 def encoder_raw_to_norm(raw):
-    span = encoder_span()
-    if span is None:
+    spans = encoder_spans()
+    if spans is None:
         return None
-    norm = (raw - calibration_data["encoder_min_raw"]) / span
+    left_span, right_span = spans
+    center_raw = calibration_data["encoder_center_raw"]
+    if raw <= center_raw:
+        norm = 0.5 * ((raw - calibration_data["encoder_min_raw"]) / left_span)
+    else:
+        norm = 0.5 + 0.5 * ((raw - center_raw) / right_span)
     return float(clamp(norm, 0.0, 1.0))
 
 
@@ -1067,7 +1084,7 @@ def start_calibration():
     calibration_stage = "min"
     calibration_samples = {}
     calibration_status_text, calibration_status_until = set_status_message(
-        "Steer cal: jog LEFT (A/D), UP/DOWN speed, SPACE to set min",
+        "Steer cal: jog LEFT (A/D), UP/DOWN speed, SPACE to set left",
         None,
     )
 
@@ -1100,22 +1117,35 @@ def capture_calibration_point():
         return
     if calibration_stage == "min":
         calibration_samples["min"] = raw
+        calibration_stage = "center"
+        calibration_status_text, calibration_status_until = set_status_message(
+            "Steer cal: jog CENTER (A/D), UP/DOWN speed, SPACE to set center",
+            None,
+        )
+    elif calibration_stage == "center":
+        calibration_samples["center"] = raw
         calibration_stage = "max"
         calibration_status_text, calibration_status_until = set_status_message(
-            "Steer cal: jog RIGHT (A/D), UP/DOWN speed, SPACE to set max",
+            "Steer cal: jog RIGHT (A/D), UP/DOWN speed, SPACE to set right",
             None,
         )
     elif calibration_stage == "max":
         calibration_samples["max"] = raw
         min_raw = min(calibration_samples["min"], calibration_samples["max"])
+        center_raw = calibration_samples["center"]
         max_raw = max(calibration_samples["min"], calibration_samples["max"])
         if min_raw == max_raw:
             calibration_status_text, calibration_status_until = set_status_message(
                 "Steer cal failed: encoder range is zero",
                 3.0,
             )
+        elif not (min_raw < center_raw < max_raw):
+            calibration_status_text, calibration_status_until = set_status_message(
+                "Steer cal failed: center must be between left/right",
+                3.0,
+            )
         else:
-            save_calibration(min_raw, max_raw)
+            save_calibration(min_raw, center_raw, max_raw)
             calibration_status_text, calibration_status_until = set_status_message(
                 "Steering calibration saved",
                 3.0,
