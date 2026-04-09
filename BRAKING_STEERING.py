@@ -1217,26 +1217,39 @@ cap1 = None
 frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
 running = True
 _shutdown_done = False
+worker_threads = []
 
 
 def shutdown_runtime():
     """Idempotent runtime cleanup for normal exits and Ctrl+C/kill signals."""
-    global running, _shutdown_done
+    global running, _shutdown_done, cap0, cap1
     if _shutdown_done:
         return
     _shutdown_done = True
     running = False
+
+    for worker in worker_threads:
+        try:
+            worker.join(timeout=1.5)
+        except Exception:
+            pass
 
     if cap0 is not None:
         try:
             cap0.release()
         except Exception:
             pass
+        cap0 = None
     if cap1 is not None:
         try:
             cap1.release()
         except Exception:
             pass
+        cap1 = None
+
+    # Give Argus/GStreamer a brief moment to finish tearing down camera streams.
+    time.sleep(0.2)
+
     try:
         cv2.destroyAllWindows()
     except Exception:
@@ -1295,8 +1308,11 @@ def grab(cam, q):
             # Avoid spinning if camera stream is temporarily unavailable.
             time.sleep(0.01)
 
-Thread(target=grab, args=(cap0, frame_q0), daemon=True).start()
-Thread(target=grab, args=(cap1, frame_q1), daemon=True).start()
+grab_t0 = Thread(target=grab, args=(cap0, frame_q0), daemon=False)
+grab_t1 = Thread(target=grab, args=(cap1, frame_q1), daemon=False)
+grab_t0.start()
+grab_t1.start()
+worker_threads.extend([grab_t0, grab_t1])
 
 
 def _ensure_sample_grid(height, width, x_offset):
@@ -1345,7 +1361,9 @@ def infer():
         result_q.put((f0, d0, f1, d1))
 
 
-Thread(target=infer, daemon=True).start()
+infer_t = Thread(target=infer, daemon=False)
+infer_t.start()
+worker_threads.append(infer_t)
 
 load_calibration()
 initialise_encoder()
