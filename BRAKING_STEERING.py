@@ -1,5 +1,7 @@
 import json
 import queue
+import atexit
+import signal
 import time
 from pathlib import Path
 from threading import Thread
@@ -1161,27 +1163,96 @@ def capture_calibration_point():
 def make_gst(sensor_id, fps=30):
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
-        f"video/x-raw(memory:NVMM),width=300,height=150,framerate={fps}/1,format=NV12 ! "
+        f"video/x-raw(memory:NVMM),width=1280,height=720,framerate={fps}/1,format=NV12 ! "
         "nvvidconv flip-method=2 ! video/x-raw,format=BGRx ! "
+        "videoscale ! video/x-raw,width=300,height=150 ! "
         "videoconvert ! video/x-raw,format=BGR ! "
-        "queue max-size-buffers=1 leaky=downstream ! "
-        "appsink sync=false max-buffers=1 drop=true enable-last-sample=0"
+        "appsink sync=false max-buffers=1 drop=true"
     )
 
 
-# Open both cameras and trim their internal buffers for minimal latency
-cap0 = cv2.VideoCapture(make_gst(0, fps=30), cv2.CAP_GSTREAMER)
-cap1 = cv2.VideoCapture(make_gst(1, fps=30), cv2.CAP_GSTREAMER)
-if not cap0.isOpened() or not cap1.isOpened():
-    raise RuntimeError("Failed to open one or both cameras.")
+def try_restart_argus_daemon():
+    """
+    Attempt to recover Argus without requiring a reboot.
+    Works when script has privileges (root or passwordless sudo).
+    """
+    restart_cmds = [
+        ["systemctl", "restart", "nvargus-daemon"],
+        ["sudo", "-n", "systemctl", "restart", "nvargus-daemon"],
+    ]
+    for cmd in restart_cmds:
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            continue
+        if result.returncode == 0:
+            time.sleep(1.5)
+            return True
+    return False
 
-cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-# Warm up cameras so Argus allocates buffers before CUDA model grabs memory
-for _ in range(30):
-    cap0.read()
-    cap1.read()
+def open_camera_with_retry(sensor_id, fps=30, warmup_frames=45, retries=4, retry_delay_s=1.0):
+    """
+    Open Jetson camera stream with retries.
+    This helps immediate restarts after forced exits when Argus buffers can still
+    be in a transient bad state.
+    """
+    last_error = "unknown"
+    for attempt in range(1, retries + 1):
+        cap = cv2.VideoCapture(make_gst(sensor_id, fps=fps), cv2.CAP_GSTREAMER)
+        if not cap.isOpened():
+            cap.release()
+            last_error = f"open failed (attempt {attempt}/{retries})"
+            time.sleep(retry_delay_s)
+            continue
+
+        good_frames = 0
+        for _ in range(warmup_frames):
+            ret, _ = cap.read()
+            if ret:
+                good_frames += 1
+        if good_frames > 0:
+            return cap
+
+        cap.release()
+        last_error = f"no frames during warmup (attempt {attempt}/{retries})"
+        time.sleep(retry_delay_s)
+
+    # Final recovery path: restart Argus daemon once, then retry one last round.
+    if try_restart_argus_daemon():
+        for attempt in range(1, retries + 1):
+            cap = cv2.VideoCapture(make_gst(sensor_id, fps=fps), cv2.CAP_GSTREAMER)
+            if not cap.isOpened():
+                cap.release()
+                last_error = f"open failed after daemon restart (attempt {attempt}/{retries})"
+                time.sleep(retry_delay_s)
+                continue
+
+            good_frames = 0
+            for _ in range(warmup_frames):
+                ret, _ = cap.read()
+                if ret:
+                    good_frames += 1
+            if good_frames > 0:
+                return cap
+
+            cap.release()
+            last_error = f"no frames after daemon restart (attempt {attempt}/{retries})"
+            time.sleep(retry_delay_s)
+
+    raise RuntimeError(
+        f"Failed to open camera {sensor_id}: {last_error}. "
+        "If this persists, verify no other process is using CSI camera(s)."
+    )
+
+
+cap0 = open_camera_with_retry(0, fps=30)
+cap1 = open_camera_with_retry(1, fps=30)
 
 # Now load depth model (smaller + FP16 to reduce memory pressure)
 depth_pipe = pipeline(
@@ -1195,6 +1266,44 @@ depth_pipe = pipeline(
 # Thread-safe queues for streaming frames and depth inference results
 frame_q0, frame_q1, result_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
 running = True
+_shutdown_done = False
+
+
+def shutdown_runtime():
+    """Idempotent runtime cleanup for normal exits and Ctrl+C/kill signals."""
+    global running, _shutdown_done
+    if _shutdown_done:
+        return
+    _shutdown_done = True
+    running = False
+
+    try:
+        cap0.release()
+    except Exception:
+        pass
+    try:
+        cap1.release()
+    except Exception:
+        pass
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+
+    shutdown_encoder()
+    shutdown_motor_control()
+    shutdown_braking_encoder()
+    shutdown_braking_motor_control()
+
+
+def _signal_shutdown(signum, frame):  # pragma: no cover - signal/hardware path
+    shutdown_runtime()
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGINT, _signal_shutdown)
+signal.signal(signal.SIGTERM, _signal_shutdown)
+atexit.register(shutdown_runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -1206,8 +1315,12 @@ def grab(cam, q):
     while running:
         ret, frame = cam.read()
         if ret:
-            if q.full(): q.get_nowait()
+            if q.full():
+                q.get_nowait()
             q.put(frame)
+        else:
+            # Avoid spinning if camera stream is temporarily unavailable.
+            time.sleep(0.01)
 
 Thread(target=grab, args=(cap0, frame_q0), daemon=True).start()
 Thread(target=grab, args=(cap1, frame_q1), daemon=True).start()
@@ -1240,15 +1353,19 @@ def infer():
         except queue.Empty:
             continue
 
-        img0 = Image.fromarray(cv2.cvtColor(f0, cv2.COLOR_BGR2RGB))
-        img1 = Image.fromarray(cv2.cvtColor(f1, cv2.COLOR_BGR2RGB))
+        try:
+            img0 = Image.fromarray(cv2.cvtColor(f0, cv2.COLOR_BGR2RGB))
+            img1 = Image.fromarray(cv2.cvtColor(f1, cv2.COLOR_BGR2RGB))
 
-        with torch.inference_mode():
-            o0 = depth_pipe(img0)
-            o1 = depth_pipe(img1)
+            with torch.inference_mode():
+                o0 = depth_pipe(img0)
+                o1 = depth_pipe(img1)
 
-        d0 = np.array(o0["depth"])
-        d1 = np.array(o1["depth"])
+            d0 = np.array(o0["depth"])
+            d1 = np.array(o1["depth"])
+        except Exception:
+            time.sleep(0.01)
+            continue
 
         if result_q.full():
             result_q.get_nowait()
@@ -1862,14 +1979,7 @@ while True:
         capture_calibration_point()
 
 # === Cleanup ===
-running = False
-cap0.release()
-cap1.release()
-cv2.destroyAllWindows()
-shutdown_encoder()
-shutdown_motor_control()
-shutdown_braking_encoder()
-shutdown_braking_motor_control()
+shutdown_runtime()
 
 
 
