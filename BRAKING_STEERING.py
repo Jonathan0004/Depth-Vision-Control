@@ -100,7 +100,6 @@ motor_pwm_frequency_hz = 5000
 motor_pwm_pin = 32                  # informational only (physical pin number)
 motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
 motor_power_pin = 23                # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
-steering_not_centered_pin = 15      # HIGH when steering control is off-center, LOW when centered
 
 # Braking motor hardware configuration (Jetson Nano)
 braking_motor_pwm_chip = "/sys/class/pwm/pwmchip2"
@@ -558,7 +557,6 @@ motor_control_available = False
 motor_gpio_initialised = False
 motor_last_duty_ns = None
 motor_pwm_enabled = False
-steering_indicator_initialised = False
 jog_mode_enabled = False
 jog_direction = 0  # -1 left, 0 idle, +1 right
 jog_duty_pct = jog_default_duty_pct
@@ -588,7 +586,6 @@ brake_hold_until = 0.0
 def initialise_motor_control():
     """Prepare GPIO direction/power pins and PWM channel for motor drive."""
     global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns, motor_pwm_enabled
-    global steering_indicator_initialised
 
     motor_control_available = False
     if GPIO is None:
@@ -601,9 +598,6 @@ def initialise_motor_control():
             GPIO.setup(motor_direction_pin, GPIO.OUT, initial=GPIO.LOW)
             GPIO.setup(motor_power_pin, GPIO.OUT, initial=GPIO.LOW)  # keep LOW until PWM actually drives
             motor_gpio_initialised = True
-        if not steering_indicator_initialised:
-            GPIO.setup(steering_not_centered_pin, GPIO.OUT, initial=GPIO.LOW)
-            steering_indicator_initialised = True
     except RuntimeError:
         return
 
@@ -737,22 +731,9 @@ def apply_jog_drive(direction: int) -> None:
             GPIO.output(motor_power_pin, GPIO.LOW)
 
 
-def update_steering_center_indicator(steer_control_px, center_px) -> None:
-    """Set indicator pin HIGH when steering control is off-center, LOW when centered/unknown."""
-    if GPIO is None or not steering_indicator_initialised:
-        return
-    is_off_center = (
-        steer_control_px is not None
-        and center_px is not None
-        and int(round(float(steer_control_px))) != int(round(float(center_px)))
-    )
-    GPIO.output(steering_not_centered_pin, GPIO.HIGH if is_off_center else GPIO.LOW)
-
-
 def shutdown_motor_control():
     """Return the motor hardware to a safe idle state."""
     global motor_control_available, motor_pwm_channel_path, motor_last_duty_ns, motor_gpio_initialised, motor_pwm_enabled
-    global steering_indicator_initialised
 
     _set_motor_direction(0)
     _set_motor_pwm_pct(0.0)
@@ -781,12 +762,6 @@ def shutdown_motor_control():
         except RuntimeError:  # pragma: no cover - hardware dependency
             pass
         motor_gpio_initialised = False
-    if GPIO is not None and steering_indicator_initialised:
-        try:
-            GPIO.cleanup([steering_not_centered_pin])
-        except RuntimeError:  # pragma: no cover - hardware dependency
-            pass
-        steering_indicator_initialised = False
 
 
 def initialise_braking_motor_control():
@@ -1618,7 +1593,6 @@ while True:
 
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
-    update_steering_center_indicator(steer_control_x, center_x)
 
     encoder_norm = get_encoder_norm()
     encoder_px = None
