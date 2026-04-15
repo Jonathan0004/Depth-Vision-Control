@@ -115,7 +115,7 @@ braking_motor_dead_zone_norm = 0.01
 braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
-brakeConf = 0.40  # brake when steerability confidence drops below this threshold
+brakeConf = 0.30  # brake when steerability confidence drops below this threshold
 brake_hold_seconds = 5.0  # keep brake fully pressed for this long after confidence-triggered braking
 braking_auto_max_duty_pct = 100.0  # max PWM duty allowed when auto-braking to press/release
 
