@@ -441,7 +441,7 @@ def encoder_raw_to_norm(raw):
 
 braking_encoder_bus = None
 braking_encoder_available = False
-braking_calibration_data = {"encoder_min_raw": None, "encoder_max_raw": None}
+braking_calibration_data = {"released_raw": None, "pressed_raw": None}
 braking_calibration_loaded = False
 
 
@@ -474,36 +474,41 @@ def load_braking_calibration():
     if braking_calibration_file.exists():
         try:
             data = json.loads(braking_calibration_file.read_text())
-            if {
-                "encoder_min_raw",
-                "encoder_max_raw",
-            } <= data.keys():
+            if {"released_raw", "pressed_raw"} <= data.keys():
                 braking_calibration_data = {
-                    "encoder_min_raw": int(data["encoder_min_raw"]),
-                    "encoder_max_raw": int(data["encoder_max_raw"]),
+                    "released_raw": int(data["released_raw"]),
+                    "pressed_raw": int(data["pressed_raw"]),
+                }
+            elif {"encoder_min_raw", "encoder_max_raw"} <= data.keys():
+                # Backward compatibility with older calibration schema.
+                braking_calibration_data = {
+                    "released_raw": int(data["encoder_min_raw"]),
+                    "pressed_raw": int(data["encoder_max_raw"]),
                 }
         except (json.JSONDecodeError, ValueError):
             pass
     braking_calibration_loaded = True
 
 
-def save_braking_calibration(min_raw, max_raw):
+BRAKING_ENCODER_COUNTS = 4096
+
+
+def save_braking_calibration(released_raw, pressed_raw):
     global braking_calibration_data, braking_calibration_loaded
     braking_calibration_data = {
-        "encoder_min_raw": int(min_raw),
-        "encoder_max_raw": int(max_raw),
+        "released_raw": int(released_raw),
+        "pressed_raw": int(pressed_raw),
     }
     braking_calibration_file.write_text(json.dumps(braking_calibration_data, indent=2))
     braking_calibration_loaded = True
 
 
 def braking_encoder_span():
-    if (
-        braking_calibration_data["encoder_min_raw"] is None
-        or braking_calibration_data["encoder_max_raw"] is None
-    ):
+    released_raw = braking_calibration_data["released_raw"]
+    pressed_raw = braking_calibration_data["pressed_raw"]
+    if released_raw is None or pressed_raw is None:
         return None
-    span = braking_calibration_data["encoder_max_raw"] - braking_calibration_data["encoder_min_raw"]
+    span = (pressed_raw - released_raw) % BRAKING_ENCODER_COUNTS
     return span if span > 0 else None
 
 
@@ -523,7 +528,11 @@ def braking_encoder_raw_to_norm(raw):
     span = braking_encoder_span()
     if span is None:
         return None
-    norm = (raw - braking_calibration_data["encoder_min_raw"]) / span
+    released_raw = braking_calibration_data["released_raw"]
+    if released_raw is None:
+        return None
+    progress = (int(raw) - int(released_raw)) % BRAKING_ENCODER_COUNTS
+    norm = progress / span
     return float(clamp(norm, 0.0, 1.0))
 
 
@@ -1057,15 +1066,16 @@ def capture_braking_calibration_point():
         )
     elif braking_calibration_stage == "max":
         braking_calibration_samples["max"] = raw
-        min_raw = min(braking_calibration_samples["min"], braking_calibration_samples["max"])
-        max_raw = max(braking_calibration_samples["min"], braking_calibration_samples["max"])
-        if min_raw == max_raw:
+        released_raw = braking_calibration_samples["min"]
+        pressed_raw = braking_calibration_samples["max"]
+        span = (pressed_raw - released_raw) % BRAKING_ENCODER_COUNTS
+        if span == 0:
             braking_calibration_status_text, braking_calibration_status_until = set_status_message(
                 "Brake cal failed: encoder range is zero",
                 3.0,
             )
         else:
-            save_braking_calibration(min_raw, max_raw)
+            save_braking_calibration(released_raw, pressed_raw)
             braking_calibration_status_text, braking_calibration_status_until = set_status_message(
                 "Brake calibration saved",
                 3.0,
