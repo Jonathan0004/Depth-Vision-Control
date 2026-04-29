@@ -493,6 +493,13 @@ def load_braking_calibration():
 BRAKING_ENCODER_COUNTS = 4096
 
 
+def _encoder_signed_delta(start_raw, end_raw, counts=BRAKING_ENCODER_COUNTS):
+    """Return shortest signed delta from start_raw to end_raw in encoder counts."""
+    half = counts // 2
+    delta = (int(end_raw) - int(start_raw) + half) % counts - half
+    return int(delta)
+
+
 def save_braking_calibration(released_raw, pressed_raw):
     global braking_calibration_data, braking_calibration_loaded
     braking_calibration_data = {
@@ -508,8 +515,8 @@ def braking_encoder_span():
     pressed_raw = braking_calibration_data["pressed_raw"]
     if released_raw is None or pressed_raw is None:
         return None
-    span = (pressed_raw - released_raw) % BRAKING_ENCODER_COUNTS
-    return span if span > 0 else None
+    span = _encoder_signed_delta(released_raw, pressed_raw)
+    return span if span != 0 else None
 
 
 def read_braking_encoder_raw():
@@ -531,7 +538,7 @@ def braking_encoder_raw_to_norm(raw):
     released_raw = braking_calibration_data["released_raw"]
     if released_raw is None:
         return None
-    progress = (int(raw) - int(released_raw)) % BRAKING_ENCODER_COUNTS
+    progress = _encoder_signed_delta(released_raw, raw)
     norm = progress / span
     return float(clamp(norm, 0.0, 1.0))
 
@@ -1068,7 +1075,7 @@ def capture_braking_calibration_point():
         braking_calibration_samples["max"] = raw
         released_raw = braking_calibration_samples["min"]
         pressed_raw = braking_calibration_samples["max"]
-        span = (pressed_raw - released_raw) % BRAKING_ENCODER_COUNTS
+        span = _encoder_signed_delta(released_raw, pressed_raw)
         if span == 0:
             braking_calibration_status_text, braking_calibration_status_until = set_status_message(
                 "Brake cal failed: encoder range is zero",
