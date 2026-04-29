@@ -90,13 +90,13 @@ jog_duty_step_pct = 5.0             # amount to adjust jog duty via arrow keys
 
 
 # Extra steering push (pixels) applied in the commanded direction (+/- from centre)
-divert_boost = 50
+divert_boost = 70
 
 
 # Motor hardware configuration (Jetson Nano)
 motor_pwm_chip = "/sys/class/pwm/pwmchip3"
 motor_pwm_channel = 0
-motor_pwm_frequency_hz = 5000
+motor_pwm_frequency_hz = 4000
 motor_pwm_pin = 32                  # informational only (physical pin number)
 motor_direction_pin = 29            # HIGH = steer right, LOW = steer left
 motor_power_pin = 23                # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
@@ -105,7 +105,7 @@ steering_not_centered_pin = 7      # HIGH when steering control is off-center, L
 # Braking motor hardware configuration (Jetson Nano)
 braking_motor_pwm_chip = "/sys/class/pwm/pwmchip2"
 braking_motor_pwm_channel = 0
-braking_motor_pwm_frequency_hz = 5000
+braking_motor_pwm_frequency_hz = 4000
 braking_motor_pwm_pin = 33               # informational only (physical pin number)
 braking_motor_direction_pin = 37         # HIGH = jog Press, LOW = jog Release
 braking_motor_power_pin = 22             # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
