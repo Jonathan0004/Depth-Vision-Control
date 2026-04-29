@@ -899,7 +899,14 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
         return
 
     duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
-    duty_pct = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
+    duty_cap = max(0.0, min(float(duty_cap), braking_motor_max_duty_pct))
+    denom = (
+        float(braking_motor_full_speed_error_norm)
+        if braking_motor_full_speed_error_norm > 0
+        else 1.0
+    )
+    scaled_pct = (abs(error) / denom) * duty_cap
+    duty_pct = max(0.0, min(duty_cap, scaled_pct))
 
     _set_braking_motor_direction(error)
 
