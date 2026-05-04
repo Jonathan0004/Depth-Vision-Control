@@ -3,6 +3,7 @@ import queue
 import atexit
 import signal
 import time
+from collections import deque
 from pathlib import Path
 from threading import Thread
 
@@ -603,6 +604,46 @@ braking_calibration_samples = {}
 braking_calibration_jog_direction = 0
 braking_target_norm = None
 brake_hold_until = 0.0
+brake_press_timestamps = deque()
+
+brake_shutdown_press_count = 5
+brake_shutdown_window_seconds = 6.0
+brake_press_detect_threshold_norm = 0.90
+brake_release_detect_threshold_norm = 0.75
+brake_encoder_was_pressed = False
+
+
+def _register_brake_press_and_maybe_shutdown() -> bool:
+    """Track brake press events and trigger system shutdown on rapid repeated presses."""
+    now = time.monotonic()
+    brake_press_timestamps.append(now)
+
+    while brake_press_timestamps and (now - brake_press_timestamps[0]) > brake_shutdown_window_seconds:
+        brake_press_timestamps.popleft()
+
+    if len(brake_press_timestamps) < brake_shutdown_press_count:
+        return False
+
+    print(
+        f"Emergency brake shutdown triggered: {brake_shutdown_press_count} presses within "
+        f"{brake_shutdown_window_seconds:.1f}s."
+    )
+    shutdown_runtime()
+    subprocess.run(["shutdown", "-h", "now"], check=False)
+    raise SystemExit(0)
+
+
+def _track_brake_encoder_press(braking_encoder_norm) -> None:
+    """Count a brake press when encoder crosses into pressed zone with hysteresis."""
+    global brake_encoder_was_pressed
+    if braking_encoder_norm is None:
+        return
+
+    if not brake_encoder_was_pressed and braking_encoder_norm >= brake_press_detect_threshold_norm:
+        brake_encoder_was_pressed = True
+        _register_brake_press_and_maybe_shutdown()
+    elif brake_encoder_was_pressed and braking_encoder_norm <= brake_release_detect_threshold_norm:
+        brake_encoder_was_pressed = False
 
 
 def initialise_motor_control():
@@ -1676,6 +1717,7 @@ while True:
         update_motor_control(boosted_blue_x if blue_x is not None else None, encoder_px)
 
     braking_encoder_norm = get_braking_encoder_norm()
+    _track_brake_encoder_press(braking_encoder_norm)
     if braking_jog_mode_enabled:
         if not braking_motor_pwm_enabled:
             enable_braking_motor_pwm()
