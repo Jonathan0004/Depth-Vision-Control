@@ -130,6 +130,7 @@ braking_motor_pwm_frequency_hz = 4000
 braking_motor_pwm_pin = 33               # informational only (physical pin number)
 braking_motor_direction_pin = 37         # HIGH = jog Press, LOW = jog Release
 braking_motor_power_pin = 22             # HIGH when PWM is driving, LOW when idle/dead-zone/calibration
+valve_output_pin = 16                    # HIGH = latched, LOW = unlatched (set to your valve GPIO pin)
 
 braking_motor_max_duty_pct = 100.0
 braking_motor_full_speed_error_norm = 0.35
@@ -593,6 +594,8 @@ braking_motor_pwm_enabled = False
 braking_jog_mode_enabled = False
 braking_jog_direction = 0  # -1 Release, 0 idle, +1 Press
 braking_jog_duty_pct = braking_jog_default_duty_pct
+valve_jog_mode_enabled = False
+valve_output_state = None
 
 braking_latest_encoder_raw = None
 braking_latest_encoder_norm = None
@@ -650,6 +653,7 @@ def initialise_motor_control():
     """Prepare GPIO direction/power pins and PWM channel for motor drive."""
     global motor_pwm_channel_path, motor_control_available, motor_gpio_initialised, motor_last_duty_ns, motor_pwm_enabled
     global steering_indicator_initialised
+    global valve_output_state
 
     motor_control_available = False
     if GPIO is None:
@@ -665,6 +669,11 @@ def initialise_motor_control():
         if not steering_indicator_initialised:
             GPIO.setup(steering_not_centered_pin, GPIO.OUT, initial=GPIO.LOW)
             steering_indicator_initialised = True
+        if valve_output_state is None:
+            GPIO.setup(valve_output_pin, GPIO.IN)
+            sensed_state = bool(GPIO.input(valve_output_pin))
+            GPIO.setup(valve_output_pin, GPIO.OUT, initial=GPIO.HIGH if sensed_state else GPIO.LOW)
+            valve_output_state = sensed_state
     except RuntimeError:
         return
 
@@ -688,6 +697,24 @@ def _set_motor_direction(error: float) -> None:
     if GPIO is None or not motor_gpio_initialised:
         return
     GPIO.output(motor_direction_pin, GPIO.HIGH if error > 0 else GPIO.LOW)
+
+
+def set_valve_output(latched: bool) -> None:
+    """Drive the valve output pin HIGH/LOW and mirror the state in software."""
+    global valve_output_state
+    valve_output_state = bool(latched)
+    if GPIO is None or not motor_gpio_initialised:
+        return
+    GPIO.output(valve_output_pin, GPIO.HIGH if valve_output_state else GPIO.LOW)
+
+
+def toggle_valve_output() -> bool:
+    """Toggle the valve output and return the new latched state."""
+    if valve_output_state is None:
+        set_valve_output(False)
+    else:
+        set_valve_output(not valve_output_state)
+    return bool(valve_output_state)
 
 
 def _set_motor_pwm_pct(pct: float) -> None:
@@ -1876,6 +1903,8 @@ while True:
                 "UP/DOWN: Adjust jog speed",
                 "B: Toggle brake jog mode",
                 "V/N: Brake jog Release/Press",
+                "T: Toggle valve jog mode",
+                "Y: Toggle valve latch/unlatch",
                 "C: Start steer calibration",
                 "X: Start brake calibration",
                 "P: Press brake for 5 seconds",
@@ -1923,6 +1952,9 @@ while True:
                 )
             if sim_encoder_enabled:
                 bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, K to exit")
+            if valve_jog_mode_enabled:
+                valve_state = "latched" if valve_output_state else "unlatched"
+                bottom_lines.append(f"Valve jog: {valve_state} (Y toggles, T exits)")
             if not control_active:
                 bottom_lines.append('Show help: "h"')
             if bottom_lines:
@@ -2004,6 +2036,21 @@ while True:
                 enable_motor_pwm()
             ui_notice_text = "Brake jog disabled"
             ui_notice_until = time.time() + 3.0
+
+    if key == ord('t'):
+        valve_jog_mode_enabled = not valve_jog_mode_enabled
+        if valve_jog_mode_enabled:
+            if valve_output_state is None:
+                set_valve_output(False)
+            ui_notice_text = "Valve jog enabled"
+        else:
+            ui_notice_text = "Valve jog disabled"
+        ui_notice_until = time.time() + 3.0
+
+    if key == ord('y') and valve_jog_mode_enabled:
+        latched = toggle_valve_output()
+        ui_notice_text = f"Valve {'latched (HIGH)' if latched else 'unlatched (LOW)'}"
+        ui_notice_until = time.time() + 3.0
     if key == ord('p'):
         brake_hold_until = time.monotonic() + 5.0
         ui_notice_text = "Brake pressed for 5 seconds"
