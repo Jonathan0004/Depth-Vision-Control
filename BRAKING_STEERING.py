@@ -1878,6 +1878,7 @@ while True:
                 "V/N: Brake jog Release/Press",
                 "C: Start steer calibration",
                 "X: Start brake calibration",
+                "P: Press brake for 5 seconds",
                 "SPACE: Capture calibration",
             ]
             draw_help_overlay(
@@ -2003,6 +2004,12 @@ while True:
                 enable_motor_pwm()
             ui_notice_text = "Brake jog disabled"
             ui_notice_until = time.time() + 3.0
+    if key == ord('p'):
+        brake_hold_until = time.monotonic() + 5.0
+        ui_notice_text = "Brake pressed for 5 seconds"
+        ui_notice_until = time.monotonic() + 2.0
+
+
 
     if calibration_active and key in (ord('a'), ord('d')):
         requested_direction = -1 if key == ord('a') else 1
