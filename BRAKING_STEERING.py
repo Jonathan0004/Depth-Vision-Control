@@ -166,6 +166,8 @@ simulated_step_norm = 0.01        # arrow-key increment when in simulated encode
 braking_encoder_i2c_bus = 1
 braking_encoder_i2c_address = 0x36
 braking_calibration_file = Path("braking_calibration.json")
+braking_encoder_read_retries = 3
+braking_encoder_glitch_hold_seconds = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -529,15 +531,28 @@ def braking_encoder_span():
 
 
 def read_braking_encoder_raw():
+    global braking_encoder_bus, braking_encoder_available
     if not braking_encoder_available or braking_encoder_bus is None:
         return None
+    for _ in range(max(1, int(braking_encoder_read_retries))):
+        try:
+            high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
+            low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
+            return ((high & 0x0F) << 8) | low
+        except OSError:
+            time.sleep(0.001)
+
     try:
-        high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
-        low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
-    except OSError:
-        return None
-    raw = ((high & 0x0F) << 8) | low
-    return raw
+        braking_encoder_bus.close()
+    except Exception:
+        pass
+    try:
+        braking_encoder_bus = SMBus(braking_encoder_i2c_bus)
+        braking_encoder_available = True
+    except Exception:
+        braking_encoder_bus = None
+        braking_encoder_available = False
+    return None
 
 
 def braking_encoder_raw_to_norm(raw):
@@ -598,6 +613,9 @@ braking_jog_duty_pct = braking_jog_default_duty_pct
 
 braking_latest_encoder_raw = None
 braking_latest_encoder_norm = None
+braking_last_valid_encoder_raw = None
+braking_last_valid_encoder_norm = None
+braking_last_valid_encoder_time = 0.0
 braking_calibration_active = False
 braking_calibration_stage = None
 braking_calibration_status_text = ""
@@ -1040,6 +1058,7 @@ def shutdown_braking_motor_control():
 
 def get_braking_encoder_norm():
     global braking_latest_encoder_raw, braking_latest_encoder_norm
+    global braking_last_valid_encoder_raw, braking_last_valid_encoder_norm, braking_last_valid_encoder_time
     global brake_release_candidate_active
     global brake_release_candidate_start_norm
     global brake_release_candidate_lowest_norm
@@ -1047,8 +1066,16 @@ def get_braking_encoder_norm():
     global brake_release_candidate_last_drop_time
     global brake_release_candidate_disqualified
     raw = read_braking_encoder_raw()
+    now = time.monotonic()
     braking_latest_encoder_raw = raw
     if raw is None:
+        if (
+            braking_last_valid_encoder_norm is not None
+            and (now - braking_last_valid_encoder_time) <= braking_encoder_glitch_hold_seconds
+        ):
+            braking_latest_encoder_raw = braking_last_valid_encoder_raw
+            braking_latest_encoder_norm = braking_last_valid_encoder_norm
+            return braking_last_valid_encoder_norm
         braking_latest_encoder_norm = None
         return None
 
@@ -1072,8 +1099,9 @@ def get_braking_encoder_norm():
     braking_latest_encoder_norm = norm
     if norm is None:
         return None
-
-    now = time.monotonic()
+    braking_last_valid_encoder_raw = raw
+    braking_last_valid_encoder_norm = norm
+    braking_last_valid_encoder_time = now
 
     if not brake_release_candidate_active:
         brake_release_candidate_active = True
