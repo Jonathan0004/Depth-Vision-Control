@@ -18,9 +18,25 @@ import os
 
 
 
-# Run INITIALIZE_PWM.py first
+# Run INITIALIZE_PWM.py first, then automatically restart this program once.
 script_path = os.path.join(os.path.dirname(__file__), "INITIALIZE_PWM.py")
-subprocess.run([sys.executable, script_path])
+
+def run_pwm_initializer():
+    subprocess.run([sys.executable, script_path])
+    time.sleep(1.0)
+
+if os.environ.get("BRAKING_STEERING_SECOND_RUN") != "1":
+    run_pwm_initializer()
+    run_pwm_initializer()
+
+    env = os.environ.copy()
+    env["BRAKING_STEERING_SECOND_RUN"] = "1"
+
+    os.execvpe(sys.executable, [sys.executable, __file__], env)
+
+# Second run continues normally
+run_pwm_initializer()
+run_pwm_initializer()
 
 
 
