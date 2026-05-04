@@ -159,13 +159,14 @@ confidence_text_margin = 12
 # Encoder + steering control configuration
 encoder_i2c_bus = 7
 encoder_i2c_address = 0x36
-calibration_file = Path("steering_calibration.json")
+script_dir = Path(__file__).resolve().parent
+calibration_file = script_dir / "steering_calibration.json"
 simulated_step_norm = 0.01        # arrow-key increment when in simulated encoder mode
 
 # Encoder + braking control configuration
 braking_encoder_i2c_bus = 1
 braking_encoder_i2c_address = 0x36
-braking_calibration_file = Path("braking_calibration.json")
+braking_calibration_file = script_dir / "braking_calibration.json"
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +414,7 @@ def save_calibration(min_raw, center_raw, max_raw):
         "encoder_center_raw": int(center_raw),
         "encoder_max_raw": int(max_raw),
     }
+    calibration_file.parent.mkdir(parents=True, exist_ok=True)
     calibration_file.write_text(json.dumps(calibration_data, indent=2))
     calibration_loaded = True
 
@@ -514,6 +516,7 @@ def save_braking_calibration(min_raw, max_raw):
         "encoder_min_raw": int(min_raw),
         "encoder_max_raw": int(max_raw),
     }
+    braking_calibration_file.parent.mkdir(parents=True, exist_ok=True)
     braking_calibration_file.write_text(json.dumps(braking_calibration_data, indent=2))
     braking_calibration_loaded = True
 
