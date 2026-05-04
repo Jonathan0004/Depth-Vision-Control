@@ -593,6 +593,8 @@ braking_motor_pwm_enabled = False
 braking_jog_mode_enabled = False
 braking_jog_direction = 0  # -1 Release, 0 idle, +1 Press
 braking_jog_duty_pct = braking_jog_default_duty_pct
+valve_jog_mode_enabled = False
+valve_output_high = None
 
 braking_latest_encoder_raw = None
 braking_latest_encoder_norm = None
@@ -644,6 +646,32 @@ def _track_brake_encoder_press(braking_encoder_norm) -> None:
         _register_brake_press_and_maybe_shutdown()
     elif brake_encoder_was_pressed and braking_encoder_norm <= brake_release_detect_threshold_norm:
         brake_encoder_was_pressed = False
+
+
+def set_valve_output(level_high):
+    """Set valve output HIGH/LOW and cache the requested state."""
+    global valve_output_high
+    valve_output_high = bool(level_high)
+    if GPIO is None:
+        return
+    try:
+        GPIO.output(braking_motor_power_pin, GPIO.HIGH if valve_output_high else GPIO.LOW)
+    except RuntimeError:
+        pass
+
+
+def sync_valve_output_from_pin():
+    """Read current valve output so latching starts from existing pin state."""
+    global valve_output_high
+    if GPIO is None:
+        if valve_output_high is None:
+            valve_output_high = False
+        return
+    try:
+        valve_output_high = bool(GPIO.input(braking_motor_power_pin) == GPIO.HIGH)
+    except RuntimeError:
+        if valve_output_high is None:
+            valve_output_high = False
 
 
 def initialise_motor_control():
@@ -1878,7 +1906,8 @@ while True:
                 "V/N: Brake jog Release/Press",
                 "C: Start steer calibration",
                 "X: Start brake calibration",
-                "P: Press brake for 5 seconds",
+                "P: Toggle valve jog mode",
+                "O: Latch/unlatch valve output",
                 "SPACE: Capture calibration",
             ]
             draw_help_overlay(
@@ -2005,8 +2034,19 @@ while True:
             ui_notice_text = "Brake jog disabled"
             ui_notice_until = time.time() + 3.0
     if key == ord('p'):
-        brake_hold_until = time.monotonic() + 5.0
-        ui_notice_text = "Brake pressed for 5 seconds"
+        valve_jog_mode_enabled = not valve_jog_mode_enabled
+        if valve_jog_mode_enabled:
+            sync_valve_output_from_pin()
+            ui_notice_text = f"Valve jog enabled (output {'HIGH' if valve_output_high else 'LOW'})"
+        else:
+            ui_notice_text = "Valve jog disabled"
+        ui_notice_until = time.monotonic() + 2.0
+
+    if key == ord('o') and valve_jog_mode_enabled:
+        if valve_output_high is None:
+            sync_valve_output_from_pin()
+        set_valve_output(not valve_output_high)
+        ui_notice_text = f"Valve output {'HIGH' if valve_output_high else 'LOW'}"
         ui_notice_until = time.monotonic() + 2.0
 
 
