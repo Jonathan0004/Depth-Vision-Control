@@ -134,6 +134,7 @@ braking_motor_power_pin = 22             # HIGH when PWM is driving, LOW when id
 braking_motor_max_duty_pct = 100.0
 braking_motor_full_speed_error_norm = 0.35
 braking_motor_dead_zone_norm = 0.01
+braking_motor_min_drive_duty_pct = 18.0
 braking_jog_default_duty_pct = 50.0
 braking_jog_duty_step_pct = 5.0
 
@@ -166,6 +167,9 @@ simulated_step_norm = 0.01        # arrow-key increment when in simulated encode
 braking_encoder_i2c_bus = 1
 braking_encoder_i2c_address = 0x36
 braking_calibration_file = Path("braking_calibration.json")
+braking_encoder_read_retries = 3
+braking_encoder_read_retry_delay_s = 0.0015
+braking_encoder_hold_last_seconds = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -531,13 +535,16 @@ def braking_encoder_span():
 def read_braking_encoder_raw():
     if not braking_encoder_available or braking_encoder_bus is None:
         return None
-    try:
-        high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
-        low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
-    except OSError:
-        return None
-    raw = ((high & 0x0F) << 8) | low
-    return raw
+    for attempt in range(max(1, int(braking_encoder_read_retries))):
+        try:
+            high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
+            low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
+            return ((high & 0x0F) << 8) | low
+        except OSError:
+            if attempt + 1 >= max(1, int(braking_encoder_read_retries)):
+                return None
+            time.sleep(max(0.0, float(braking_encoder_read_retry_delay_s)))
+    return None
 
 
 def braking_encoder_raw_to_norm(raw):
@@ -598,6 +605,7 @@ braking_jog_duty_pct = braking_jog_default_duty_pct
 
 braking_latest_encoder_raw = None
 braking_latest_encoder_norm = None
+braking_latest_encoder_read_monotonic = 0.0
 braking_calibration_active = False
 braking_calibration_stage = None
 braking_calibration_status_text = ""
@@ -962,7 +970,11 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
         return
 
     duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
-    duty_pct = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
+    duty_cap = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
+    error_ratio = abs(error) / max(1e-6, float(braking_motor_full_speed_error_norm))
+    duty_pct = duty_cap * min(1.0, error_ratio)
+    if duty_pct > 0.0:
+        duty_pct = max(braking_motor_min_drive_duty_pct, duty_pct)
 
     _set_braking_motor_direction(error)
 
@@ -1029,12 +1041,20 @@ def shutdown_braking_motor_control():
 
 
 def get_braking_encoder_norm():
-    global braking_latest_encoder_raw, braking_latest_encoder_norm
+    global braking_latest_encoder_raw, braking_latest_encoder_norm, braking_latest_encoder_read_monotonic
+    now = time.monotonic()
     raw = read_braking_encoder_raw()
-    braking_latest_encoder_raw = raw
     if raw is None:
+        if (
+            braking_latest_encoder_norm is not None
+            and (now - braking_latest_encoder_read_monotonic) <= braking_encoder_hold_last_seconds
+        ):
+            return braking_latest_encoder_norm
+        braking_latest_encoder_raw = None
         braking_latest_encoder_norm = None
         return None
+    braking_latest_encoder_raw = raw
+    braking_latest_encoder_read_monotonic = now
     norm = braking_encoder_raw_to_norm(raw)
     braking_latest_encoder_norm = norm
     return norm
