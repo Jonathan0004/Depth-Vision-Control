@@ -610,6 +610,7 @@ brake_press_timestamps = deque()
 brake_release_rezero_drop_norm = 0.05
 brake_release_rezero_settle_seconds = 1.0
 brake_release_rezero_up_tolerance_norm = 0.005
+brake_autorange_margin_raw = 4
 brake_release_candidate_active = False
 brake_release_candidate_start_norm = None
 brake_release_candidate_lowest_norm = None
@@ -1050,6 +1051,23 @@ def get_braking_encoder_norm():
     if raw is None:
         braking_latest_encoder_norm = None
         return None
+
+    # Expand (never shrink) brake calibration bounds when live readings exceed
+    # the recorded range. This prevents normalized output from getting pinned
+    # at 1.000/0.000 after a hard press/release that goes slightly outside the
+    # calibrated travel.
+    min_raw = braking_calibration_data.get("encoder_min_raw")
+    max_raw = braking_calibration_data.get("encoder_max_raw")
+    if min_raw is not None and max_raw is not None:
+        updated_min = int(min_raw)
+        updated_max = int(max_raw)
+        if raw < (updated_min - brake_autorange_margin_raw):
+            updated_min = int(raw)
+        if raw > (updated_max + brake_autorange_margin_raw):
+            updated_max = int(raw)
+        if updated_min != int(min_raw) or updated_max != int(max_raw):
+            save_braking_calibration(updated_min, updated_max)
+
     norm = braking_encoder_raw_to_norm(raw)
     braking_latest_encoder_norm = norm
     if norm is None:
