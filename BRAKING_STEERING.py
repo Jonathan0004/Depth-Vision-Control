@@ -607,6 +607,15 @@ braking_calibration_jog_direction = 0
 braking_target_norm = None
 brake_hold_until = 0.0
 brake_press_timestamps = deque()
+brake_release_rezero_drop_norm = 0.05
+brake_release_rezero_settle_seconds = 1.0
+brake_release_rezero_up_tolerance_norm = 0.005
+brake_release_candidate_active = False
+brake_release_candidate_start_norm = None
+brake_release_candidate_lowest_norm = None
+brake_release_candidate_lowest_raw = None
+brake_release_candidate_last_drop_time = 0.0
+brake_release_candidate_disqualified = False
 
 brake_shutdown_press_count = 5
 brake_shutdown_window_seconds = 6.0
@@ -1030,6 +1039,12 @@ def shutdown_braking_motor_control():
 
 def get_braking_encoder_norm():
     global braking_latest_encoder_raw, braking_latest_encoder_norm
+    global brake_release_candidate_active
+    global brake_release_candidate_start_norm
+    global brake_release_candidate_lowest_norm
+    global brake_release_candidate_lowest_raw
+    global brake_release_candidate_last_drop_time
+    global brake_release_candidate_disqualified
     raw = read_braking_encoder_raw()
     braking_latest_encoder_raw = raw
     if raw is None:
@@ -1037,6 +1052,57 @@ def get_braking_encoder_norm():
         return None
     norm = braking_encoder_raw_to_norm(raw)
     braking_latest_encoder_norm = norm
+    if norm is None:
+        return None
+
+    now = time.monotonic()
+
+    if not brake_release_candidate_active:
+        brake_release_candidate_active = True
+        brake_release_candidate_start_norm = norm
+        brake_release_candidate_lowest_norm = norm
+        brake_release_candidate_lowest_raw = raw
+        brake_release_candidate_last_drop_time = now
+        brake_release_candidate_disqualified = False
+        return norm
+
+    if brake_release_candidate_start_norm is None or brake_release_candidate_lowest_norm is None:
+        brake_release_candidate_active = False
+        return norm
+
+    if norm < brake_release_candidate_lowest_norm:
+        brake_release_candidate_lowest_norm = norm
+        brake_release_candidate_lowest_raw = raw
+        brake_release_candidate_last_drop_time = now
+    elif norm > (brake_release_candidate_lowest_norm + brake_release_rezero_up_tolerance_norm):
+        brake_release_candidate_disqualified = True
+
+    drop_amount = brake_release_candidate_start_norm - brake_release_candidate_lowest_norm
+    settle_elapsed = now - brake_release_candidate_last_drop_time
+    if (
+        drop_amount >= brake_release_rezero_drop_norm
+        and not brake_release_candidate_disqualified
+        and settle_elapsed >= brake_release_rezero_settle_seconds
+        and not braking_calibration_active
+    ):
+        new_zero_raw = brake_release_candidate_lowest_raw
+        max_raw = braking_calibration_data.get("encoder_max_raw")
+        if new_zero_raw is not None and max_raw is not None and int(max_raw) - int(new_zero_raw) > 0:
+            save_braking_calibration(int(new_zero_raw), int(max_raw))
+
+        brake_release_candidate_active = True
+        brake_release_candidate_start_norm = norm
+        brake_release_candidate_lowest_norm = norm
+        brake_release_candidate_lowest_raw = raw
+        brake_release_candidate_last_drop_time = now
+        brake_release_candidate_disqualified = False
+    elif brake_release_candidate_disqualified:
+        brake_release_candidate_start_norm = norm
+        brake_release_candidate_lowest_norm = norm
+        brake_release_candidate_lowest_raw = raw
+        brake_release_candidate_last_drop_time = now
+        brake_release_candidate_disqualified = False
+
     return norm
 
 
