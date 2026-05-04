@@ -140,6 +140,10 @@ braking_jog_duty_step_pct = 5.0
 brakeConf = 0.30  # brake when steerability confidence drops below this threshold
 brake_hold_seconds = 5.0  # keep brake fully pressed for this long after confidence-triggered braking
 braking_auto_max_duty_pct = 100.0  # max PWM duty allowed when auto-braking to press/release
+brake_press_stall_progress_norm = 0.006  # required new high-watermark increase to confirm real press progress
+brake_press_stall_noise_norm = 0.004  # ignore smaller encoder jitter while evaluating progress
+brake_press_stall_timeout_seconds = 0.80  # stop press drive only after sustained no-progress while pressing
+brake_press_stall_min_error_norm = 0.08  # only run stall detection when still meaningfully far from target
 
 # HUD text overlays on the combined frame
 hud_text_position = (10, 30)
@@ -623,6 +627,8 @@ brake_shutdown_window_seconds = 6.0
 brake_press_detect_threshold_norm = 0.90
 brake_release_detect_threshold_norm = 0.75
 brake_encoder_was_pressed = False
+brake_press_max_norm = None
+brake_press_last_progress_time = 0.0
 
 
 def _register_brake_press_and_maybe_shutdown() -> bool:
@@ -955,7 +961,12 @@ def enable_braking_motor_pwm() -> None:
 
 
 def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
+    global brake_press_max_norm, brake_press_last_progress_time
+
+    now = time.monotonic()
     if target_norm is None or encoder_norm is None or braking_calibration_active:
+        brake_press_max_norm = None
+        brake_press_last_progress_time = now
         _set_braking_motor_direction(0)
         _set_braking_motor_pwm_pct(0.0)
         if GPIO is not None and braking_motor_gpio_initialised:
@@ -965,6 +976,34 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
     error = float(target_norm) - float(encoder_norm)
 
     if abs(error) <= braking_motor_dead_zone_norm:
+        brake_press_max_norm = None
+        brake_press_last_progress_time = now
+        _set_braking_motor_direction(0)
+        _set_braking_motor_pwm_pct(0.0)
+        if GPIO is not None and braking_motor_gpio_initialised:
+            GPIO.output(braking_motor_power_pin, GPIO.LOW)
+        return
+
+    stalled_press = False
+    if error > 0.0 and error >= brake_press_stall_min_error_norm:
+        current_norm = float(encoder_norm)
+        if brake_press_max_norm is None:
+            brake_press_max_norm = current_norm
+            brake_press_last_progress_time = now
+        else:
+            if current_norm > (brake_press_max_norm + brake_press_stall_progress_norm):
+                brake_press_max_norm = current_norm
+                brake_press_last_progress_time = now
+            elif current_norm > brake_press_max_norm:
+                brake_press_max_norm = current_norm
+            elif current_norm < (brake_press_max_norm - brake_press_stall_noise_norm):
+                if (now - brake_press_last_progress_time) >= brake_press_stall_timeout_seconds:
+                    stalled_press = True
+    else:
+        brake_press_max_norm = None
+        brake_press_last_progress_time = now
+
+    if stalled_press:
         _set_braking_motor_direction(0)
         _set_braking_motor_pwm_pct(0.0)
         if GPIO is not None and braking_motor_gpio_initialised:
@@ -982,7 +1021,6 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
             GPIO.output(braking_motor_power_pin, GPIO.HIGH)
         else:
             GPIO.output(braking_motor_power_pin, GPIO.LOW)
-
 
 def apply_braking_jog_drive(direction: int) -> None:
     if GPIO is not None and braking_motor_gpio_initialised:
