@@ -583,6 +583,8 @@ steering_indicator_initialised = False
 jog_mode_enabled = False
 jog_direction = 0  # -1 left, 0 idle, +1 right
 jog_duty_pct = jog_default_duty_pct
+valve_jog_mode_enabled = False
+valve_jog_latched = False
 
 braking_motor_pwm_period_ns = _ns_period(braking_motor_pwm_frequency_hz)
 braking_motor_pwm_channel_path = None
@@ -1681,7 +1683,10 @@ while True:
 
     # Update "Steer Control" variable every loop
     steer_control_x = draw_x
-    update_steering_center_indicator(steer_control_x, center_x)
+    if valve_jog_mode_enabled:
+        update_steering_center_indicator(1 if valve_jog_latched else None, 0)
+    else:
+        update_steering_center_indicator(steer_control_x, center_x)
 
     encoder_norm = get_encoder_norm()
     encoder_px = None
@@ -1698,7 +1703,14 @@ while True:
                 1,
             )
 
-    if jog_mode_enabled:
+    if valve_jog_mode_enabled:
+        if motor_pwm_enabled:
+            disable_motor_pwm()
+        if braking_motor_pwm_enabled:
+            disable_braking_motor_pwm()
+        apply_jog_drive(0)
+        apply_braking_jog_drive(0)
+    elif jog_mode_enabled:
         if not motor_pwm_enabled:
             enable_motor_pwm()
         if braking_motor_pwm_enabled:
@@ -1853,6 +1865,7 @@ while True:
             sim_encoder_enabled
             or jog_mode_enabled
             or braking_jog_mode_enabled
+            or valve_jog_mode_enabled
             or calibration_active
             or braking_calibration_active
         )
@@ -1876,6 +1889,8 @@ while True:
                 "UP/DOWN: Adjust jog speed",
                 "B: Toggle brake jog mode",
                 "V/N: Brake jog Release/Press",
+                "T: Toggle valve jog mode",
+                "Y: Toggle valve latch while in valve jog mode",
                 "C: Start steer calibration",
                 "X: Start brake calibration",
                 "P: Press brake for 5 seconds",
@@ -1921,6 +1936,9 @@ while True:
                 bottom_lines.append(
                     f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, UP/DOWN for speed, B to exit)"
                 )
+            if valve_jog_mode_enabled:
+                valve_state = "latched (HIGH)" if valve_jog_latched else "unlatched (LOW)"
+                bottom_lines.append(f"Valve jog: {valve_state} (Y to toggle, T to exit)")
             if sim_encoder_enabled:
                 bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, K to exit")
             if not control_active:
@@ -1966,44 +1984,83 @@ while True:
             ui_notice_until = time.time() + 3.0
 
     if key == ord('s'):
-        jog_mode_enabled = not jog_mode_enabled
-        jog_direction = 0
-        apply_jog_drive(0)
-        if jog_mode_enabled:
-            braking_jog_mode_enabled = False
-            braking_jog_direction = 0
-            apply_braking_jog_drive(0)
-            if braking_motor_pwm_enabled:
-                disable_braking_motor_pwm()
-            if not motor_pwm_enabled:
-                enable_motor_pwm()
-            ui_notice_text = "Steer jog enabled"
+        if valve_jog_mode_enabled:
+            ui_notice_text = "Valve jog active (press T to exit first)"
             ui_notice_until = time.time() + 3.0
         else:
-            if not braking_motor_pwm_enabled:
-                enable_braking_motor_pwm()
-            ui_notice_text = "Steer jog disabled"
-            ui_notice_until = time.time() + 3.0
+            jog_mode_enabled = not jog_mode_enabled
+            jog_direction = 0
+            apply_jog_drive(0)
+            if jog_mode_enabled:
+                braking_jog_mode_enabled = False
+                braking_jog_direction = 0
+                apply_braking_jog_drive(0)
+                if braking_motor_pwm_enabled:
+                    disable_braking_motor_pwm()
+                if not motor_pwm_enabled:
+                    enable_motor_pwm()
+                ui_notice_text = "Steer jog enabled"
+                ui_notice_until = time.time() + 3.0
+            else:
+                if not braking_motor_pwm_enabled:
+                    enable_braking_motor_pwm()
+                ui_notice_text = "Steer jog disabled"
+                ui_notice_until = time.time() + 3.0
 
     if key == ord('b'):
-        braking_jog_mode_enabled = not braking_jog_mode_enabled
-        braking_jog_direction = 0
-        apply_braking_jog_drive(0)
-        if braking_jog_mode_enabled:
+        if valve_jog_mode_enabled:
+            ui_notice_text = "Valve jog active (press T to exit first)"
+            ui_notice_until = time.time() + 3.0
+        else:
+            braking_jog_mode_enabled = not braking_jog_mode_enabled
+            braking_jog_direction = 0
+            apply_braking_jog_drive(0)
+            if braking_jog_mode_enabled:
+                jog_mode_enabled = False
+                jog_direction = 0
+                apply_jog_drive(0)
+                if motor_pwm_enabled:
+                    disable_motor_pwm()
+                if not braking_motor_pwm_enabled:
+                    enable_braking_motor_pwm()
+                ui_notice_text = "Brake jog enabled"
+                ui_notice_until = time.time() + 3.0
+            else:
+                if not motor_pwm_enabled:
+                    enable_motor_pwm()
+                ui_notice_text = "Brake jog disabled"
+                ui_notice_until = time.time() + 3.0
+
+    if key == ord('t'):
+        valve_jog_mode_enabled = not valve_jog_mode_enabled
+        if valve_jog_mode_enabled:
             jog_mode_enabled = False
             jog_direction = 0
             apply_jog_drive(0)
+            braking_jog_mode_enabled = False
+            braking_jog_direction = 0
+            apply_braking_jog_drive(0)
             if motor_pwm_enabled:
                 disable_motor_pwm()
-            if not braking_motor_pwm_enabled:
-                enable_braking_motor_pwm()
-            ui_notice_text = "Brake jog enabled"
+            if braking_motor_pwm_enabled:
+                disable_braking_motor_pwm()
+            ui_notice_text = "Valve jog enabled"
             ui_notice_until = time.time() + 3.0
         else:
+            valve_jog_latched = False
+            update_steering_center_indicator(None, 0)
             if not motor_pwm_enabled:
                 enable_motor_pwm()
-            ui_notice_text = "Brake jog disabled"
+            if not braking_motor_pwm_enabled:
+                enable_braking_motor_pwm()
+            ui_notice_text = "Valve jog disabled"
             ui_notice_until = time.time() + 3.0
+
+    if valve_jog_mode_enabled and key == ord('y'):
+        valve_jog_latched = not valve_jog_latched
+        update_steering_center_indicator(1 if valve_jog_latched else None, 0)
+        ui_notice_text = "Valve latched HIGH" if valve_jog_latched else "Valve unlatched LOW"
+        ui_notice_until = time.time() + 3.0
     if key == ord('p'):
         brake_hold_until = time.monotonic() + 5.0
         ui_notice_text = "Brake pressed for 5 seconds"
