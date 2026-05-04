@@ -462,7 +462,7 @@ def encoder_raw_to_norm(raw):
 
 braking_encoder_bus = None
 braking_encoder_available = False
-braking_calibration_data = {"encoder_release_raw": None, "encoder_press_raw": None}
+braking_calibration_data = {"encoder_min_raw": None, "encoder_max_raw": None}
 braking_calibration_loaded = False
 
 
@@ -495,50 +495,37 @@ def load_braking_calibration():
     if braking_calibration_file.exists():
         try:
             data = json.loads(braking_calibration_file.read_text())
-            if {"encoder_release_raw", "encoder_press_raw"} <= data.keys():
+            if {
+                "encoder_min_raw",
+                "encoder_max_raw",
+            } <= data.keys():
                 braking_calibration_data = {
-                    "encoder_release_raw": int(data["encoder_release_raw"]),
-                    "encoder_press_raw": int(data["encoder_press_raw"]),
-                }
-            elif {"encoder_min_raw", "encoder_max_raw"} <= data.keys():
-                braking_calibration_data = {
-                    "encoder_release_raw": int(data["encoder_min_raw"]),
-                    "encoder_press_raw": int(data["encoder_max_raw"]),
+                    "encoder_min_raw": int(data["encoder_min_raw"]),
+                    "encoder_max_raw": int(data["encoder_max_raw"]),
                 }
         except (json.JSONDecodeError, ValueError):
             pass
     braking_calibration_loaded = True
 
 
-def save_braking_calibration(release_raw, press_raw):
+def save_braking_calibration(min_raw, max_raw):
     global braking_calibration_data, braking_calibration_loaded
     braking_calibration_data = {
-        "encoder_release_raw": int(release_raw),
-        "encoder_press_raw": int(press_raw),
+        "encoder_min_raw": int(min_raw),
+        "encoder_max_raw": int(max_raw),
     }
     braking_calibration_file.write_text(json.dumps(braking_calibration_data, indent=2))
     braking_calibration_loaded = True
 
 
-def _mod_12bit(value):
-    return int(value) & 0x0FFF
-
-
-def _directed_12bit_delta(start_raw, end_raw):
-    start = _mod_12bit(start_raw)
-    end = _mod_12bit(end_raw)
-    forward = (end - start) & 0x0FFF
-    backward = (start - end) & 0x0FFF
-    return forward if forward <= backward else -backward
-
-
 def braking_encoder_span():
-    release_raw = braking_calibration_data["encoder_release_raw"]
-    press_raw = braking_calibration_data["encoder_press_raw"]
-    if release_raw is None or press_raw is None:
+    if (
+        braking_calibration_data["encoder_min_raw"] is None
+        or braking_calibration_data["encoder_max_raw"] is None
+    ):
         return None
-    span = _directed_12bit_delta(release_raw, press_raw)
-    return span if span != 0 else None
+    span = braking_calibration_data["encoder_max_raw"] - braking_calibration_data["encoder_min_raw"]
+    return span if span > 0 else None
 
 
 def read_braking_encoder_raw():
@@ -557,8 +544,7 @@ def braking_encoder_raw_to_norm(raw):
     span = braking_encoder_span()
     if span is None:
         return None
-    release_raw = braking_calibration_data["encoder_release_raw"]
-    norm = _directed_12bit_delta(release_raw, raw) / span
+    norm = (raw - braking_calibration_data["encoder_min_raw"]) / span
     return float(clamp(norm, 0.0, 1.0))
 
 
@@ -1127,15 +1113,15 @@ def capture_braking_calibration_point():
         )
     elif braking_calibration_stage == "max":
         braking_calibration_samples["max"] = raw
-        release_raw = braking_calibration_samples["min"]
-        press_raw = braking_calibration_samples["max"]
-        if release_raw == press_raw:
+        min_raw = min(braking_calibration_samples["min"], braking_calibration_samples["max"])
+        max_raw = max(braking_calibration_samples["min"], braking_calibration_samples["max"])
+        if min_raw == max_raw:
             braking_calibration_status_text, braking_calibration_status_until = set_status_message(
                 "Brake cal failed: encoder range is zero",
                 3.0,
             )
         else:
-            save_braking_calibration(release_raw, press_raw)
+            save_braking_calibration(min_raw, max_raw)
             braking_calibration_status_text, braking_calibration_status_until = set_status_message(
                 "Brake calibration saved",
                 3.0,
