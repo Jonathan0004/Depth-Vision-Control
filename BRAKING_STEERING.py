@@ -60,6 +60,10 @@ except ImportError:  # pragma: no cover - hardware dependency
 # documented so their impact is clear.
 # ---------------------------------------------------------------------------
 
+# Toggle all OpenCV visualization work (drawing + display window).
+# Set False for maximum runtime performance without rendering overhead.
+enable_visualization = True
+
 # Grid resolution for sampling depth points across each frame (higher = denser)
 rows, cols = 25, 50
 
@@ -1453,21 +1457,23 @@ while True:
     thresh = max(depth_diff_threshold, std_multiplier * std_z)
     mask = (mean_z - zs) > thresh
 
-    # Convert depth arrays into coloured heatmaps for easier interpretation
-    norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
-    norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
+    combined = None
+    if enable_visualization:
+        # Convert depth arrays into coloured heatmaps for easier interpretation
+        norm0 = cv2.normalize(depth0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap0 = cv2.applyColorMap(cv2.resize(norm0, (frame0.shape[1], frame0.shape[0])), cv2.COLORMAP_MAGMA)
+        norm1 = cv2.normalize(depth1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        cmap1 = cv2.applyColorMap(cv2.resize(norm1, (frame1.shape[1], frame1.shape[0])), cv2.COLORMAP_MAGMA)
 
-    # Draw cutoff lines on each camera to mark the active sensing band
-    for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
-        top_y = top_cutoff_pixels
-        bottom_y = h - bottom_cutoff_pixels
-        cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
-        cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
+        # Draw cutoff lines on each camera to mark the active sensing band
+        for cmap, h, w in [(cmap0, frame0.shape[0], frame0.shape[1]), (cmap1, frame1.shape[0], frame1.shape[1])]:
+            top_y = top_cutoff_pixels
+            bottom_y = h - bottom_cutoff_pixels
+            cv2.line(cmap, (0, top_y), (w, top_y), cutoff_line_color, cutoff_line_thickness)
+            cv2.line(cmap, (0, bottom_y), (w, bottom_y), cutoff_line_color, cutoff_line_thickness)
 
-    # Show combined view
-    combined = np.hstack((cmap0, cmap1))
+        # Show combined view
+        combined = np.hstack((cmap0, cmap1))
 
     cam_indices_all = cloud['cam']
     heights_all = np.where(cam_indices_all == 0, frame0.shape[0], frame1.shape[0])
@@ -1642,13 +1648,14 @@ while True:
         scale = max(1, w_combined - 1)
         encoder_px = int(round(encoder_norm * scale))
         encoder_px = int(clamp(encoder_px, 0, w_combined - 1))
-        cv2.line(
-            combined,
-            (encoder_px, 0),
-            (encoder_px, h_combined),
-            (0, 255, 255),
-            1,
-        )
+        if enable_visualization:
+            cv2.line(
+                combined,
+                (encoder_px, 0),
+                (encoder_px, h_combined),
+                (0, 255, 255),
+                1,
+            )
 
     if jog_mode_enabled:
         if not motor_pwm_enabled:
@@ -1691,206 +1698,209 @@ while True:
             max_duty_pct=braking_auto_max_duty_pct,
         )
 
-    # Draw the guidance circle
-    blue_pos = (draw_x, line_y)
-    cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
+    if enable_visualization:
+        # Draw the guidance circle
+        blue_pos = (draw_x, line_y)
+        cv2.circle(combined, blue_pos, blue_circle_radius_px, blue_circle_color, blue_circle_thickness)
 
-    if not help_overlay_enabled:
-        # Display "Steer Control" on the left frame
-        draw_text_with_outline(
-            combined,
-            f"Steer Control: {steer_control_x}",
-            hud_text_position,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            hud_text_outline_color,
-            hud_text_outline_thickness,
-        )
-
-        encoder_text = "Steer Encoder: --"
-        if encoder_px is not None:
-            encoder_text = f"Steer Encoder: {encoder_px} px"
-        elif sim_encoder_enabled:
-            encoder_text = "Steer Encoder: simulated"
-        draw_text_with_outline(
-            combined,
-            encoder_text,
-            (hud_text_position[0], hud_text_position[1] + 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            hud_text_outline_color,
-            hud_text_outline_thickness,
-        )
-
-        brake_encoder_text = "Break Encoder: --"
-        if braking_encoder_norm is not None:
-            brake_encoder_text = f"Break Encoder: {braking_encoder_norm:.3f}"
-        draw_text_with_outline(
-            combined,
-            brake_encoder_text,
-            (hud_text_position[0], hud_text_position[1] + 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            hud_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            hud_text_outline_color,
-            hud_text_outline_thickness,
-        )
-
-    # Visualize the pull zone boundaries (blue vertical lines)
-    cv2.line(
-        combined,
-        (int(zone_left), 0),
-        (int(zone_left), h_combined),
-        pull_zone_line_color,
-        pull_zone_line_thickness,
-    )
-    cv2.line(
-        combined,
-        (int(zone_right), 0),
-        (int(zone_right), h_combined),
-        pull_zone_line_color,
-        pull_zone_line_thickness,
-    )
-
-    confidence_text = f"Steering Confidence: {steering_confidence:.2f}"
-    confidence_color = (
-        0,
-        int(round(255.0 * steering_confidence)),
-        int(round(255.0 * (1.0 - steering_confidence))),
-    )
-    (confidence_text_w, confidence_text_h), _ = cv2.getTextSize(
-        confidence_text,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        hud_text_thickness,
-    )
-    confidence_text_x = max(confidence_text_margin, w_combined - confidence_text_w - confidence_text_margin)
-    confidence_text_y = confidence_text_margin + confidence_text_h
-    draw_text_with_outline(
-        combined,
-        confidence_text,
-        (confidence_text_x, confidence_text_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hud_text_scale,
-        confidence_color,
-        hud_text_thickness,
-        hud_text_outline_color,
-        hud_text_outline_thickness,
-    )
-    # ────────────────────────────────────────────────────────────────────
-
-    if sim_encoder_enabled:
-        slider_left = 20
-        slider_right = w_combined - 20
-        slider_y = h_combined - 30
-        cv2.line(
-            combined,
-            (slider_left, slider_y),
-            (slider_right, slider_y),
-            (200, 200, 200),
-            2,
-        )
-        slider_x = int(round(slider_left + sim_encoder_norm * (slider_right - slider_left)))
-        cv2.circle(combined, (slider_x, slider_y), 8, (0, 200, 255), -1)
-
-    bottom_lines = []
-    control_active = (
-        sim_encoder_enabled
-        or jog_mode_enabled
-        or braking_jog_mode_enabled
-        or calibration_active
-        or braking_calibration_active
-    )
-    now = time.time()
-    if calibration_status_text and calibration_status_until and now > calibration_status_until:
-        calibration_status_text = ""
-        calibration_status_until = 0.0
-    if braking_calibration_status_text and braking_calibration_status_until and now > braking_calibration_status_until:
-        braking_calibration_status_text = ""
-        braking_calibration_status_until = 0.0
-
-    if help_overlay_enabled:
-        help_title = ""
-        help_lines = [
-            "ESC: End Program",
-            "H: Close help overlay",
-            "K: Toggle sim steer encoder",
-            "LEFT/RIGHT: Adjust sim steer encoder",
-            "S: Toggle steer jog mode",
-            "A/D: Steer jog left/right",
-            "UP/DOWN: Adjust jog speed",
-            "B: Toggle brake jog mode",
-            "V/N: Brake jog Release/Press",
-            "C: Start steer calibration",
-            "X: Start brake calibration",
-            "SPACE: Capture calibration",
-        ]
-        draw_help_overlay(
-            combined,
-            help_title,
-            help_lines,
-            (20, 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            help_title_scale,
-            help_text_scale,
-            hud_text_color,
-            hud_text_thickness,
-            hud_text_outline_color,
-            hud_text_outline_thickness,
-            help_text_line_gap,
-            help_text_column_gap,
-        )
-    else:
-        if calibration_status_text:
-            bottom_lines.append(calibration_status_text)
-        if braking_calibration_status_text:
-            bottom_lines.append(braking_calibration_status_text)
-        if jog_mode_enabled:
-            if jog_direction < 0:
-                jog_state = "left"
-            elif jog_direction > 0:
-                jog_state = "right"
-            else:
-                jog_state = "idle"
-            bottom_lines.append(
-                f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (A/D to drive, UP/DOWN for speed, S to exit)"
-            )
-        if braking_jog_mode_enabled:
-            if braking_jog_direction < 0:
-                braking_jog_state = "Release"
-            elif braking_jog_direction > 0:
-                braking_jog_state = "Press"
-            else:
-                braking_jog_state = "idle"
-            bottom_lines.append(
-                f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, UP/DOWN for speed, B to exit)"
-            )
-        if sim_encoder_enabled:
-            bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, K to exit")
-        if not control_active:
-            bottom_lines.append('Show help: "h"')
-        if bottom_lines:
-            draw_bottom_lines(
+        if not help_overlay_enabled:
+            # Display "Steer Control" on the left frame
+            draw_text_with_outline(
                 combined,
-                bottom_lines,
-                (20, h_combined - 14),
+                f"Steer Control: {steer_control_x}",
+                hud_text_position,
                 cv2.FONT_HERSHEY_SIMPLEX,
                 hud_text_scale,
                 hud_text_color,
                 hud_text_thickness,
                 hud_text_outline_color,
                 hud_text_outline_thickness,
-                20,
             )
 
-    # Present the final annotated view
-    cv2.imshow("Depth: Camera 0 | Camera 1", combined)
-    key = cv2.waitKey(1) & 0xFF
+            encoder_text = "Steer Encoder: --"
+            if encoder_px is not None:
+                encoder_text = f"Steer Encoder: {encoder_px} px"
+            elif sim_encoder_enabled:
+                encoder_text = "Steer Encoder: simulated"
+            draw_text_with_outline(
+                combined,
+                encoder_text,
+                (hud_text_position[0], hud_text_position[1] + 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                hud_text_scale,
+                hud_text_color,
+                hud_text_thickness,
+                hud_text_outline_color,
+                hud_text_outline_thickness,
+            )
+
+            brake_encoder_text = "Break Encoder: --"
+            if braking_encoder_norm is not None:
+                brake_encoder_text = f"Break Encoder: {braking_encoder_norm:.3f}"
+            draw_text_with_outline(
+                combined,
+                brake_encoder_text,
+                (hud_text_position[0], hud_text_position[1] + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                hud_text_scale,
+                hud_text_color,
+                hud_text_thickness,
+                hud_text_outline_color,
+                hud_text_outline_thickness,
+            )
+
+        # Visualize the pull zone boundaries (blue vertical lines)
+        cv2.line(
+            combined,
+            (int(zone_left), 0),
+            (int(zone_left), h_combined),
+            pull_zone_line_color,
+            pull_zone_line_thickness,
+        )
+        cv2.line(
+            combined,
+            (int(zone_right), 0),
+            (int(zone_right), h_combined),
+            pull_zone_line_color,
+            pull_zone_line_thickness,
+        )
+
+        confidence_text = f"Steering Confidence: {steering_confidence:.2f}"
+        confidence_color = (
+            0,
+            int(round(255.0 * steering_confidence)),
+            int(round(255.0 * (1.0 - steering_confidence))),
+        )
+        (confidence_text_w, confidence_text_h), _ = cv2.getTextSize(
+            confidence_text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            hud_text_thickness,
+        )
+        confidence_text_x = max(confidence_text_margin, w_combined - confidence_text_w - confidence_text_margin)
+        confidence_text_y = confidence_text_margin + confidence_text_h
+        draw_text_with_outline(
+            combined,
+            confidence_text,
+            (confidence_text_x, confidence_text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_text_scale,
+            confidence_color,
+            hud_text_thickness,
+            hud_text_outline_color,
+            hud_text_outline_thickness,
+        )
+        # ────────────────────────────────────────────────────────────────────
+
+        if sim_encoder_enabled:
+            slider_left = 20
+            slider_right = w_combined - 20
+            slider_y = h_combined - 30
+            cv2.line(
+                combined,
+                (slider_left, slider_y),
+                (slider_right, slider_y),
+                (200, 200, 200),
+                2,
+            )
+            slider_x = int(round(slider_left + sim_encoder_norm * (slider_right - slider_left)))
+            cv2.circle(combined, (slider_x, slider_y), 8, (0, 200, 255), -1)
+
+        bottom_lines = []
+        control_active = (
+            sim_encoder_enabled
+            or jog_mode_enabled
+            or braking_jog_mode_enabled
+            or calibration_active
+            or braking_calibration_active
+        )
+        now = time.time()
+        if calibration_status_text and calibration_status_until and now > calibration_status_until:
+            calibration_status_text = ""
+            calibration_status_until = 0.0
+        if braking_calibration_status_text and braking_calibration_status_until and now > braking_calibration_status_until:
+            braking_calibration_status_text = ""
+            braking_calibration_status_until = 0.0
+
+        if help_overlay_enabled:
+            help_title = ""
+            help_lines = [
+                "ESC: End Program",
+                "H: Close help overlay",
+                "K: Toggle sim steer encoder",
+                "LEFT/RIGHT: Adjust sim steer encoder",
+                "S: Toggle steer jog mode",
+                "A/D: Steer jog left/right",
+                "UP/DOWN: Adjust jog speed",
+                "B: Toggle brake jog mode",
+                "V/N: Brake jog Release/Press",
+                "C: Start steer calibration",
+                "X: Start brake calibration",
+                "SPACE: Capture calibration",
+            ]
+            draw_help_overlay(
+                combined,
+                help_title,
+                help_lines,
+                (20, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                help_title_scale,
+                help_text_scale,
+                hud_text_color,
+                hud_text_thickness,
+                hud_text_outline_color,
+                hud_text_outline_thickness,
+                help_text_line_gap,
+                help_text_column_gap,
+            )
+        else:
+            if calibration_status_text:
+                bottom_lines.append(calibration_status_text)
+            if braking_calibration_status_text:
+                bottom_lines.append(braking_calibration_status_text)
+            if jog_mode_enabled:
+                if jog_direction < 0:
+                    jog_state = "left"
+                elif jog_direction > 0:
+                    jog_state = "right"
+                else:
+                    jog_state = "idle"
+                bottom_lines.append(
+                    f"Steer jog: {jog_state} @ {jog_duty_pct:.0f}% (A/D to drive, UP/DOWN for speed, S to exit)"
+                )
+            if braking_jog_mode_enabled:
+                if braking_jog_direction < 0:
+                    braking_jog_state = "Release"
+                elif braking_jog_direction > 0:
+                    braking_jog_state = "Press"
+                else:
+                    braking_jog_state = "idle"
+                bottom_lines.append(
+                    f"Brake jog: {braking_jog_state} @ {braking_jog_duty_pct:.0f}% (V/N to drive, UP/DOWN for speed, B to exit)"
+                )
+            if sim_encoder_enabled:
+                bottom_lines.append("Sim encoder: \u2190/\u2192 adjust, K to exit")
+            if not control_active:
+                bottom_lines.append('Show help: "h"')
+            if bottom_lines:
+                draw_bottom_lines(
+                    combined,
+                    bottom_lines,
+                    (20, h_combined - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    hud_text_scale,
+                    hud_text_color,
+                    hud_text_thickness,
+                    hud_text_outline_color,
+                    hud_text_outline_thickness,
+                    20,
+                )
+
+        # Present the final annotated view
+        cv2.imshow("Depth: Camera 0 | Camera 1", combined)
+        key = cv2.waitKey(1) & 0xFF
+    else:
+        key = -1
 
     # Handle keys — currently only ESC to exit
     if key == 27:
