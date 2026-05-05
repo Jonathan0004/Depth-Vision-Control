@@ -534,16 +534,10 @@ def read_braking_encoder_raw():
     global braking_encoder_bus, braking_encoder_available
     if not braking_encoder_available or braking_encoder_bus is None:
         return None
-
-    retries = max(1, int(braking_encoder_read_retries))
-    for _ in range(retries):
+    for _ in range(max(1, int(braking_encoder_read_retries))):
         try:
-            # Read both bytes in one I2C transaction so high/low parts stay coherent
-            # while the brake is moving quickly under motor drive.
-            raw_bytes = braking_encoder_bus.read_i2c_block_data(braking_encoder_i2c_address, 0x0C, 2)
-            if len(raw_bytes) < 2:
-                raise OSError("Incomplete braking encoder read")
-            high, low = raw_bytes[0], raw_bytes[1]
+            high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
+            low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
             return ((high & 0x0F) << 8) | low
         except OSError:
             time.sleep(0.001)
