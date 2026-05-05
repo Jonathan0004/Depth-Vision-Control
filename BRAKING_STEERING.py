@@ -167,6 +167,8 @@ braking_encoder_i2c_bus = 1
 braking_encoder_i2c_address = 0x36
 braking_calibration_file = Path("braking_calibration.json")
 braking_encoder_read_retries = 3
+braking_encoder_quiet_read_retries = 2
+braking_encoder_quiet_pause_seconds = 0.003
 braking_encoder_glitch_hold_seconds = 0.20
 
 
@@ -530,18 +532,28 @@ def braking_encoder_span():
     return span if span > 0 else None
 
 
-def read_braking_encoder_raw():
-    global braking_encoder_bus, braking_encoder_available
-    if not braking_encoder_available or braking_encoder_bus is None:
-        return None
-    for _ in range(max(1, int(braking_encoder_read_retries))):
-        try:
-            high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
-            low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
-            return ((high & 0x0F) << 8) | low
-        except OSError:
-            time.sleep(0.001)
+def _read_braking_as5600_raw_once():
+    data = braking_encoder_bus.read_i2c_block_data(braking_encoder_i2c_address, 0x0C, 2)
+    high, low = data[0], data[1]
+    return ((high & 0x0F) << 8) | low
 
+
+def _pause_braking_motor_for_encoder_read() -> bool:
+    if (
+        not braking_motor_control_available
+        or not braking_motor_pwm_enabled
+        or braking_motor_last_duty_ns in (None, 0)
+    ):
+        return False
+    _set_braking_motor_pwm_pct(0.0)
+    if GPIO is not None and braking_motor_gpio_initialised:
+        GPIO.output(braking_motor_power_pin, GPIO.LOW)
+    time.sleep(max(0.0, float(braking_encoder_quiet_pause_seconds)))
+    return True
+
+
+def _reopen_braking_encoder_bus() -> None:
+    global braking_encoder_bus, braking_encoder_available
     try:
         braking_encoder_bus.close()
     except Exception:
@@ -552,6 +564,29 @@ def read_braking_encoder_raw():
     except Exception:
         braking_encoder_bus = None
         braking_encoder_available = False
+
+
+def read_braking_encoder_raw():
+    if not braking_encoder_available or braking_encoder_bus is None:
+        return None
+
+    for _ in range(max(1, int(braking_encoder_read_retries))):
+        try:
+            return _read_braking_as5600_raw_once()
+        except OSError:
+            time.sleep(0.001)
+
+    # Brake-motor PWM can inject enough noise onto the AS5600/I2C wiring to
+    # make reads fail. If that happens, briefly quiet the motor and try again
+    # before declaring the encoder unavailable.
+    _pause_braking_motor_for_encoder_read()
+    for _ in range(max(0, int(braking_encoder_quiet_read_retries))):
+        try:
+            return _read_braking_as5600_raw_once()
+        except OSError:
+            time.sleep(0.001)
+
+    _reopen_braking_encoder_bus()
     return None
 
 
@@ -990,7 +1025,14 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
         return
 
     duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
-    duty_pct = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
+    duty_cap = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
+    denom = (
+        float(braking_motor_full_speed_error_norm)
+        if braking_motor_full_speed_error_norm > 0
+        else 1.0
+    )
+    scaled_pct = (abs(error) / denom) * duty_cap
+    duty_pct = max(0.0, min(duty_cap, scaled_pct))
 
     _set_braking_motor_direction(error)
 
@@ -1900,9 +1942,9 @@ while True:
                 hud_text_outline_thickness,
             )
 
-            brake_encoder_text = "Break Encoder: --"
+            brake_encoder_text = "Brake Encoder: --"
             if braking_encoder_norm is not None:
-                brake_encoder_text = f"Break Encoder: {braking_encoder_norm:.3f}"
+                brake_encoder_text = f"Brake Encoder: {braking_encoder_norm:.3f}"
             draw_text_with_outline(
                 combined,
                 brake_encoder_text,
