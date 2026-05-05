@@ -65,6 +65,11 @@ except ImportError:  # pragma: no cover - hardware dependency
 # Set False for maximum runtime performance without rendering overhead.
 enable_visualization = True
 
+# Master safety toggle for brake motor movement.
+# False (default) keeps brake motor PWM at 0% and direction neutral, even if
+# auto-braking, jog mode, or calibration requests motion.
+enable_brake_motor_movement = False
+
 # Grid resolution for sampling depth points across each frame (higher = denser)
 rows, cols = 25, 50
 
@@ -921,6 +926,8 @@ def initialise_braking_motor_control():
 
 
 def _set_braking_motor_direction(error: float) -> None:
+    if not enable_brake_motor_movement:
+        error = 0.0
     if GPIO is None or not braking_motor_gpio_initialised:
         return
     GPIO.output(braking_motor_direction_pin, GPIO.HIGH if error > 0 else GPIO.LOW)
@@ -928,6 +935,8 @@ def _set_braking_motor_direction(error: float) -> None:
 
 def _set_braking_motor_pwm_pct(pct: float) -> None:
     global braking_motor_last_duty_ns
+    if not enable_brake_motor_movement:
+        pct = 0.0
     if (
         not braking_motor_control_available
         or braking_motor_pwm_channel_path is None
