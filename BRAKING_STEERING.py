@@ -166,6 +166,8 @@ simulated_step_norm = 0.01        # arrow-key increment when in simulated encode
 braking_encoder_i2c_bus = 1
 braking_encoder_i2c_address = 0x36
 braking_calibration_file = Path("braking_calibration.json")
+braking_encoder_quiet_read_enabled = True
+braking_encoder_quiet_settle_seconds = 0.003
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +533,7 @@ def braking_encoder_span():
 def read_braking_encoder_raw():
     if not braking_encoder_available or braking_encoder_bus is None:
         return None
+    quiet_braking_motor_for_encoder_read()
     try:
         high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
         low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
@@ -944,6 +947,29 @@ def enable_braking_motor_pwm() -> None:
         GPIO.output(braking_motor_power_pin, GPIO.LOW)
 
 
+def quiet_braking_motor_for_encoder_read() -> None:
+    global braking_motor_last_duty_ns
+    if (
+        not braking_encoder_quiet_read_enabled
+        or not braking_motor_control_available
+        or braking_motor_pwm_channel_path is None
+        or not braking_motor_pwm_enabled
+        or braking_motor_last_duty_ns is None
+        or braking_motor_last_duty_ns <= 0
+    ):
+        return
+
+    try:
+        _pwm_write(braking_motor_pwm_channel_path / "duty_cycle", 0)
+    except OSError:  # pragma: no cover - hardware dependency
+        return
+
+    braking_motor_last_duty_ns = 0
+    if GPIO is not None and braking_motor_gpio_initialised:
+        GPIO.output(braking_motor_power_pin, GPIO.LOW)
+    time.sleep(max(0.0, float(braking_encoder_quiet_settle_seconds)))
+
+
 def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
     if target_norm is None or encoder_norm is None or braking_calibration_active:
         _set_braking_motor_direction(0)
@@ -961,10 +987,15 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
             GPIO.output(braking_motor_power_pin, GPIO.LOW)
         return
 
-    duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
-    duty_pct = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
-
     _set_braking_motor_direction(error)
+    denom = (
+        float(braking_motor_full_speed_error_norm)
+        if braking_motor_full_speed_error_norm > 0
+        else 1.0
+    )
+    duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
+    scaled_pct = (abs(error) / denom) * braking_motor_max_duty_pct
+    duty_pct = max(0.0, min(duty_cap, braking_motor_max_duty_pct, scaled_pct))
 
     _set_braking_motor_pwm_pct(duty_pct)
     if GPIO is not None and braking_motor_gpio_initialised:
