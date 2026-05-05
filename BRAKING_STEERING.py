@@ -628,7 +628,9 @@ brake_press_timestamps = deque()
 brake_release_rezero_drop_norm = 0.05
 brake_release_rezero_settle_seconds = 1.0
 brake_release_rezero_up_tolerance_norm = 0.005
-brake_autorange_margin_raw = 4
+brake_release_capture_max_norm = 0.20
+brake_release_target_max_norm = 0.10
+brake_release_min_shift_raw = 2
 brake_release_candidate_active = False
 brake_release_candidate_start_norm = None
 brake_release_candidate_lowest_norm = None
@@ -1065,6 +1067,7 @@ def get_braking_encoder_norm():
     global brake_release_candidate_lowest_raw
     global brake_release_candidate_last_drop_time
     global brake_release_candidate_disqualified
+    global braking_target_norm
     raw = read_braking_encoder_raw()
     now = time.monotonic()
     braking_latest_encoder_raw = raw
@@ -1078,22 +1081,6 @@ def get_braking_encoder_norm():
             return braking_last_valid_encoder_norm
         braking_latest_encoder_norm = None
         return None
-
-    # Expand (never shrink) brake calibration bounds when live readings exceed
-    # the recorded range. This prevents normalized output from getting pinned
-    # at 1.000/0.000 after a hard press/release that goes slightly outside the
-    # calibrated travel.
-    min_raw = braking_calibration_data.get("encoder_min_raw")
-    max_raw = braking_calibration_data.get("encoder_max_raw")
-    if min_raw is not None and max_raw is not None:
-        updated_min = int(min_raw)
-        updated_max = int(max_raw)
-        if raw < (updated_min - brake_autorange_margin_raw):
-            updated_min = int(raw)
-        if raw > (updated_max + brake_autorange_margin_raw):
-            updated_max = int(raw)
-        if updated_min != int(min_raw) or updated_max != int(max_raw):
-            save_braking_calibration(updated_min, updated_max)
 
     norm = braking_encoder_raw_to_norm(raw)
     braking_latest_encoder_norm = norm
@@ -1125,15 +1112,27 @@ def get_braking_encoder_norm():
 
     drop_amount = brake_release_candidate_start_norm - brake_release_candidate_lowest_norm
     settle_elapsed = now - brake_release_candidate_last_drop_time
+    in_release_zone = norm <= brake_release_capture_max_norm
+    targeting_release = braking_target_norm is not None and braking_target_norm <= brake_release_target_max_norm
+
     if (
         drop_amount >= brake_release_rezero_drop_norm
         and not brake_release_candidate_disqualified
         and settle_elapsed >= brake_release_rezero_settle_seconds
         and not braking_calibration_active
+        and in_release_zone
+        and targeting_release
     ):
         new_zero_raw = brake_release_candidate_lowest_raw
+        min_raw = braking_calibration_data.get("encoder_min_raw")
         max_raw = braking_calibration_data.get("encoder_max_raw")
-        if new_zero_raw is not None and max_raw is not None and int(max_raw) - int(new_zero_raw) > 0:
+        if (
+            new_zero_raw is not None
+            and min_raw is not None
+            and max_raw is not None
+            and int(new_zero_raw) < (int(min_raw) - brake_release_min_shift_raw)
+            and int(max_raw) - int(new_zero_raw) > 0
+        ):
             save_braking_calibration(int(new_zero_raw), int(max_raw))
 
         brake_release_candidate_active = True
