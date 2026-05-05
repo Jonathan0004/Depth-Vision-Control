@@ -166,10 +166,6 @@ simulated_step_norm = 0.01        # arrow-key increment when in simulated encode
 braking_encoder_i2c_bus = 1
 braking_encoder_i2c_address = 0x36
 braking_calibration_file = Path("braking_calibration.json")
-braking_encoder_read_retries = 3
-braking_encoder_quiet_read_retries = 2
-braking_encoder_quiet_pause_seconds = 0.003
-braking_encoder_glitch_hold_seconds = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -532,62 +528,16 @@ def braking_encoder_span():
     return span if span > 0 else None
 
 
-def _read_braking_as5600_raw_once():
-    data = braking_encoder_bus.read_i2c_block_data(braking_encoder_i2c_address, 0x0C, 2)
-    high, low = data[0], data[1]
-    return ((high & 0x0F) << 8) | low
-
-
-def _pause_braking_motor_for_encoder_read() -> bool:
-    if (
-        not braking_motor_control_available
-        or not braking_motor_pwm_enabled
-        or braking_motor_last_duty_ns in (None, 0)
-    ):
-        return False
-    _set_braking_motor_pwm_pct(0.0)
-    if GPIO is not None and braking_motor_gpio_initialised:
-        GPIO.output(braking_motor_power_pin, GPIO.LOW)
-    time.sleep(max(0.0, float(braking_encoder_quiet_pause_seconds)))
-    return True
-
-
-def _reopen_braking_encoder_bus() -> None:
-    global braking_encoder_bus, braking_encoder_available
-    try:
-        braking_encoder_bus.close()
-    except Exception:
-        pass
-    try:
-        braking_encoder_bus = SMBus(braking_encoder_i2c_bus)
-        braking_encoder_available = True
-    except Exception:
-        braking_encoder_bus = None
-        braking_encoder_available = False
-
-
 def read_braking_encoder_raw():
     if not braking_encoder_available or braking_encoder_bus is None:
         return None
-
-    for _ in range(max(1, int(braking_encoder_read_retries))):
-        try:
-            return _read_braking_as5600_raw_once()
-        except OSError:
-            time.sleep(0.001)
-
-    # Brake-motor PWM can inject enough noise onto the AS5600/I2C wiring to
-    # make reads fail. If that happens, briefly quiet the motor and try again
-    # before declaring the encoder unavailable.
-    _pause_braking_motor_for_encoder_read()
-    for _ in range(max(0, int(braking_encoder_quiet_read_retries))):
-        try:
-            return _read_braking_as5600_raw_once()
-        except OSError:
-            time.sleep(0.001)
-
-    _reopen_braking_encoder_bus()
-    return None
+    try:
+        high = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0C)
+        low = braking_encoder_bus.read_byte_data(braking_encoder_i2c_address, 0x0D)
+    except OSError:
+        return None
+    raw = ((high & 0x0F) << 8) | low
+    return raw
 
 
 def braking_encoder_raw_to_norm(raw):
@@ -648,9 +598,6 @@ braking_jog_duty_pct = braking_jog_default_duty_pct
 
 braking_latest_encoder_raw = None
 braking_latest_encoder_norm = None
-braking_last_valid_encoder_raw = None
-braking_last_valid_encoder_norm = None
-braking_last_valid_encoder_time = 0.0
 braking_calibration_active = False
 braking_calibration_stage = None
 braking_calibration_status_text = ""
@@ -660,16 +607,6 @@ braking_calibration_jog_direction = 0
 braking_target_norm = None
 brake_hold_until = 0.0
 brake_press_timestamps = deque()
-brake_release_rezero_drop_norm = 0.05
-brake_release_rezero_settle_seconds = 1.0
-brake_release_rezero_up_tolerance_norm = 0.005
-brake_autorange_margin_raw = 4
-brake_release_candidate_active = False
-brake_release_candidate_start_norm = None
-brake_release_candidate_lowest_norm = None
-brake_release_candidate_lowest_raw = None
-brake_release_candidate_last_drop_time = 0.0
-brake_release_candidate_disqualified = False
 
 brake_shutdown_press_count = 5
 brake_shutdown_window_seconds = 6.0
@@ -1025,14 +962,7 @@ def update_braking_motor_control(target_norm, encoder_norm, max_duty_pct=None):
         return
 
     duty_cap = braking_motor_max_duty_pct if max_duty_pct is None else max_duty_pct
-    duty_cap = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
-    denom = (
-        float(braking_motor_full_speed_error_norm)
-        if braking_motor_full_speed_error_norm > 0
-        else 1.0
-    )
-    scaled_pct = (abs(error) / denom) * duty_cap
-    duty_pct = max(0.0, min(duty_cap, scaled_pct))
+    duty_pct = max(0.0, min(duty_cap, braking_motor_max_duty_pct))
 
     _set_braking_motor_direction(error)
 
@@ -1100,97 +1030,14 @@ def shutdown_braking_motor_control():
 
 def get_braking_encoder_norm():
     global braking_latest_encoder_raw, braking_latest_encoder_norm
-    global braking_last_valid_encoder_raw, braking_last_valid_encoder_norm, braking_last_valid_encoder_time
-    global brake_release_candidate_active
-    global brake_release_candidate_start_norm
-    global brake_release_candidate_lowest_norm
-    global brake_release_candidate_lowest_raw
-    global brake_release_candidate_last_drop_time
-    global brake_release_candidate_disqualified
     raw = read_braking_encoder_raw()
-    now = time.monotonic()
     braking_latest_encoder_raw = raw
     if raw is None:
-        if (
-            braking_last_valid_encoder_norm is not None
-            and (now - braking_last_valid_encoder_time) <= braking_encoder_glitch_hold_seconds
-        ):
-            braking_latest_encoder_raw = braking_last_valid_encoder_raw
-            braking_latest_encoder_norm = braking_last_valid_encoder_norm
-            return braking_last_valid_encoder_norm
         braking_latest_encoder_norm = None
         return None
 
-    # Expand (never shrink) brake calibration bounds when live readings exceed
-    # the recorded range. This prevents normalized output from getting pinned
-    # at 1.000/0.000 after a hard press/release that goes slightly outside the
-    # calibrated travel.
-    min_raw = braking_calibration_data.get("encoder_min_raw")
-    max_raw = braking_calibration_data.get("encoder_max_raw")
-    if min_raw is not None and max_raw is not None:
-        updated_min = int(min_raw)
-        updated_max = int(max_raw)
-        if raw < (updated_min - brake_autorange_margin_raw):
-            updated_min = int(raw)
-        if raw > (updated_max + brake_autorange_margin_raw):
-            updated_max = int(raw)
-        if updated_min != int(min_raw) or updated_max != int(max_raw):
-            save_braking_calibration(updated_min, updated_max)
-
     norm = braking_encoder_raw_to_norm(raw)
     braking_latest_encoder_norm = norm
-    if norm is None:
-        return None
-    braking_last_valid_encoder_raw = raw
-    braking_last_valid_encoder_norm = norm
-    braking_last_valid_encoder_time = now
-
-    if not brake_release_candidate_active:
-        brake_release_candidate_active = True
-        brake_release_candidate_start_norm = norm
-        brake_release_candidate_lowest_norm = norm
-        brake_release_candidate_lowest_raw = raw
-        brake_release_candidate_last_drop_time = now
-        brake_release_candidate_disqualified = False
-        return norm
-
-    if brake_release_candidate_start_norm is None or brake_release_candidate_lowest_norm is None:
-        brake_release_candidate_active = False
-        return norm
-
-    if norm < brake_release_candidate_lowest_norm:
-        brake_release_candidate_lowest_norm = norm
-        brake_release_candidate_lowest_raw = raw
-        brake_release_candidate_last_drop_time = now
-    elif norm > (brake_release_candidate_lowest_norm + brake_release_rezero_up_tolerance_norm):
-        brake_release_candidate_disqualified = True
-
-    drop_amount = brake_release_candidate_start_norm - brake_release_candidate_lowest_norm
-    settle_elapsed = now - brake_release_candidate_last_drop_time
-    if (
-        drop_amount >= brake_release_rezero_drop_norm
-        and not brake_release_candidate_disqualified
-        and settle_elapsed >= brake_release_rezero_settle_seconds
-        and not braking_calibration_active
-    ):
-        new_zero_raw = brake_release_candidate_lowest_raw
-        max_raw = braking_calibration_data.get("encoder_max_raw")
-        if new_zero_raw is not None and max_raw is not None and int(max_raw) - int(new_zero_raw) > 0:
-            save_braking_calibration(int(new_zero_raw), int(max_raw))
-
-        brake_release_candidate_active = True
-        brake_release_candidate_start_norm = norm
-        brake_release_candidate_lowest_norm = norm
-        brake_release_candidate_lowest_raw = raw
-        brake_release_candidate_last_drop_time = now
-        brake_release_candidate_disqualified = False
-    elif brake_release_candidate_disqualified:
-        brake_release_candidate_start_norm = norm
-        brake_release_candidate_lowest_norm = norm
-        brake_release_candidate_lowest_raw = raw
-        brake_release_candidate_last_drop_time = now
-        brake_release_candidate_disqualified = False
-
     return norm
 
 
@@ -1942,9 +1789,9 @@ while True:
                 hud_text_outline_thickness,
             )
 
-            brake_encoder_text = "Brake Encoder: --"
+            brake_encoder_text = "Break Encoder: --"
             if braking_encoder_norm is not None:
-                brake_encoder_text = f"Brake Encoder: {braking_encoder_norm:.3f}"
+                brake_encoder_text = f"Break Encoder: {braking_encoder_norm:.3f}"
             draw_text_with_outline(
                 combined,
                 brake_encoder_text,
